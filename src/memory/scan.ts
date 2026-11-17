@@ -213,6 +213,10 @@ const inside = (dir: string, path: string) => { const rel = relative(dir, path);
 
 /** Project files relative to the working directory (../ for its ancestors), home files as ~/…. */
 function display(ctx: ScanContext, path: string): string {
+  return displayPath(ctx, path).split('/').map((part) => (part.length > 40 ? `${part.slice(0, 14)}…${part.slice(-10)}` : part)).join('/');
+}
+
+function displayPath(ctx: ScanContext, path: string): string {
   if (inside(ctx.root, path)) return relative(ctx.cwd, path).split(sep).join('/');
   const fromHome = relative(ctx.home, path);
   if (fromHome && !fromHome.startsWith('..') && !isAbsolute(fromHome)) return '~/' + fromHome.split(sep).join('/');

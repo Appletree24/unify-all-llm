@@ -167,12 +167,25 @@ Claude Code、Codex、Gemini CLI 和 Pi 各有一套“记忆”：启动时自�
 
 ```sh
 node dist/cli.js memory              # 启动本机网页界面，打印带令牌的链接
+node dist/cli.js memory --tui        # 终端内的交互界面
 node dist/cli.js memory --list       # 只在终端打印分层结构
 node dist/cli.js memory --effective claude   # 打印某个工具启动时拼接后的记忆
 node dist/cli.js memory --json       # 扫描结果，供脚本使用
 ```
 
-TUI 中输入 `/memory` 也会启动同一个界面。
+终端里也有同样的界面：`node dist/cli.js memory --tui`，或在 TUI 中输入 `/memory`（`/memory web` 启动网页）。左侧按载入顺序列出各层与文件，右侧是所选文件的逐条记忆和来历。
+
+| 键 | 作用 |
+| --- | --- |
+| `Tab` / `1`–`4` | 切换工具 |
+| `↑↓`、`→` / `Enter`、`←` | 选择文件，进入右侧选择记忆，返回 |
+| `e` `a` `d` | 编辑、新增、删除所选记忆（`a` 在尚未创建的文件上会创建它） |
+| `c` `m` | 复制、移动到另一层或另一个工具 |
+| `u` | 撤销最近一次修改 |
+| `x` `i` `/` | 查看启动时拼接的上下文、问题列表、搜索 |
+| `w` `r` `q` | 打开网页界面、重新扫描、返回 |
+
+编辑全文、新建规则文件、查看提交历史和恢复任意旧版本目前只在网页里。
 
 | 工具 | 分层（按载入顺序，越靠后越优先） |
 | --- | --- |
