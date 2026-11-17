@@ -1,0 +1,903 @@
+import { spawn } from 'node:child_process';
+import { basename } from 'node:path';
+import { fanOut, runOne } from '../core/orchestrator.js';
+import { loadConfig, newRunId, saveRun, type Config, type RunRecord } from '../core/store.js';
+import { anonymize, buildExecPrompt, buildFollowUpPrompt, buildSynthesisPrompt } from '../core/synth.js';
+import type { ProviderAdapter, ProviderEvent } from '../core/types.js';
+import { decide } from '../core/decider.js';
+import { buildRegistry } from '../providers/index.js';
+import { KeyParser, type Key } from './keys.js';
+import { layout } from './markdown.js';
+import { Screen, charWidth, rgb, textWidth, truncate, type Cell } from './screen.js';
+
+// ── palette ────────────────────────────────────────────────────────────────
+const GOLD = rgb(232, 196, 104); // the synthesis: where the voices converge
+const VIOLET = rgb(190, 140, 255); // execution
+const DIM = rgb(120, 125, 135);
+const BORDER = rgb(72, 76, 86);
+const RED = rgb(240, 90, 90);
+const YELLOW = rgb(235, 190, 90);
+const PROVIDER_COLORS: Record<string, string> = {
+  claude: rgb(217, 119, 87),
+  codex: rgb(25, 195, 155),
+  gemini: rgb(96, 150, 255),
+};
+const FALLBACK_COLORS = [rgb(230, 130, 180), rgb(120, 200, 230), rgb(170, 210, 110)];
+const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+
+interface Pane {
+  id: string; // 'a:<provider>' | 'synth' | 'exec'
+  kind: 'answer' | 'synth' | 'exec';
+  title: string;
+  color: string;
+  text: string;
+  reasoning: string;
+  status: 'run' | 'ok' | 'err';
+  error?: string;
+  tool?: string;
+  note?: string;
+  start: number;
+  end?: number;
+  scroll: number;
+  follow: boolean;
+  viewH: number;
+  maxScroll: number;
+  cache?: { key: string; lines: Cell[][] };
+}
+
+export interface TuiIO {
+  cols(): number;
+  rows(): number;
+  write(s: string): void;
+  setMouse?(on: boolean): void;
+}
+
+export class App {
+  onQuit: () => void = () => {};
+
+  private installed = new Map<string, boolean>();
+  private selected: string[] = [];
+  private panes: Pane[] = [];
+  private synth?: Pane;
+  private exec?: Pane;
+  private question = '';
+  private turn = 0;
+  private context?: { question: string; answer: string };
+  private lastRun?: RunRecord;
+
+  private chars: string[] = [];
+  private caret = 0;
+  private history: string[] = [];
+  private histIdx = 0;
+
+  private focus = 'input';
+  private zoomId?: string;
+  private activeAnswer = 0;
+  private busy = false;
+  private ctl?: AbortController;
+  private confirm?: { text: string; yes: () => void };
+  private notice = '';
+  private noticeColor = DIM;
+  private showReasoning = false;
+
+  private frame = 0;
+  private prev: string[] = [];
+  private prevCols = 0;
+  private last?: Screen;
+  private cursor: { x: number; y: number } | null = null;
+  private pending = false;
+  private ticker?: NodeJS.Timeout;
+  private disposed = false;
+  private rects: { id: string; x: number; y: number; w: number; h: number }[] = [];
+  private inputTop = 0;
+  private mouseOn = true;
+  private manualModels = false;
+
+  constructor(
+    private io: TuiIO,
+    private cwd: string,
+    private cfg: Config,
+    private all: ProviderAdapter[],
+  ) {}
+
+  // ── lifecycle ────────────────────────────────────────────────────────────
+  async init(): Promise<void> {
+    this.render();
+    this.ticker = setInterval(() => {
+      if (this.busy || this.installed.size < this.all.length) {
+        this.frame++;
+        this.render();
+      }
+    }, 100);
+    await Promise.all(
+      this.all.map(async (a) => {
+        this.installed.set(a.id, (await a.detect()).installed);
+        this.requestRender();
+      }),
+    );
+    // Everything registered answers by default, except the model reserved for deciding.
+    const wanted = this.cfg.providers ?? this.all.map((a) => a.id).filter((id) => id !== this.cfg.decider);
+    this.selected = wanted.filter((id) => this.installed.get(id));
+    this.requestRender();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.ticker) clearInterval(this.ticker);
+    this.ctl?.abort();
+  }
+
+  invalidate(): void {
+    this.prev = [];
+    this.render();
+  }
+
+  snapshot(): string[] {
+    return this.last?.toPlain() ?? [];
+  }
+
+  private requestRender(): void {
+    if (this.pending) return;
+    this.pending = true;
+    setTimeout(() => {
+      this.pending = false;
+      this.render();
+    }, 16);
+  }
+
+  private say(text: string, color = DIM): void {
+    this.notice = text;
+    this.noticeColor = color;
+    this.requestRender();
+  }
+
+  private colorOf(id: string): string {
+    return PROVIDER_COLORS[id] ?? FALLBACK_COLORS[Math.max(0, this.all.findIndex((a) => a.id === id)) % FALLBACK_COLORS.length];
+  }
+
+  private adapter(id: string): ProviderAdapter | undefined {
+    return this.all.find((a) => a.id === id);
+  }
+
+  private newPane(id: string, kind: Pane['kind'], title: string, color: string): Pane {
+    return { id, kind, title, color, text: '', reasoning: '', status: 'run', start: Date.now(), scroll: 0, follow: true, viewH: 1, maxScroll: 0 };
+  }
+
+  private apply(p: Pane, ev: ProviderEvent): void {
+    if (ev.type === 'delta') {
+      p.text += ev.text;
+      p.tool = undefined;
+    } else if (ev.type === 'reasoning') {
+      p.reasoning += ev.text;
+    } else if (ev.type === 'tool') {
+      p.tool = ev.name;
+      if (p.kind === 'exec') {
+        const detail = ev.detail ? ' ' + ev.detail.replace(/\s+/g, ' ').slice(0, 160) : '';
+        p.text += `${p.text && !p.text.endsWith('\n') ? '\n' : ''}⚙ ${ev.name}${detail}\n`;
+      }
+    } else if (ev.type === 'done') {
+      p.status = 'ok';
+      p.end = Date.now();
+      p.tool = undefined;
+      if (p.kind !== 'exec' && ev.text) p.text = ev.text; // the final answer, without tool-use chatter
+      if (p.kind === 'answer' && p.follow) {
+        // A finished answer is read from its beginning, not its tail.
+        p.follow = false;
+        p.scroll = 0;
+      }
+    } else if (ev.type === 'error') {
+      p.status = 'err';
+      p.end = Date.now();
+      p.error = ev.message;
+    }
+    this.requestRender();
+  }
+
+  // ── flows ────────────────────────────────────────────────────────────────
+  private async ask(question: string): Promise<void> {
+    let adapters = this.selected.map((id) => this.adapter(id)!).filter(Boolean);
+    if (adapters.length === 0) return this.say('没有可用的模型：请先安装并登录 claude / codex / gemini CLI', RED);
+
+    this.busy = true;
+    const ctl = (this.ctl = new AbortController());
+
+    // Optional System One step: let the decider pick who answers. A manual /models choice wins.
+    let synthesize = true;
+    let decisionNote = '';
+    const decider = this.cfg.decider ? this.adapter(this.cfg.decider) : undefined;
+    if (decider && !this.manualModels && adapters.length > 1 && this.installed.get(decider.id)) {
+      this.say(`${decider.label} 决策中…`, GOLD);
+      const d = await decide(decider, {
+        question,
+        available: adapters.map((a) => ({ id: a.id, label: a.label })),
+        cwd: this.cwd,
+        model: this.cfg.models?.[decider.id],
+        signal: ctl.signal,
+      }).catch(() => undefined);
+      if (ctl.signal.aborted) {
+        this.busy = false;
+        return this.requestRender();
+      }
+      if (d) {
+        adapters = adapters.filter((a) => d.providers.includes(a.id));
+        synthesize = d.synthesize;
+        decisionNote = `决策 · ${decider.label}: ${d.reason ?? adapters.map((a) => a.label).join('、')}`;
+      } else decisionNote = `${decider.label} 没有给出可用决策，已发给全部模型`;
+    }
+
+    this.question = question;
+    this.turn++;
+    this.panes = adapters.map((a) => this.newPane(`a:${a.id}`, 'answer', a.label, this.colorOf(a.id)));
+    this.synth = undefined;
+    this.exec = undefined;
+    this.zoomId = undefined;
+    this.focus = 'input';
+    this.activeAnswer = 0;
+    if (decisionNote) this.say(decisionNote);
+    const timeoutMs = (this.cfg.timeoutSec ?? 600) * 1000;
+    const labels = Object.fromEntries(adapters.map((a) => [a.id, a.label]));
+    const run: RunRecord = { id: newRunId(), createdAt: new Date().toISOString(), question, results: [] };
+    this.render();
+
+    try {
+      const prompt = this.context ? buildFollowUpPrompt(this.context.question, this.context.answer, question) : question;
+      run.results = await fanOut(adapters, {
+        prompt,
+        cwd: this.cwd,
+        mode: 'ask',
+        models: this.cfg.models,
+        timeoutMs,
+        signal: ctl.signal,
+        onEvent: (id, ev) => this.apply(this.panes.find((p) => p.id === `a:${id}`)!, ev),
+      });
+      if (ctl.signal.aborted) return;
+
+      const answers = anonymize(run.results);
+      if (answers.length >= 2 && synthesize) {
+        let synth = this.adapter(this.cfg.synthesizer ?? 'claude');
+        if (!synth || !this.installed.get(synth.id)) synth = this.adapter(answers[0].provider)!;
+        const pane = (this.synth = this.newPane('synth', 'synth', `汇总 · ${synth.label}`, GOLD));
+        pane.note = answers.map((a) => `${a.label}=${labels[a.provider]}`).join('  ');
+        const result = await runOne(synth, {
+          prompt: buildSynthesisPrompt(question, answers),
+          cwd: this.cwd,
+          mode: 'ask',
+          model: this.cfg.models?.[synth.id],
+          timeoutMs,
+          signal: ctl.signal,
+          onEvent: (_id, ev) => this.apply(pane, ev),
+        });
+        if (ctl.signal.aborted) return;
+        run.synthesis = { provider: synth.id, labels: Object.fromEntries(answers.map((a) => [a.label, a.provider])), result };
+      } else if (answers.length === 1 && adapters.length > 1) {
+        this.say('只有一个模型成功回答，已跳过汇总', YELLOW);
+      }
+
+      const best = run.synthesis?.result.ok ? run.synthesis.result.text : run.results.find((r) => r.ok)?.text;
+      if (best) this.context = { question, answer: best };
+      this.lastRun = run;
+      saveRun(this.cwd, run);
+    } catch (err) {
+      this.say(`出错: ${err instanceof Error ? err.message : err}`, RED);
+    } finally {
+      this.busy = false;
+      this.requestRender();
+    }
+  }
+
+  private startExec(executorId?: string): void {
+    if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
+    const run = this.lastRun;
+    if (!run) return this.say('还没有可实施的方案：先提一个问题', YELLOW);
+
+    // A focused answer pane means "use this model's answer"; otherwise the synthesis.
+    let plan: string | undefined;
+    let source = '汇总结论';
+    const focused = this.panes.find((p) => p.id === this.focus);
+    const ok = run.results.filter((r) => r.ok);
+    if (focused && focused.status === 'ok') {
+      plan = focused.text;
+      source = `${focused.title} 的回答`;
+    } else if (run.synthesis?.result.ok) {
+      plan = run.synthesis.result.text;
+    } else if (ok.length === 1) {
+      plan = ok[0].text;
+      source = `${this.adapter(ok[0].provider)?.label ?? ok[0].provider} 的回答`;
+    }
+    if (!plan) return this.say('没有可用的方案：用 Tab 选中某个模型的回答后再试', YELLOW);
+
+    const id = executorId ?? this.cfg.executor ?? 'claude';
+    let executor = this.adapter(id);
+    if (executorId && !executor) return this.say(`未知的模型 "${executorId}"`, RED);
+    if (!executor || !this.installed.get(executor.id)) executor = this.adapter(this.selected[0] ?? '');
+    if (!executor) return this.say('没有可用的执行模型', RED);
+
+    const chosen = executor;
+    const finalPlan = plan;
+    this.confirm = {
+      text: `按 y 确认 · 其他键取消 — 让 ${chosen.label} 按「${source}」修改 ${basename(this.cwd)}/ 下的文件`,
+      yes: () => void this.runExec(chosen, run.question, finalPlan),
+    };
+    this.requestRender();
+  }
+
+  private async runExec(executor: ProviderAdapter, question: string, plan: string): Promise<void> {
+    const pane = (this.exec = this.newPane('exec', 'exec', `实施 · ${executor.label}`, VIOLET));
+    this.focus = 'input';
+    this.zoomId = undefined;
+    this.busy = true;
+    const ctl = (this.ctl = new AbortController());
+    this.render();
+    try {
+      await runOne(executor, {
+        prompt: buildExecPrompt(question, plan),
+        cwd: this.cwd,
+        mode: 'exec',
+        model: this.cfg.models?.[executor.id],
+        timeoutMs: 3600_000,
+        signal: ctl.signal,
+        onEvent: (_id, ev) => this.apply(pane, ev),
+      });
+      if (pane.status === 'ok') this.say('实施完成，请用 git diff 检查改动', GOLD);
+    } finally {
+      this.busy = false;
+      this.requestRender();
+    }
+  }
+
+  private copy(): void {
+    const p = this.findPane(this.focus) ?? this.bottomPane() ?? this.panes[this.activeAnswer];
+    if (!p || !p.text.trim()) return this.say('没有可复制的内容', YELLOW);
+    const [cmd, args, data]: [string, string[], Buffer] =
+      process.platform === 'win32'
+        ? ['clip', [], Buffer.from('﻿' + p.text, 'utf16le')]
+        : process.platform === 'darwin'
+          ? ['pbcopy', [], Buffer.from(p.text, 'utf8')]
+          : ['xclip', ['-selection', 'clipboard'], Buffer.from(p.text, 'utf8')];
+    try {
+      const child = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
+      child.on('error', () => this.say(`复制失败：找不到 ${cmd}`, RED));
+      child.on('close', (code) => code === 0 && this.say(`已复制「${p.title}」到剪贴板`, GOLD));
+      child.stdin.end(data);
+    } catch {
+      this.say('复制失败', RED);
+    }
+  }
+
+  private newConversation(): void {
+    if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
+    this.panes = [];
+    this.synth = this.exec = undefined;
+    this.context = this.lastRun = undefined;
+    this.question = '';
+    this.turn = 0;
+    this.focus = 'input';
+    this.zoomId = undefined;
+    this.say('已开始新对话');
+  }
+
+  private command(line: string): void {
+    const [name, ...rest] = line.slice(1).trim().split(/\s+/);
+    const arg = rest.join(' ');
+    if (name === 'exec') this.startExec(arg || undefined);
+    else if (name === 'new') this.newConversation();
+    else if (name === 'copy') this.copy();
+    else if (name === 'quit' || name === 'exit') this.onQuit();
+    else if (name === 'models') {
+      if (!arg) return this.say(`当前: ${this.selected.join(', ') || '无'}    用法: /models claude,codex`);
+      const ids = arg.split(/[,\s]+/).filter(Boolean);
+      const bad = ids.find((id) => !this.installed.get(id));
+      if (bad) return this.say(`"${bad}" 不可用（未安装或不存在）`, RED);
+      this.selected = ids;
+      this.manualModels = true;
+      this.say(`之后的问题将发给: ${ids.join(', ')}`);
+    } else if (name === 'mouse') {
+      this.mouseOn = !this.mouseOn;
+      this.io.setMouse?.(this.mouseOn);
+      this.say(this.mouseOn ? '鼠标滚轮已开启（选择文本请按住 Shift 拖动）' : '鼠标已关闭，可直接拖动选择文本');
+    } else if (name === 'synth') {
+      if (!this.installed.get(arg)) return this.say(`"${arg}" 不可用`, RED);
+      this.cfg = { ...this.cfg, synthesizer: arg };
+      this.say(`汇总模型: ${arg}`);
+    } else {
+      this.say('命令: /exec [模型]  /models a,b  /synth 模型  /mouse  /new  /copy  /quit');
+    }
+  }
+
+  // ── input ────────────────────────────────────────────────────────────────
+  handleKey(k: Key): void {
+    if (k.name === 'wheelup' || k.name === 'wheeldown' || k.name === 'click') {
+      this.mouse(k);
+      return this.requestRender();
+    }
+    this.notice = '';
+    if (this.confirm) {
+      const c = this.confirm;
+      this.confirm = undefined;
+      if (k.name === 'char' && /^[yY]$/.test(k.text ?? '')) c.yes();
+      else this.say('已取消');
+      return this.requestRender();
+    }
+    switch (k.name) {
+      case 'ctrl+c':
+        if (this.busy) {
+          this.ctl?.abort();
+          this.say('已取消当前请求', YELLOW);
+        } else if (this.chars.length) {
+          this.chars = [];
+          this.caret = 0;
+        } else this.onQuit();
+        break;
+      case 'ctrl+d':
+        this.onQuit();
+        break;
+      case 'tab':
+      case 'shifttab':
+        this.cycleFocus(k.name === 'tab' ? 1 : -1);
+        break;
+      case 'ctrl+e':
+        this.startExec();
+        break;
+      case 'ctrl+y':
+        this.copy();
+        break;
+      case 'ctrl+n':
+        this.newConversation();
+        break;
+      case 'ctrl+r':
+        this.showReasoning = !this.showReasoning;
+        this.say(this.showReasoning ? '显示思考过程' : '隐藏思考过程');
+        break;
+      case 'pgup':
+      case 'pgdn':
+        this.scrollPane(this.findPane(this.focus) ?? this.bottomPane() ?? this.panes[this.activeAnswer], k.name === 'pgup' ? -1 : 1, true);
+        break;
+      default:
+        if (this.focus === 'input') this.inputKey(k);
+        else this.paneKey(k);
+    }
+    this.requestRender();
+  }
+
+  private mouse(k: Key): void {
+    const x = k.x ?? -1;
+    const y = k.y ?? -1;
+    const hit = this.rects.find((r) => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
+    if (k.name === 'click') {
+      if (this.confirm) return;
+      if (hit) {
+        this.focus = hit.id;
+        const ai = this.panes.findIndex((p) => p.id === hit.id);
+        if (ai >= 0) this.activeAnswer = ai;
+      } else if (y >= this.inputTop) this.focus = 'input';
+      return;
+    }
+    // The wheel scrolls whatever is under the pointer, without moving focus.
+    const pane = hit ? this.findPane(hit.id) : (this.bottomPane() ?? this.panes[this.activeAnswer]);
+    for (let n = 0; n < 3; n++) this.scrollPane(pane, k.name === 'wheelup' ? -1 : 1);
+  }
+
+  private focusOrder(): string[] {
+    return ['input', ...this.panes.map((p) => p.id), ...(this.synth ? ['synth'] : []), ...(this.exec ? ['exec'] : [])];
+  }
+
+  private cycleFocus(dir: number): void {
+    const order = this.focusOrder();
+    const i = Math.max(0, order.indexOf(this.focus));
+    this.focus = order[(i + dir + order.length) % order.length];
+    const ai = this.panes.findIndex((p) => p.id === this.focus);
+    if (ai >= 0) this.activeAnswer = ai;
+    if (this.zoomId) this.zoomId = this.focus === 'input' ? undefined : this.focus;
+  }
+
+  private findPane(id: string): Pane | undefined {
+    return id === 'synth' ? this.synth : id === 'exec' ? this.exec : this.panes.find((p) => p.id === id);
+  }
+
+  /** The pane shown in the lower region: the synthesis, or the execution once it exists. */
+  private bottomPane(): Pane | undefined {
+    if (this.focus === 'synth') return this.synth;
+    return this.exec ?? this.synth;
+  }
+
+  private scrollPane(p: Pane | undefined, dir: number, page = false): void {
+    if (!p) return;
+    const top = (p.follow ? p.maxScroll : p.scroll) + dir * (page ? Math.max(1, p.viewH - 2) : 1);
+    p.scroll = clamp(top, 0, p.maxScroll);
+    p.follow = p.scroll >= p.maxScroll;
+  }
+
+  private paneKey(k: Key): void {
+    const p = this.findPane(this.focus);
+    if (!p) {
+      this.focus = 'input';
+      return;
+    }
+    const ch = k.name === 'char' ? k.text : '';
+    if (k.name === 'up' || ch === 'k') this.scrollPane(p, -1);
+    else if (k.name === 'down' || ch === 'j') this.scrollPane(p, 1);
+    else if (ch === ' ') this.scrollPane(p, 1, true);
+    else if (k.name === 'home' || ch === 'g') {
+      p.scroll = 0;
+      p.follow = p.maxScroll === 0;
+    } else if (k.name === 'end' || ch === 'G') p.follow = true;
+    else if (k.name === 'enter' || ch === 'z') this.zoomId = this.zoomId ? undefined : p.id;
+    else if (ch === 'y') this.copy();
+    else if (k.name === 'esc' || ch === 'i') {
+      if (this.zoomId) this.zoomId = undefined;
+      else this.focus = 'input';
+    }
+  }
+
+  private insert(text: string): void {
+    const add = Array.from(text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ')).filter(
+      (c) => c === '\n' || charWidth(c.codePointAt(0)!) > 0,
+    );
+    this.chars.splice(this.caret, 0, ...add);
+    this.caret += add.length;
+  }
+
+  private inputKey(k: Key): void {
+    const n = this.chars.length;
+    switch (k.name) {
+      case 'char':
+      case 'paste':
+        this.insert(k.text ?? '');
+        break;
+      case 'altenter':
+      case 'ctrl+j':
+        this.insert('\n');
+        break;
+      case 'enter':
+        this.submit();
+        break;
+      case 'backspace':
+        if (this.caret > 0) this.chars.splice(--this.caret, 1);
+        break;
+      case 'delete':
+        this.chars.splice(this.caret, 1);
+        break;
+      case 'left':
+        this.caret = Math.max(0, this.caret - 1);
+        break;
+      case 'right':
+        this.caret = Math.min(n, this.caret + 1);
+        break;
+      case 'home':
+      case 'ctrl+a':
+        this.caret = 0;
+        break;
+      case 'end':
+        this.caret = n;
+        break;
+      case 'ctrl+u':
+        this.chars = [];
+        this.caret = 0;
+        break;
+      case 'up':
+      case 'down': {
+        if (this.chars.includes('\n') || this.history.length === 0) break;
+        this.histIdx = clamp(this.histIdx + (k.name === 'up' ? -1 : 1), 0, this.history.length);
+        this.chars = Array.from(this.history[this.histIdx] ?? '');
+        this.caret = this.chars.length;
+        break;
+      }
+    }
+  }
+
+  private submit(): void {
+    const text = this.chars.join('').trim();
+    if (!text) return;
+    if (text.startsWith('/')) {
+      this.chars = [];
+      this.caret = 0;
+      return this.command(text);
+    }
+    if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
+    this.history.push(text);
+    this.histIdx = this.history.length;
+    this.chars = [];
+    this.caret = 0;
+    void this.ask(text);
+  }
+
+  // ── rendering ────────────────────────────────────────────────────────────
+  render(): void {
+    if (this.disposed) return;
+    const s = this.compose();
+    this.last = s;
+    const lines = s.toLines();
+    let out = '\x1b[?2026h';
+    if (this.prev.length !== lines.length || this.prevCols !== s.cols) {
+      out += '\x1b[2J';
+      this.prev = [];
+    }
+    lines.forEach((l, i) => {
+      if (l !== this.prev[i]) out += `\x1b[${i + 1};1H${l}`;
+    });
+    out += this.cursor ? `\x1b[${this.cursor.y + 1};${this.cursor.x + 1}H\x1b[?25h` : '\x1b[?25l';
+    out += '\x1b[?2026l';
+    this.io.write(out);
+    this.prev = lines;
+    this.prevCols = s.cols;
+  }
+
+  private compose(): Screen {
+    const cols = Math.max(40, this.io.cols());
+    const rows = Math.max(12, this.io.rows());
+    const s = new Screen(cols, rows);
+    this.cursor = null;
+    this.rects = [];
+    this.drawHeader(s);
+    const inputH = this.drawInput(s);
+    this.drawFooter(s);
+    this.drawBody(s, 2, rows - 3 - inputH);
+    return s;
+  }
+
+  private drawHeader(s: Screen): void {
+    let x = s.put(1, 0, '✦ unify', `1;${GOLD}`) + 2;
+    for (const a of this.all) {
+      const known = this.installed.has(a.id);
+      const on = this.selected.includes(a.id);
+      // The decider does not answer; it is shown as the diamond that routes the others.
+      const deciding = a.id === this.cfg.decider && !on && this.installed.get(a.id) === true;
+      const color = deciding ? GOLD : on ? this.colorOf(a.id) : DIM;
+      x = s.put(x, 0, !known ? SPIN[this.frame % 10] : deciding ? '◆' : on ? '●' : '○', color);
+      x = s.put(x + 1, 0, deciding ? `${a.label} 决策` : a.label, color) + 2;
+    }
+    const right = `${this.turn > 1 ? `第 ${this.turn} 轮 · ` : ''}${basename(this.cwd)}`;
+    const rx = s.cols - textWidth(right) - 1;
+    if (rx > x) s.put(rx, 0, right, DIM);
+    if (this.question) {
+      s.put(1, 1, '❯', GOLD);
+      s.put(3, 1, truncate(this.question.replace(/\s+/g, ' '), s.cols - 4), '1');
+    }
+  }
+
+  /** Draws the input box above the footer and returns its height. */
+  private drawInput(s: Screen): number {
+    const inner = s.cols - 6;
+    // Wrap the input manually so the caret position is known exactly.
+    const lines: Cell[][] = [[]];
+    let cx = 0;
+    let cy = 0;
+    let w = 0;
+    this.chars.forEach((ch, i) => {
+      if (i === this.caret) [cx, cy] = [w, lines.length - 1];
+      const cw = ch === '\n' ? 0 : charWidth(ch.codePointAt(0)!);
+      if (ch === '\n' || w + cw > inner) {
+        lines.push([]);
+        w = 0;
+      }
+      if (ch !== '\n') {
+        lines[lines.length - 1].push({ ch, st: '', w: cw });
+        w += cw;
+      }
+      // A caret sitting right after a newline belongs to the new line.
+      if (ch === '\n' && i + 1 === this.caret) [cx, cy] = [0, lines.length - 1];
+    });
+    if (this.caret >= this.chars.length) [cx, cy] = [w, lines.length - 1];
+    if (cx >= inner) [cx, cy] = [0, cy + 1];
+    while (lines.length <= cy) lines.push([]);
+
+    const h = Math.min(5, lines.length);
+    const first = clamp(cy - h + 1, 0, lines.length - h);
+    const y = s.rows - 1 - (h + 2);
+    this.inputTop = y;
+    const active = this.focus === 'input' && !this.confirm;
+    const st = active ? GOLD : BORDER;
+    s.put(0, y, '╭' + '─'.repeat(s.cols - 2) + '╮', st);
+    for (let i = 0; i < h; i++) {
+      s.put(0, y + 1 + i, '│', st);
+      s.put(s.cols - 1, y + 1 + i, '│', st);
+      if (i === 0 && first === 0) s.put(2, y + 1, '❯', active ? GOLD : DIM);
+      s.putCells(4, y + 1 + i, lines[first + i], s.cols - 2);
+    }
+    s.put(0, y + h + 1, '╰' + '─'.repeat(s.cols - 2) + '╯', st);
+    if (this.chars.length === 0) {
+      const hint = this.busy
+        ? '生成中…  Ctrl+C 取消'
+        : this.turn === 0
+          ? '问点什么…  Enter 发送 · Ctrl+J 换行'
+          : '继续追问，或输入 /exec 让模型按方案动手';
+      s.put(4, y + 1, truncate(hint, inner), DIM);
+    }
+    if (active) this.cursor = { x: 4 + cx, y: y + 1 + (cy - first) };
+    return h + 2;
+  }
+
+  private drawFooter(s: Screen): void {
+    const y = s.rows - 1;
+    if (this.confirm) return void s.put(1, y, truncate(this.confirm.text, s.cols - 2), `1;${YELLOW}`);
+    if (this.notice) return void s.put(1, y, truncate(this.notice, s.cols - 2), this.noticeColor);
+    const hints =
+      this.focus === 'input'
+        ? this.panes.length
+          ? ['Tab 切换面板', '滚轮 滚动', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+N 新对话', 'Ctrl+C 退出']
+          : ['Enter 发送', '/models 选择模型', 'Ctrl+C 退出']
+        : ['↑↓/滚轮 滚动', 'Enter 放大', 'y 复制', 'Ctrl+E 按此回答实施', 'Esc 返回'];
+    let x = 1;
+    for (const h of hints) {
+      if (x + textWidth(h) + 3 > s.cols) break;
+      const [key, ...rest] = h.split(' ');
+      x = s.put(x, y, key, '');
+      x = s.put(x, y, ' ' + rest.join(' '), DIM) + 3;
+    }
+  }
+
+  private drawBody(s: Screen, y: number, h: number): void {
+    if (this.panes.length === 0) return this.drawWelcome(s, y, h);
+    const bottom = this.bottomPane();
+    const zoomed = this.zoomId ? this.findPane(this.zoomId) : undefined;
+    if (zoomed) return this.drawPane(s, 0, y, s.cols, h, zoomed, true);
+    if (h < 12) {
+      // Too short to split: show one pane at a time.
+      const one = this.findPane(this.focus) ?? bottom ?? this.panes[this.activeAnswer];
+      return this.drawPane(s, 0, y, s.cols, h, one, this.focus === one.id);
+    }
+    // Before the synthesis the answers own the screen; afterwards they step
+    // back and the converged answer takes the larger share.
+    const ah = bottom ? clamp(Math.round(h * 0.4), 5, h - 6) : h;
+    const n = this.panes.length;
+    if (Math.floor(s.cols / n) < 30) {
+      const p = this.panes[this.activeAnswer];
+      this.drawPane(s, 0, y, s.cols, ah, p, this.focus === p.id, `${this.activeAnswer + 1}/${n} · Tab 切换`);
+    } else {
+      const w = Math.floor(s.cols / n);
+      this.panes.forEach((p, i) => {
+        this.drawPane(s, i * w, y, i === n - 1 ? s.cols - i * w : w, ah, p, this.focus === p.id);
+      });
+    }
+    if (bottom) this.drawPane(s, 0, y + ah, s.cols, h - ah, bottom, this.focus === bottom.id);
+  }
+
+  private drawWelcome(s: Screen, y: number, h: number): void {
+    const n = this.all.length;
+    const nameW = Math.max(...this.all.map((a) => textWidth(a.label)));
+    const mid = Math.floor((n - 1) / 2);
+    const diagramW = 2 + nameW + 4 + 12;
+    const x0 = Math.max(1, Math.floor((s.cols - diagramW) / 2));
+    const blockH = n + 4;
+    let row = y + Math.max(0, Math.floor((h - blockH) / 2));
+    this.all.forEach((a, i) => {
+      const on = this.selected.includes(a.id);
+      const known = this.installed.has(a.id);
+      const color = on ? this.colorOf(a.id) : BORDER;
+      let x = s.put(x0, row, !known ? SPIN[this.frame % 10] : on ? '●' : '○', color);
+      x = s.put(x + 1, row, a.label.padEnd(nameW), on ? `1;${color}` : DIM);
+      const joint = n === 1 ? '─' : i === mid ? (i === 0 ? '┬' : i === n - 1 ? '┴' : '┼') : i === 0 ? '╮' : i === n - 1 ? '╯' : '┤';
+      x = s.put(x + 1, row, '──' + joint, color === BORDER ? BORDER : DIM);
+      if (i === mid) {
+        x = s.put(x, row, '──▶ ', DIM);
+        s.put(x, row, '✦ 最优解', `1;${GOLD}`);
+      } else if (a.id === this.cfg.decider && this.installed.get(a.id)) {
+        s.put(x + 1, row, '决策', GOLD);
+      } else if (known && !this.installed.get(a.id)) {
+        s.put(x + 1, row, '未安装', BORDER);
+      }
+      row++;
+    });
+    const center = (text: string, st: string, at: number) => {
+      if (at < y + h) s.put(Math.max(1, Math.floor((s.cols - textWidth(text)) / 2)), at, truncate(text, s.cols - 2), st);
+    };
+    center('一个问题 · 多个模型 · 一份最优解', '', row + 1);
+    center('各模型独立作答，再由一个模型匿名评审、去伪存真', DIM, row + 2);
+  }
+
+  private drawPane(s: Screen, x: number, y: number, w: number, h: number, p: Pane, focused: boolean, hint = ''): void {
+    this.rects.push({ id: p.id, x, y, w, h });
+    const bst = focused ? p.color : BORDER;
+    const right = x + w - 1;
+    const innerW = Math.max(4, w - 4);
+    const innerH = Math.max(1, h - 2);
+
+    // content
+    let body = p.text;
+    if (p.error) body += `${body ? '\n\n' : ''}✗ ${p.error}`;
+    const key = `${body.length}|${p.reasoning.length}|${innerW}|${this.showReasoning}`;
+    if (p.cache?.key !== key) {
+      const lines = this.showReasoning && p.reasoning.trim() ? [...layout(p.reasoning.trim(), innerW, p.color, true), []] : [];
+      if (body) lines.push(...layout(body, innerW, p.color));
+      p.cache = { key, lines };
+    }
+    const lines = p.cache.lines;
+    p.viewH = innerH;
+    p.maxScroll = Math.max(0, lines.length - innerH);
+    if (p.follow) p.scroll = p.maxScroll;
+    p.scroll = clamp(p.scroll, 0, p.maxScroll);
+
+    // frame
+    s.put(x, y, '╭' + '─'.repeat(w - 2) + '╮', bst);
+    s.put(x, y + h - 1, '╰' + '─'.repeat(w - 2) + '╯', bst);
+    const thumbH = p.maxScroll ? Math.max(1, Math.round((innerH * innerH) / lines.length)) : 0;
+    const thumbY = p.maxScroll ? Math.round(((innerH - thumbH) * p.scroll) / p.maxScroll) : 0;
+    for (let i = 0; i < innerH; i++) {
+      const onThumb = thumbH > 0 && i >= thumbY && i < thumbY + thumbH;
+      s.put(x, y + 1 + i, '│', bst);
+      s.put(right, y + 1 + i, onThumb ? '┃' : '│', onThumb ? p.color : bst);
+      const line = lines[p.scroll + i];
+      if (line) s.putCells(x + 2, y + 1 + i, line, right - 1);
+    }
+    if (lines.length === 0 && p.status === 'run') {
+      s.put(x + 2, y + 1, truncate(p.tool ? `正在使用 ${p.tool}…` : '等待响应…', innerW), DIM, right - 1);
+    }
+
+    // title
+    const elapsed = secs((p.end ?? Date.now()) - p.start);
+    const icon = p.status === 'run' ? SPIN[this.frame % 10] : p.status === 'ok' ? (p.kind === 'answer' ? '●' : '✦') : '✗';
+    const status =
+      p.status === 'run'
+        ? `${elapsed}${p.tool ? ` · ${p.tool}` : ''}`
+        : p.status === 'ok'
+          ? `${elapsed} · ${Array.from(p.text).length} 字`
+          : `${elapsed} · 失败`;
+    let tx = s.put(x + 2, y, ' ', '', right);
+    tx = s.put(tx, y, icon + ' ', p.status === 'err' ? RED : p.color, right - 1);
+    tx = s.put(tx, y, p.title, `1;${p.color}`, right - 1);
+    tx = s.put(tx, y, `  ${status} `, DIM, right - 1);
+    if (hint && tx + textWidth(hint) + 4 < right) s.put(right - textWidth(hint) - 3, y, ` ${hint} `, DIM, right - 1);
+
+    // bottom edge: who is who, and where we are
+    if (p.note) s.put(x + 2, y + h - 1, ` ${p.note} `, DIM, right - 1);
+    if (p.maxScroll) {
+      const pos = ` ${Math.min(lines.length, p.scroll + innerH)}/${lines.length} `;
+      const px = right - textWidth(pos) - 2;
+      if (px > x + 2 + (p.note ? textWidth(p.note) + 3 : 0)) s.put(px, y + h - 1, pos, DIM, right - 1);
+    }
+  }
+}
+
+// Wheel and click reporting in SGR coordinates. Native text selection then needs Shift+drag.
+const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
+const MOUSE_OFF = '\x1b[?1006l\x1b[?1000l';
+
+/** Run the full-screen interface until the user quits. */
+export async function runTui(cwd: string): Promise<number> {
+  const out = process.stdout;
+  const stdin = process.stdin;
+  if (!out.isTTY || !stdin.isTTY) throw new Error('交互界面需要在终端中运行；脚本中请使用 unify ask');
+
+  const cfg = loadConfig(cwd);
+  const app = new App(
+    {
+      cols: () => out.columns ?? 80,
+      rows: () => out.rows ?? 24,
+      write: (s) => void out.write(s),
+      setMouse: (on) => void out.write(on ? MOUSE_ON : MOUSE_OFF),
+    },
+    cwd,
+    cfg,
+    Object.values(buildRegistry(cfg)),
+  );
+  const parser = new KeyParser();
+  const restore = () => out.write(MOUSE_OFF + '\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l');
+
+  // alternate screen, no auto-wrap, bracketed paste
+  out.write('\x1b[?1049h\x1b[?7l\x1b[?2004h' + MOUSE_ON);
+  stdin.setRawMode(true);
+  stdin.setEncoding('utf8');
+  stdin.resume();
+  process.on('exit', restore);
+
+  return new Promise<number>((resolve) => {
+    const onData = (d: string) => parser.feed(d).forEach((k) => app.handleKey(k));
+    const onResize = () => app.invalidate();
+    app.onQuit = () => {
+      app.dispose();
+      stdin.off('data', onData);
+      out.off('resize', onResize);
+      stdin.setRawMode(false);
+      stdin.pause();
+      restore();
+      process.off('exit', restore);
+      resolve(0);
+    };
+    stdin.on('data', onData);
+    out.on('resize', onResize);
+    void app.init();
+  });
+}

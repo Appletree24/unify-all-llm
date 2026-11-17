@@ -1,0 +1,23 @@
+{
+  "name": "unify-llm",
+  "version": "0.1.0",
+  "description": "Fan one prompt out to every LLM CLI you subscribe to, then synthesize the best answer.",
+  "type": "module",
+  "bin": {
+    "unify": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "dev": "tsc -p . --watch"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
