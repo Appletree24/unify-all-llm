@@ -1,5 +1,9 @@
 import { commandExists, runText } from '../core/proc.js';
 import type { ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
+import { z } from 'zod';
+import type { CustomProviderConfig } from '../core/config.js';
+import { sseData } from './sse.js';
+export type { CustomProviderConfig } from '../core/config.js';
 
 /**
  * A model plugged in from config, with no code change. Two transports:
@@ -11,17 +15,25 @@ import type { ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.j
  *
  * Custom models are answer-only: they cannot be the executor.
  */
-export type CustomProviderConfig =
-  | { type: 'openai'; label?: string; baseUrl: string; model: string; apiKeyEnv?: string; system?: string }
-  | { type: 'command'; label?: string; command: string; args?: string[] };
+const chunkSchema = z.object({
+  error: z.object({ message: z.string() }).passthrough().optional(),
+  choices: z.array(z.object({
+    index: z.number().optional(), finish_reason: z.string().nullable().optional(),
+    delta: z.object({
+      content: z.string().nullable().optional(), reasoning_content: z.string().optional(), reasoning: z.string().optional(),
+    }).optional(),
+  })).optional(),
+  usage: z.object({ prompt_tokens: z.number().optional(), completion_tokens: z.number().optional() }).nullable().optional(),
+});
 
 function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'openai' }>): ProviderAdapter {
   return {
     id,
     label: c.label ?? id,
+    capabilities: { askPolicy: 'text-only', exec: false },
     async detect() {
       // Configuration only; reachability is discovered on first use.
-      return { installed: !!(c.baseUrl && c.model), version: c.model };
+      return { installed: !c.apiKeyEnv || !!process.env[c.apiKeyEnv], version: c.model };
     },
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
       const key = c.apiKeyEnv ? process.env[c.apiKeyEnv] : undefined;
@@ -40,36 +52,38 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
         }),
       });
       if (!res.ok || !res.body) {
-        yield { type: 'error', message: `HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}` };
+        await res.body?.cancel();
+        yield { type: 'error', message: `HTTP ${res.status}` };
         return;
       }
       let acc = '';
-      let buf = '';
-      const decoder = new TextDecoder();
-      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-        buf += decoder.decode(chunk, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith('data:')) continue;
-          const data = line.slice(5).trim();
-          if (data === '[DONE]') continue;
-          let delta: any;
-          try {
-            delta = JSON.parse(data).choices?.[0]?.delta;
-          } catch {
-            continue;
-          }
-          const thought = delta?.reasoning_content ?? delta?.reasoning;
-          if (typeof thought === 'string' && thought) yield { type: 'reasoning', text: thought };
-          if (typeof delta?.content === 'string' && delta.content) {
-            acc += delta.content;
-            yield { type: 'delta', text: delta.content };
-          }
+      let finished = false;
+      let usage: { inputTokens?: number; outputTokens?: number } | undefined;
+      for await (const data of sseData(res.body)) {
+        if (data.trim() === '[DONE]') {
+          finished = true;
+          break;
+        }
+        const chunk = chunkSchema.parse(JSON.parse(data));
+        if (chunk.error) throw new Error(chunk.error.message);
+        if (chunk.usage) usage = { inputTokens: chunk.usage.prompt_tokens, outputTokens: chunk.usage.completion_tokens };
+        const choice = chunk.choices?.find((v) => (v.index ?? 0) === 0);
+        if (!choice) continue;
+        const delta = choice.delta;
+        if (finished && (delta?.content || delta?.reasoning || delta?.reasoning_content)) throw new Error('SSE 在完成后继续返回正文');
+        const thought = delta?.reasoning_content ?? delta?.reasoning;
+        if (thought) yield { type: 'reasoning', text: thought };
+        if (delta?.content) {
+          acc += delta.content;
+          yield { type: 'delta', text: delta.content };
+        }
+        if (choice.finish_reason != null) {
+          if (choice.finish_reason !== 'stop') throw new Error(`模型未完整回答: finish_reason=${choice.finish_reason}`);
+          finished = true;
         }
       }
-      yield { type: 'done', text: acc };
+      if (!finished) throw new Error('SSE 输出被截断：缺少 [DONE] 或 finish_reason');
+      yield { type: 'done', text: acc, usage };
     },
   };
 }
@@ -78,8 +92,9 @@ function commandAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'co
   return {
     id,
     label: c.label ?? id,
-    async detect() {
-      return { installed: await commandExists(c.command) };
+    capabilities: { askPolicy: 'unrestricted-command', exec: false },
+    async detect(signal) {
+      return { installed: await commandExists(c.command, signal) };
     },
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
       let acc = '';
@@ -97,6 +112,7 @@ export function customAdapter(id: string, c: CustomProviderConfig): ProviderAdap
   if (!inner) throw new Error(`自定义模型 "${id}" 的 type 必须是 "openai" 或 "command"`);
   return {
     ...inner,
+    configuration: c,
     async *run(req) {
       if (req.mode === 'exec') {
         yield { type: 'error', message: `${inner.label} 是只回答的自定义模型，不能用来实施` };

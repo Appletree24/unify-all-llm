@@ -5,9 +5,10 @@ import type { ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.j
 export const claude: ProviderAdapter = {
   id: 'claude',
   label: 'Claude',
+  capabilities: { askPolicy: 'read-tools', exec: true },
 
-  async detect() {
-    const version = await probeVersion('claude');
+  async detect(signal) {
+    const version = await probeVersion('claude', signal);
     return { installed: !!version, version };
   },
 
@@ -52,7 +53,6 @@ export const claude: ProviderAdapter = {
             usage: { inputTokens: ev.usage?.input_tokens, outputTokens: ev.usage?.output_tokens },
           };
         }
-        return;
       }
     }
   },

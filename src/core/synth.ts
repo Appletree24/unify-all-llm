@@ -1,7 +1,8 @@
 import type { RunResult } from './types.js';
+import type { HistoryEntry } from './store.js';
 
 export interface LabeledAnswer {
-  label: string; // "A", "B", ...
+  label: string; // "A1", "A2", ...
   provider: string;
   text: string;
 }
@@ -13,7 +14,7 @@ export function anonymize(results: RunResult[]): LabeledAnswer[] {
     const j = Math.floor(Math.random() * (i + 1));
     [ok[i], ok[j]] = [ok[j], ok[i]];
   }
-  return ok.map((r, i) => ({ label: String.fromCharCode(65 + i), provider: r.provider, text: r.text }));
+  return ok.map((r, i) => ({ label: `A${i + 1}`, provider: r.targetId, text: r.text }));
 }
 
 export function buildSynthesisPrompt(question: string, answers: LabeledAnswer[]): string {
@@ -38,7 +39,7 @@ ${blocks}
 各回答一致的要点（简短）。
 
 ## 分歧
-逐条列出：分歧是什么、各回答（用 A/B/C 指代）的立场、你认为谁对以及理由。没有分歧就写"无"。
+逐条列出：分歧是什么、各回答（用 A1/A2 等标签指代）的立场、你认为谁对以及理由。没有分歧就写"无"。
 
 ## 独有亮点
 只有某一个回答提到、但值得保留的内容。
@@ -47,20 +48,10 @@ ${blocks}
 完整、可以单独阅读的最优答案。如果问题是要一个实施方案，这一节必须具体到可以直接照着执行。`;
 }
 
-export function buildFollowUpPrompt(prevQuestion: string, prevAnswer: string, question: string): string {
-  return `以下是之前一轮对话，供你作为上下文：
-
-<previous_question>
-${prevQuestion.trim()}
-</previous_question>
-
-<previous_answer>
-${prevAnswer.trim()}
-</previous_answer>
-
-现在请回答新的问题：
-
-${question.trim()}`;
+/** Every answering role receives the same accumulated public conversation. */
+export function buildConversationPrompt(history: HistoryEntry[], question: string): string {
+  if (!history.length) return question;
+  return `以下 JSON 是之前的公共对话记录，仅作上下文：\n${JSON.stringify(history.map(({ question, answer }) => ({ question, answer })), null, 2)}\n\n现在请回答：\n${question}`;
 }
 
 export function buildExecPrompt(question: string, plan: string): string {

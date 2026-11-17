@@ -1,11 +1,10 @@
 import { spawn } from 'node:child_process';
 import { basename } from 'node:path';
-import { fanOut, runOne } from '../core/orchestrator.js';
-import { loadConfig, newRunId, saveRun, type Config, type RunRecord } from '../core/store.js';
-import { anonymize, buildExecPrompt, buildFollowUpPrompt, buildSynthesisPrompt } from '../core/synth.js';
-import type { ProviderAdapter, ProviderEvent } from '../core/types.js';
-import { decide } from '../core/decider.js';
+import { loadConfig, type Config, type RunRecord } from '../core/store.js';
+import type { ModelTarget, ProviderEvent } from '../core/types.js';
+import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
 import { buildRegistry } from '../providers/index.js';
+import { defaultTargetIds, detectTargets } from '../core/targets.js';
 import { KeyParser, type Key } from './keys.js';
 import { layout } from './markdown.js';
 import { Screen, charWidth, rgb, textWidth, truncate, type Cell } from './screen.js';
@@ -29,13 +28,13 @@ const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
 interface Pane {
-  id: string; // 'a:<provider>' | 'synth' | 'exec'
+  id: string; // 'a:<target>' | 'synth' | 'exec'
   kind: 'answer' | 'synth' | 'exec';
   title: string;
   color: string;
   text: string;
   reasoning: string;
-  status: 'run' | 'ok' | 'err';
+  status: 'run' | 'ok' | 'err' | 'cancelled' | 'timed_out';
   error?: string;
   tool?: string;
   note?: string;
@@ -65,8 +64,9 @@ export class App {
   private exec?: Pane;
   private question = '';
   private turn = 0;
-  private context?: { question: string; answer: string };
   private lastRun?: RunRecord;
+  private active?: WorkflowHandle;
+  private detecting = new AbortController();
 
   private chars: string[] = [];
   private caret = 0;
@@ -100,7 +100,7 @@ export class App {
     private io: TuiIO,
     private cwd: string,
     private cfg: Config,
-    private all: ProviderAdapter[],
+    private all: ModelTarget[],
   ) {}
 
   // ── lifecycle ────────────────────────────────────────────────────────────
@@ -112,22 +112,24 @@ export class App {
         this.render();
       }
     }, 100);
-    await Promise.all(
-      this.all.map(async (a) => {
-        this.installed.set(a.id, (await a.detect()).installed);
-        this.requestRender();
-      }),
-    );
-    // Everything registered answers by default, except the model reserved for deciding.
-    const wanted = this.cfg.providers ?? this.all.map((a) => a.id).filter((id) => id !== this.cfg.decider);
-    this.selected = wanted.filter((id) => this.installed.get(id));
+    this.installed = await detectTargets(this.all, this.detecting.signal);
+    if (this.disposed) return;
+    const wanted = defaultTargetIds(this.cfg, this.all);
+    this.selected = this.cfg.providers ?? wanted.filter((id) => this.installed.get(id));
     this.requestRender();
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.disposed = true;
     if (this.ticker) clearInterval(this.ticker);
     this.ctl?.abort();
+    this.detecting.abort();
+    await this.active?.done.catch(() => undefined);
+  }
+
+  /** Wait for model cleanup and record persistence; also used by terminal hosts. */
+  async waitForIdle(): Promise<void> {
+    await this.active?.done.catch(() => undefined);
   }
 
   invalidate(): void {
@@ -158,7 +160,7 @@ export class App {
     return PROVIDER_COLORS[id] ?? FALLBACK_COLORS[Math.max(0, this.all.findIndex((a) => a.id === id)) % FALLBACK_COLORS.length];
   }
 
-  private adapter(id: string): ProviderAdapter | undefined {
+  private adapter(id: string): ModelTarget | undefined {
     return this.all.find((a) => a.id === id);
   }
 
@@ -167,6 +169,7 @@ export class App {
   }
 
   private apply(p: Pane, ev: ProviderEvent): void {
+    p.cache = undefined;
     if (ev.type === 'delta') {
       p.text += ev.text;
       p.tool = undefined;
@@ -189,7 +192,7 @@ export class App {
         p.scroll = 0;
       }
     } else if (ev.type === 'error') {
-      p.status = 'err';
+      p.status = ev.status === 'cancelled' || ev.status === 'timed_out' ? ev.status : 'err';
       p.end = Date.now();
       p.error = ev.message;
     }
@@ -197,89 +200,45 @@ export class App {
   }
 
   // ── flows ────────────────────────────────────────────────────────────────
-  private async ask(question: string): Promise<void> {
-    let adapters = this.selected.map((id) => this.adapter(id)!).filter(Boolean);
-    if (adapters.length === 0) return this.say('没有可用的模型：请先安装并登录 claude / codex / gemini CLI', RED);
-
-    this.busy = true;
-    const ctl = (this.ctl = new AbortController());
-
-    // Optional System One step: let the decider pick who answers. A manual /models choice wins.
-    let synthesize = true;
-    let decisionNote = '';
-    const decider = this.cfg.decider ? this.adapter(this.cfg.decider) : undefined;
-    if (decider && !this.manualModels && adapters.length > 1 && this.installed.get(decider.id)) {
-      this.say(`${decider.label} 决策中…`, GOLD);
-      const d = await decide(decider, {
-        question,
-        available: adapters.map((a) => ({ id: a.id, label: a.label })),
-        cwd: this.cwd,
-        model: this.cfg.models?.[decider.id],
-        signal: ctl.signal,
-      }).catch(() => undefined);
-      if (ctl.signal.aborted) {
-        this.busy = false;
-        return this.requestRender();
-      }
-      if (d) {
-        adapters = adapters.filter((a) => d.providers.includes(a.id));
-        synthesize = d.synthesize;
-        decisionNote = `决策 · ${decider.label}: ${d.reason ?? adapters.map((a) => a.label).join('、')}`;
-      } else decisionNote = `${decider.label} 没有给出可用决策，已发给全部模型`;
+  private workflowEvent(ev: WorkflowEvent): void {
+    if (ev.type === 'stage' && ev.stage === 'answering') {
+      this.panes = ev.targets.map((t) => this.newPane(`a:${t.id}`, 'answer', t.label, this.colorOf(t.id)));
+    } else if (ev.type === 'call' && ev.scope === 'synthesis') {
+      this.synth = this.newPane('synth', 'synth', `汇总 · ${ev.target.label}`, GOLD);
+    } else if (ev.type === 'provider') {
+      const pane = ev.scope === 'answer' ? this.panes.find((p) => p.id === `a:${ev.targetId}`) : ev.scope === 'synthesis' ? this.synth : ev.scope === 'exec' ? this.exec : undefined;
+      if (pane) this.apply(pane, ev.event);
+    } else if (ev.type === 'notice') this.say(ev.message);
+    else if (ev.type === 'end' && this.synth && this.lastRun?.synthesis) {
+      this.synth.note = Object.entries(this.lastRun.synthesis.labels).map(([label, id]) => `${label}=${this.adapter(id)?.label ?? id}`).join('  ');
     }
+    this.requestRender();
+  }
 
+  private async ask(question: string, retryIds?: string[]): Promise<void> {
+    if (!this.selected.length) return this.say('没有可用的模型，请先配置模型并检查登录状态', RED);
+    const previous = this.lastRun;
+    this.busy = true;
+    this.ctl = new AbortController();
     this.question = question;
     this.turn++;
-    this.panes = adapters.map((a) => this.newPane(`a:${a.id}`, 'answer', a.label, this.colorOf(a.id)));
+    this.panes = [];
     this.synth = undefined;
     this.exec = undefined;
+    this.lastRun = undefined;
     this.zoomId = undefined;
     this.focus = 'input';
     this.activeAnswer = 0;
-    if (decisionNote) this.say(decisionNote);
-    const timeoutMs = (this.cfg.timeoutSec ?? 600) * 1000;
-    const labels = Object.fromEntries(adapters.map((a) => [a.id, a.label]));
-    const run: RunRecord = { id: newRunId(), createdAt: new Date().toISOString(), question, results: [] };
     this.render();
-
     try {
-      const prompt = this.context ? buildFollowUpPrompt(this.context.question, this.context.answer, question) : question;
-      run.results = await fanOut(adapters, {
-        prompt,
-        cwd: this.cwd,
-        mode: 'ask',
-        models: this.cfg.models,
-        timeoutMs,
-        signal: ctl.signal,
-        onEvent: (id, ev) => this.apply(this.panes.find((p) => p.id === `a:${id}`)!, ev),
+      this.active = startComparison({
+        cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
+        previous, manualSelection: this.manualModels, signal: this.ctl.signal,
+        retry: retryIds && previous ? { record: previous, targetIds: retryIds } : undefined,
+        onEvent: (ev) => this.workflowEvent(ev),
       });
-      if (ctl.signal.aborted) return;
-
-      const answers = anonymize(run.results);
-      if (answers.length >= 2 && synthesize) {
-        let synth = this.adapter(this.cfg.synthesizer ?? 'claude');
-        if (!synth || !this.installed.get(synth.id)) synth = this.adapter(answers[0].provider)!;
-        const pane = (this.synth = this.newPane('synth', 'synth', `汇总 · ${synth.label}`, GOLD));
-        pane.note = answers.map((a) => `${a.label}=${labels[a.provider]}`).join('  ');
-        const result = await runOne(synth, {
-          prompt: buildSynthesisPrompt(question, answers),
-          cwd: this.cwd,
-          mode: 'ask',
-          model: this.cfg.models?.[synth.id],
-          timeoutMs,
-          signal: ctl.signal,
-          onEvent: (_id, ev) => this.apply(pane, ev),
-        });
-        if (ctl.signal.aborted) return;
-        run.synthesis = { provider: synth.id, labels: Object.fromEntries(answers.map((a) => [a.label, a.provider])), result };
-      } else if (answers.length === 1 && adapters.length > 1) {
-        this.say('只有一个模型成功回答，已跳过汇总', YELLOW);
-      }
-
-      const best = run.synthesis?.result.ok ? run.synthesis.result.text : run.results.find((r) => r.ok)?.text;
-      if (best) this.context = { question, answer: best };
-      this.lastRun = run;
-      saveRun(this.cwd, run);
+      this.lastRun = this.active.record;
+      await this.active.done;
     } catch (err) {
       this.say(`出错: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
@@ -293,38 +252,20 @@ export class App {
     const run = this.lastRun;
     if (!run) return this.say('还没有可实施的方案：先提一个问题', YELLOW);
 
-    // A focused answer pane means "use this model's answer"; otherwise the synthesis.
-    let plan: string | undefined;
-    let source = '汇总结论';
     const focused = this.panes.find((p) => p.id === this.focus);
-    const ok = run.results.filter((r) => r.ok);
-    if (focused && focused.status === 'ok') {
-      plan = focused.text;
-      source = `${focused.title} 的回答`;
-    } else if (run.synthesis?.result.ok) {
-      plan = run.synthesis.result.text;
-    } else if (ok.length === 1) {
-      plan = ok[0].text;
-      source = `${this.adapter(ok[0].provider)?.label ?? ok[0].provider} 的回答`;
-    }
-    if (!plan) return this.say('没有可用的方案：用 Tab 选中某个模型的回答后再试', YELLOW);
-
-    const id = executorId ?? this.cfg.executor ?? 'claude';
-    let executor = this.adapter(id);
-    if (executorId && !executor) return this.say(`未知的模型 "${executorId}"`, RED);
-    if (!executor || !this.installed.get(executor.id)) executor = this.adapter(this.selected[0] ?? '');
-    if (!executor) return this.say('没有可用的执行模型', RED);
-
-    const chosen = executor;
-    const finalPlan = plan;
-    this.confirm = {
-      text: `按 y 确认 · 其他键取消 — 让 ${chosen.label} 按「${source}」修改 ${basename(this.cwd)}/ 下的文件`,
-      yes: () => void this.runExec(chosen, run.question, finalPlan),
-    };
+    const from = focused?.id.slice(2);
+    try {
+      const plan = selectPlan(run, from);
+      const chosen = chooseExecutor(this.all, executorId ?? this.cfg.executor, this.installed);
+      this.confirm = {
+        text: `按 y 确认 · 其他键取消 — 让 ${chosen.label} 按「${plan.source.targetId}」修改 ${basename(this.cwd)}/ 下的文件`,
+        yes: () => void this.runExec(chosen, run, from),
+      };
+    } catch (err) { return this.say(err instanceof Error ? err.message : String(err), YELLOW); }
     this.requestRender();
   }
 
-  private async runExec(executor: ProviderAdapter, question: string, plan: string): Promise<void> {
+  private async runExec(executor: ModelTarget, source: RunRecord, from?: string): Promise<void> {
     const pane = (this.exec = this.newPane('exec', 'exec', `实施 · ${executor.label}`, VIOLET));
     this.focus = 'input';
     this.zoomId = undefined;
@@ -332,16 +273,14 @@ export class App {
     const ctl = (this.ctl = new AbortController());
     this.render();
     try {
-      await runOne(executor, {
-        prompt: buildExecPrompt(question, plan),
-        cwd: this.cwd,
-        mode: 'exec',
-        model: this.cfg.models?.[executor.id],
-        timeoutMs: 3600_000,
-        signal: ctl.signal,
-        onEvent: (_id, ev) => this.apply(pane, ev),
+      this.active = startExecution({
+        cwd: this.cwd, config: this.cfg, targets: this.all, executor, source, from, signal: ctl.signal,
+        onEvent: (ev) => { if (ev.type === 'provider') this.apply(pane, ev.event); },
       });
+      await this.active.done;
       if (pane.status === 'ok') this.say('实施完成，请用 git diff 检查改动', GOLD);
+    } catch (err) {
+      this.say(`实施失败: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
       this.busy = false;
       this.requestRender();
@@ -371,7 +310,7 @@ export class App {
     if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
     this.panes = [];
     this.synth = this.exec = undefined;
-    this.context = this.lastRun = undefined;
+    this.lastRun = undefined;
     this.question = '';
     this.turn = 0;
     this.focus = 'input';
@@ -383,12 +322,25 @@ export class App {
     const [name, ...rest] = line.slice(1).trim().split(/\s+/);
     const arg = rest.join(' ');
     if (name === 'exec') this.startExec(arg || undefined);
+    else if (name === 'cancel') {
+      if (!this.busy) return this.say('没有正在运行的请求');
+      if (!arg) this.ctl?.abort();
+      else if (!this.active?.cancelTarget(arg)) return this.say(`目标 ${arg} 未在回答`, YELLOW);
+      this.say(arg ? `已取消 ${arg}` : '已取消当前请求', YELLOW);
+    } else if (name === 'retry') {
+      if (this.busy) return this.say('请先等待当前请求结束', YELLOW);
+      if (!this.lastRun) return this.say('没有可重试的记录', YELLOW);
+      const ids = arg ? arg.split(/[,\s]+/) : this.lastRun.targets.filter((t) => !this.lastRun!.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id);
+      if (!ids.length) return this.say('没有失败目标；用 /retry 目标 指定重新回答');
+      void this.ask(this.lastRun.question, ids);
+    }
     else if (name === 'new') this.newConversation();
     else if (name === 'copy') this.copy();
     else if (name === 'quit' || name === 'exit') this.onQuit();
     else if (name === 'models') {
       if (!arg) return this.say(`当前: ${this.selected.join(', ') || '无'}    用法: /models claude,codex`);
       const ids = arg.split(/[,\s]+/).filter(Boolean);
+      if (new Set(ids).size !== ids.length) return this.say('不能重复选择同一个目标；请在 targets 中配置不同模型', RED);
       const bad = ids.find((id) => !this.installed.get(id));
       if (bad) return this.say(`"${bad}" 不可用（未安装或不存在）`, RED);
       this.selected = ids;
@@ -403,7 +355,7 @@ export class App {
       this.cfg = { ...this.cfg, synthesizer: arg };
       this.say(`汇总模型: ${arg}`);
     } else {
-      this.say('命令: /exec [模型]  /models a,b  /synth 模型  /mouse  /new  /copy  /quit');
+      this.say('命令: /exec /models /synth /cancel [目标] /retry [目标] /mouse /new /copy /exit /quit');
     }
   }
 
@@ -717,8 +669,8 @@ export class App {
     const hints =
       this.focus === 'input'
         ? this.panes.length
-          ? ['Tab 切换面板', '滚轮 滚动', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+N 新对话', 'Ctrl+C 退出']
-          : ['Enter 发送', '/models 选择模型', 'Ctrl+C 退出']
+          ? ['Tab 切换面板', '滚轮 滚动', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+N 新对话', '/exit 退出']
+          : ['Enter 发送', '/models 选择模型', '/exit 退出']
         : ['↑↓/滚轮 滚动', 'Enter 放大', 'y 复制', 'Ctrl+E 按此回答实施', 'Esc 返回'];
     let x = 1;
     for (const h of hints) {
@@ -834,7 +786,7 @@ export class App {
         ? `${elapsed}${p.tool ? ` · ${p.tool}` : ''}`
         : p.status === 'ok'
           ? `${elapsed} · ${Array.from(p.text).length} 字`
-          : `${elapsed} · 失败`;
+          : `${elapsed} · ${p.status === 'cancelled' ? '已取消' : p.status === 'timed_out' ? '超时' : '失败'}`;
     let tx = s.put(x + 2, y, ' ', '', right);
     tx = s.put(tx, y, icon + ' ', p.status === 'err' ? RED : p.color, right - 1);
     tx = s.put(tx, y, p.title, `1;${p.color}`, right - 1);
@@ -856,7 +808,7 @@ const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
 const MOUSE_OFF = '\x1b[?1006l\x1b[?1000l';
 
 /** Run the full-screen interface until the user quits. */
-export async function runTui(cwd: string): Promise<number> {
+export async function runTui(cwd: string, signal?: AbortSignal): Promise<number> {
   const out = process.stdout;
   const stdin = process.stdin;
   if (!out.isTTY || !stdin.isTTY) throw new Error('交互界面需要在终端中运行；脚本中请使用 unify ask');
@@ -886,18 +838,26 @@ export async function runTui(cwd: string): Promise<number> {
   return new Promise<number>((resolve) => {
     const onData = (d: string) => parser.feed(d).forEach((k) => app.handleKey(k));
     const onResize = () => app.invalidate();
-    app.onQuit = () => {
-      app.dispose();
+    let closing = false;
+    const quit = async (code = 0) => {
+      if (closing) return;
+      closing = true;
       stdin.off('data', onData);
       out.off('resize', onResize);
+      signal?.removeEventListener('abort', onAbort);
+      await app.dispose();
       stdin.setRawMode(false);
       stdin.pause();
       restore();
       process.off('exit', restore);
-      resolve(0);
+      resolve(code);
     };
+    const onAbort = () => { void quit(130); };
+    app.onQuit = () => { void quit(); };
     stdin.on('data', onData);
     out.on('resize', onResize);
-    void app.init();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    else void app.init().catch(() => quit(1));
   });
 }

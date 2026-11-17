@@ -1,0 +1,110 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+import { loadRun, listRunIds } from '../dist/core/store.js';
+import { workspace } from './helpers.mjs';
+
+const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+const model = new URL('fixtures/model-cli.mjs', import.meta.url).href;
+
+function environment(t) {
+  const cwd = workspace(t);
+  const bin = join(cwd, 'bin');
+  const home = join(cwd, 'home');
+  mkdirSync(bin);
+  mkdirSync(join(home, '.unify'), { recursive: true });
+  for (const name of ['claude', 'codex', 'gemini']) {
+    const path = join(bin, name);
+    writeFileSync(path, `#!${process.execPath}\nimport ${JSON.stringify(model)};\n`);
+    chmodSync(path, 0o755);
+  }
+  writeFileSync(join(home, '.unify', 'config.json'), '{"disableClaude":true}');
+  writeFileSync(join(cwd, 'unify.config.json'), JSON.stringify({
+    providers: ['fast', 'deep'], synthesizer: 'fast',
+    targets: { fast: { provider: 'codex', model: 'fast' }, deep: { provider: 'codex', model: 'deep' } },
+  }));
+  return { cwd, env: { ...process.env, HOME: home, PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, UNIFY_TEST_LOG: join(cwd, 'calls.jsonl') } };
+}
+
+async function invoke(args, opts, onOutput) {
+  const child = spawn(process.execPath, [cli, ...args], { ...opts, timeout: 10000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', (s) => { stdout += s; onOutput?.(stdout, child); });
+  child.stderr.on('data', (s) => { stderr += s; });
+  const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+  return { code, stdout, stderr };
+}
+
+test('CLI JSONL separates target, provider and call identities; continue and retry read records', { skip: process.platform === 'win32' }, async (t) => {
+  const opts = environment(t);
+  const result = await invoke(['ask', 'FIRST', '--json'], opts);
+  assert.equal(result.code, 0, result.stderr);
+  const events = result.stdout.trim().split('\n').map(JSON.parse);
+  assert.ok(events.every((e) => e.schemaVersion === 2 && e.turnId));
+  const calls = events.filter((e) => e.type === 'call' && e.scope === 'answer');
+  assert.deepEqual(calls.map((e) => e.target.id), ['fast', 'deep']);
+  assert.ok(calls.every((e) => e.target.provider === 'codex'));
+  assert.notEqual(calls[0].callId, calls[1].callId);
+  assert.equal(events.at(-1).status, 'completed');
+  assert.equal((await invoke(['ask', '-c', 'SECOND', '--json', '--no-synth'], opts)).code, 0);
+  const current = loadRun(opts.cwd);
+  assert.match(current.input.prompt, /FIRST/);
+  assert.match(current.input.prompt, /SECOND/);
+  const retry = await invoke(['retry', current.id, '--target', 'deep', '--json'], opts);
+  assert.equal(retry.code, 0, retry.stderr);
+  assert.equal(loadRun(opts.cwd).retryOf, current.id);
+  const log = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(log.every((l) => l.name !== 'claude'), 'disabled Claude must never execute, including --version');
+});
+
+test('fixture CLI adapters require their terminal and a successful process exit', { skip: process.platform === 'win32' }, async (t) => {
+  for (const provider of ['codex', 'gemini', 'claude']) for (const scenario of ['normal', 'truncate', 'late-failure']) {
+    const opts = environment(t);
+    // A generated fake executable is used here; no installed model CLI is invoked.
+    writeFileSync(join(opts.env.HOME, '.unify', 'config.json'), '{}');
+    writeFileSync(join(opts.cwd, 'unify.config.json'), JSON.stringify({ providers: [provider] }));
+    opts.env.UNIFY_TEST_SCENARIO = scenario;
+    const result = await invoke(['ask', 'fixture', '--json'], opts);
+    assert.equal(result.code, scenario === 'normal' ? 0 : 1, `${provider}/${scenario}: ${result.stderr}`);
+    const record = loadRun(opts.cwd);
+    assert.equal(record.results[0].status, scenario === 'normal' ? 'succeeded' : 'failed');
+    if (provider === 'gemini') {
+      const log = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+      assert.ok(log.some((l) => l.args.includes('plan')));
+    }
+  }
+});
+
+test('CLI execution is durable and failed configuration never launches a model', { skip: process.platform === 'win32' }, async (t) => {
+  const opts = environment(t);
+  assert.equal((await invoke(['ask', 'implement', '--json'], opts)).code, 0);
+  const source = loadRun(opts.cwd);
+  const result = await invoke(['exec', source.id, '--with', 'fast', '--yes'], opts);
+  assert.equal(result.code, 0, result.stderr);
+  const execution = loadRun(opts.cwd);
+  assert.equal(execution.kind, 'execution');
+  assert.equal(execution.planSource.turnId, source.id);
+  assert.equal(listRunIds(opts.cwd).length, 2);
+  const before = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8');
+  const bad = await invoke(['ask', 'Q', '--timeout', 'Infinity'], opts);
+  assert.equal(bad.code, 1);
+  assert.equal(readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8'), before);
+});
+
+test('CLI SIGINT keeps stdout valid JSONL and saves partial results before exit', { skip: process.platform === 'win32' }, async (t) => {
+  const opts = environment(t);
+  opts.env.UNIFY_TEST_SCENARIO = 'wait';
+  let cancelled = false;
+  const result = await invoke(['ask', 'Q', '--json', '--models', 'fast'], opts, (output, child) => {
+    if (!cancelled && output.includes('"type":"delta"')) { cancelled = true; child.kill('SIGINT'); }
+  });
+  assert.equal(result.code, 130, result.stderr);
+  const events = result.stdout.trim().split('\n').map(JSON.parse);
+  assert.equal(events.at(-1).status, 'cancelled');
+  const record = loadRun(opts.cwd);
+  assert.equal(record.results[0].status, 'cancelled');
+  assert.equal(record.results[0].text, 'answer-fast');
+});

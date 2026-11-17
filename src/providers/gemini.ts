@@ -1,21 +1,22 @@
 import { probeVersion, runJsonl } from '../core/proc.js';
 import type { ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
 
-// UNVERIFIED: written from memory of Gemini CLI's headless `--output-format stream-json`
-// because the CLI was not installed when this was written. Check the flags and event
-// shapes against `gemini --help` and a real run before trusting this adapter.
+// Protocol and policy: geminicli.com/docs/cli/{headless,plan-mode}/.
+// Plan mode is provider policy, not an OS sandbox; it may write planning files.
 export const gemini: ProviderAdapter = {
   id: 'gemini',
   label: 'Gemini',
+  capabilities: { askPolicy: 'provider-plan', exec: true },
 
-  async detect() {
-    const version = await probeVersion('gemini');
+  async detect(signal) {
+    const version = await probeVersion('gemini', signal);
     return { installed: !!version, version };
   },
 
   async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
     const args = ['--output-format', 'stream-json'];
     if (req.mode === 'exec') args.push('--approval-mode', 'auto_edit');
+    else args.push('--approval-mode', 'plan');
     if (req.model) args.push('-m', req.model);
 
     let acc = '';
@@ -27,11 +28,10 @@ export const gemini: ProviderAdapter = {
         yield { type: 'reasoning', text: ev.content };
       } else if (ev.type === 'tool_use') {
         yield { type: 'tool', name: String(ev.tool_name ?? ev.name ?? 'tool') };
-      } else if (ev.type === 'error') {
+      } else if (ev.type === 'error' && ev.severity !== 'warning') {
         yield { type: 'error', message: String(ev.message ?? 'unknown error') };
-        return;
       } else if (ev.type === 'result') {
-        if (ev.status && ev.status !== 'success') {
+        if (ev.status !== 'success') {
           yield { type: 'error', message: String(ev.error?.message ?? ev.status) };
         } else {
           yield {
@@ -40,7 +40,6 @@ export const gemini: ProviderAdapter = {
             usage: { inputTokens: ev.stats?.input_tokens, outputTokens: ev.stats?.output_tokens },
           };
         }
-        return;
       }
     }
   },

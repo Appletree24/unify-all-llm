@@ -1,5 +1,4 @@
-import { runOne } from './orchestrator.js';
-import type { ProviderAdapter } from './types.js';
+import { z } from 'zod';
 
 /**
  * The decider is a fast "System One" step that runs before the fan-out and
@@ -18,12 +17,9 @@ export interface Decision {
 export interface DecideInput {
   question: string;
   available: { id: string; label: string }[];
-  cwd: string;
-  model?: string;
-  signal?: AbortSignal;
 }
 
-function buildPrompt(input: DecideInput): string {
+export function buildDecisionPrompt(input: DecideInput): string {
   return `你是一个路由决策器。根据下面的问题，决定应该让哪些模型回答，以及是否需要对它们的回答做汇总评审。
 
 可用模型: ${input.available.map((a) => `${a.id}（${a.label}）`).join('、')}
@@ -46,35 +42,21 @@ export function parseDecision(reply: string, available: string[]): Decision | un
   const start = reply.indexOf('{');
   const end = reply.lastIndexOf('}');
   if (start < 0 || end <= start) return undefined;
-  let obj: any;
+  let obj: unknown;
   try {
     obj = JSON.parse(reply.slice(start, end + 1));
   } catch {
     return undefined;
   }
-  if (!Array.isArray(obj?.providers)) return undefined;
-  const providers = available.filter((id) => obj.providers.includes(id));
+  const parsed = z.object({ providers: z.array(z.string()), synthesize: z.boolean(), reason: z.string().optional() }).safeParse(obj);
+  if (!parsed.success) return undefined;
+  const value = parsed.data;
+  if (value.providers.some((id) => !available.includes(id))) return undefined;
+  const providers = available.filter((id) => value.providers.includes(id));
   if (providers.length === 0) return undefined;
   return {
     providers,
-    synthesize: providers.length >= 2 && obj.synthesize !== false,
-    reason: typeof obj.reason === 'string' ? obj.reason.slice(0, 200) : undefined,
+    synthesize: providers.length >= 2 && value.synthesize,
+    reason: value.reason?.slice(0, 200),
   };
-}
-
-/**
- * Ask the decider. A decision is advice, never a gate: on timeout, error or
- * an unparseable reply this resolves undefined and the caller asks everyone.
- */
-export async function decide(decider: ProviderAdapter, input: DecideInput): Promise<Decision | undefined> {
-  const res = await runOne(decider, {
-    prompt: buildPrompt(input),
-    cwd: input.cwd,
-    mode: 'ask',
-    model: input.model,
-    timeoutMs: 60_000,
-    signal: input.signal,
-  });
-  if (!res.ok) return undefined;
-  return parseDecision(res.text, input.available.map((a) => a.id));
 }

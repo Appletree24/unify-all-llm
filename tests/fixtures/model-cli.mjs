@@ -1,0 +1,28 @@
+import { appendFileSync } from 'node:fs';
+import { basename } from 'node:path';
+
+const name = basename(process.argv[1]).replace(/\.cmd$/, '');
+if (process.env.UNIFY_TEST_LOG) appendFileSync(process.env.UNIFY_TEST_LOG, JSON.stringify({ name, args: process.argv.slice(2) }) + '\n');
+if (process.argv.includes('--version')) {
+  process.stdout.write('fixture-1.0\n');
+} else {
+  let prompt = '';
+  for await (const chunk of process.stdin) prompt += chunk;
+  const emit = (event) => process.stdout.write(JSON.stringify(event) + '\n');
+  const scenario = process.env.UNIFY_TEST_SCENARIO;
+  const modelFlag = process.argv.findIndex((a) => a === '-m' || a === '--model');
+  const answer = `answer-${modelFlag >= 0 ? process.argv[modelFlag + 1] : name}`;
+  if (name === 'codex') {
+    emit({ type: 'item.completed', item: { type: 'agent_message', text: answer } });
+    if (scenario === 'wait') await new Promise(() => setInterval(() => {}, 1000));
+    if (scenario !== 'truncate') emit({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 5 } });
+  } else if (name === 'claude') {
+    emit({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: answer } } });
+    if (scenario !== 'truncate') emit({ type: 'result', result: answer });
+  } else if (name === 'gemini') {
+    emit({ type: 'error', severity: 'warning', message: 'advisory' });
+    emit({ type: 'message', role: 'assistant', content: answer });
+    if (scenario !== 'truncate') emit({ type: 'result', status: 'success', stats: { input_tokens: 3, output_tokens: 5 } });
+  }
+  if (scenario === 'late-failure') process.exitCode = 2;
+}

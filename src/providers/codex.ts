@@ -5,9 +5,10 @@ import type { ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.j
 export const codex: ProviderAdapter = {
   id: 'codex',
   label: 'Codex',
+  capabilities: { askPolicy: 'sandbox-read-only', exec: true },
 
-  async detect() {
-    const version = await probeVersion('codex');
+  async detect(signal) {
+    const version = await probeVersion('codex', signal);
     return { installed: !!version, version };
   },
 
@@ -41,10 +42,8 @@ export const codex: ProviderAdapter = {
           text: req.mode === 'ask' ? last || acc : acc,
           usage: { inputTokens: ev.usage?.input_tokens, outputTokens: ev.usage?.output_tokens },
         };
-        return;
       } else if (ev.type === 'turn.failed' || ev.type === 'error') {
         yield { type: 'error', message: String(ev.error?.message ?? ev.message ?? 'unknown error') };
-        return;
       }
     }
   },

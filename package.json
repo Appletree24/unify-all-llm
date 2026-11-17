@@ -11,7 +11,11 @@
   ],
   "scripts": {
     "build": "tsc -p .",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "dev": "tsc -p . --watch"
+  },
+  "dependencies": {
+    "zod": "^4.1.12"
   },
   "engines": {
     "node": ">=20"

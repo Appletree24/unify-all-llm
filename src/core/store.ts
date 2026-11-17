@@ -1,88 +1,157 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { CustomProviderConfig } from '../providers/custom.js';
-import type { RunResult } from './types.js';
+import { hostname } from 'node:os';
+import { z } from 'zod';
+import { customSchema, readJson } from './config.js';
+export { loadConfig, type Config } from './config.js';
 
-export interface Config {
-  /** Providers to ask. Default: every installed one. */
-  providers?: string[];
-  synthesizer?: string;
-  executor?: string;
-  models?: Record<string, string>;
-  timeoutSec?: number;
-  /** Extra models, keyed by id: an OpenAI-compatible endpoint or a stdin/stdout command. */
-  custom?: Record<string, CustomProviderConfig>;
-  /** Model that routes each question before the fan-out (see core/decider.ts). Off when unset. */
-  decider?: string;
-}
+const safeId = z.string().regex(/^[\w-]+$/);
+const capabilities = z.object({
+  askPolicy: z.enum(['read-tools', 'sandbox-read-only', 'provider-plan', 'text-only', 'unrestricted-command']),
+  exec: z.boolean(),
+});
+const targetSchema = z.object({ id: safeId, label: z.string(), provider: safeId, model: z.string().optional(), capabilities, configuration: customSchema.optional() });
+const resultSchema = z.object({
+  runId: safeId, targetId: safeId, provider: safeId, model: z.string().optional(),
+  status: z.enum(['running', 'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted']),
+  ok: z.boolean(), text: z.string(), reasoning: z.string(), error: z.string().optional(), durationMs: z.number().nonnegative(),
+  usage: z.object({ inputTokens: z.number().optional(), outputTokens: z.number().optional() }).optional(),
+  observerErrors: z.array(z.string()).optional(),
+}).refine((r) => r.ok === (r.status === 'succeeded'), 'ok 与 status 不一致');
+const historySchema = z.array(z.object({ turnId: safeId, question: z.string(), answer: z.string() }));
+const inputSchema = z.object({ prompt: z.string(), cwd: z.string(), history: historySchema });
+const sourceSchema = z.object({ turnId: safeId, runId: safeId, targetId: safeId, scope: z.enum(['answer', 'synthesis']) });
+const recordSchema = z.object({
+  schemaVersion: z.literal(2), kind: z.enum(['comparison', 'execution']), id: safeId, sessionId: safeId,
+  parentTurnId: safeId.optional(), retryOf: safeId.optional(), createdAt: z.string(), updatedAt: z.string(),
+  owner: z.object({ pid: z.number().int().positive(), hostname: z.string() }).optional(),
+  question: z.string(), input: inputSchema, targets: z.array(targetSchema),
+  status: z.enum(['created', 'deciding', 'answering', 'synthesizing', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']),
+  error: z.string().optional(), results: z.array(resultSchema),
+  calls: z.array(z.object({
+    id: safeId, scope: z.enum(['decision', 'answer', 'synthesis', 'exec']), target: targetSchema,
+    input: z.object({ prompt: z.string(), cwd: z.string(), mode: z.enum(['ask', 'exec']), timeoutMs: z.number().positive() }),
+    result: resultSchema,
+  })),
+  decision: z.object({ providers: z.array(safeId), synthesize: z.boolean(), reason: z.string().optional() }).optional(),
+  synthesis: z.object({ provider: safeId, labels: z.record(z.string(), safeId), result: resultSchema }).optional(),
+  planSource: sourceSchema.optional(),
+  observerErrors: z.array(z.string()).optional(),
+});
+export type RunRecord = z.infer<typeof recordSchema>;
+export type CallRecord = RunRecord['calls'][number];
+export type HistoryEntry = z.infer<typeof historySchema>[number];
+export type PlanSource = z.infer<typeof sourceSchema>;
 
-export interface RunRecord {
-  id: string;
-  createdAt: string;
-  question: string;
-  results: RunResult[];
-  synthesis?: { provider: string; labels: Record<string, string>; result: RunResult };
-}
+const legacyResult = z.object({
+  provider: safeId, ok: z.boolean(), text: z.string(), reasoning: z.string().default(''),
+  error: z.string().optional(), durationMs: z.number().nonnegative(), usage: resultSchema.shape.usage,
+});
+const legacySchema = z.object({
+  id: safeId, createdAt: z.string(), question: z.string(), results: z.array(legacyResult),
+  synthesis: z.object({ provider: safeId, labels: z.record(z.string(), safeId), result: legacyResult }).optional(),
+});
 
-function readJson<T>(path: string): T | undefined {
-  if (!existsSync(path)) return undefined;
-  try {
-    return JSON.parse(readFileSync(path, 'utf8')) as T;
-  } catch (err) {
-    throw new Error(`无法解析 ${path}: ${err instanceof Error ? err.message : err}`);
-  }
-}
-
-/**
- * Project config (./unify.config.json) overrides user config (~/.unify/config.json),
- * except `custom`: that can run commands and send prompts to arbitrary servers, so it
- * is only honored from the user config and never from a repository you happen to be in.
- */
-export function loadConfig(cwd: string): Config {
-  const user = readJson<Config>(join(homedir(), '.unify', 'config.json')) ?? {};
-  const project = readJson<Config>(join(cwd, 'unify.config.json')) ?? {};
-  return { ...user, ...project, models: { ...user.models, ...project.models }, custom: user.custom };
+export function newRunId(): string {
+  return `${new Date().toISOString().replace(/[-:.]/g, '')}-${process.hrtime.bigint().toString().padStart(20, '0')}-${randomUUID()}`;
 }
 
 const runsDir = (cwd: string) => join(cwd, '.unify', 'runs');
 
-export function newRunId(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+function runDir(cwd: string, id: string): string {
+  return join(runsDir(cwd), safeId.parse(id));
 }
 
-/** Writes run.json plus one readable .md per answer. Returns the run directory. */
+function atomicWrite(path: string, content: string): void {
+  const temp = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temp, 'wx', 0o600);
+  try {
+    try { writeFileSync(fd, content, 'utf8'); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(temp, path);
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+/** Reserve an exclusive directory before starting model work. */
+export function createRun(cwd: string, run: RunRecord): void {
+  mkdirSync(runsDir(cwd), { recursive: true, mode: 0o700 });
+  mkdirSync(runDir(cwd, run.id), { mode: 0o700 });
+  saveRun(cwd, run);
+}
+
+/** run.json is authoritative; readable exports are atomically replaced individually. */
 export function saveRun(cwd: string, run: RunRecord): string {
-  const dir = join(runsDir(cwd), run.id);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'run.json'), JSON.stringify(run, null, 2), 'utf8');
-  writeFileSync(join(dir, 'question.md'), run.question, 'utf8');
-  for (const r of run.results) {
-    writeFileSync(join(dir, `${r.provider}.md`), r.ok ? r.text : `**失败**: ${r.error ?? ''}\n\n${r.text}`, 'utf8');
-  }
-  if (run.synthesis?.result.ok) {
-    writeFileSync(join(dir, 'synthesis.md'), run.synthesis.result.text, 'utf8');
-  }
+  const dir = runDir(cwd, run.id);
+  run.updatedAt = new Date().toISOString();
+  atomicWrite(join(dir, 'run.json'), JSON.stringify(recordSchema.parse(run), null, 2) + '\n');
   return dir;
 }
 
-export function listRunIds(cwd: string): string[] {
-  const dir = runsDir(cwd);
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => e.name)
-    .sort();
+export function exportRun(cwd: string, run: RunRecord): void {
+  const dir = runDir(cwd, run.id);
+  atomicWrite(join(dir, 'question.md'), run.question + '\n');
+  for (const r of run.results) atomicWrite(join(dir, `answer-${safeId.parse(r.targetId)}.md`), `${r.ok ? '' : `**${r.status}**: ${r.error ?? ''}\n\n`}${r.text}\n`);
+  if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), `${run.synthesis.result.text}\n`);
 }
 
-/** Load a run by id, or the latest when id is omitted. */
+export function listRunIds(cwd: string): string[] {
+  try {
+    return readdirSync(runsDir(cwd), { withFileTypes: true }).filter((e) => e.isDirectory() && safeId.safeParse(e.name).success).map((e) => e.name).sort();
+  } catch (err) {
+    if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return [];
+    throw err;
+  }
+}
+
+function ownerAlive(run: RunRecord): boolean {
+  if (!run.owner || run.owner.hostname !== hostname()) return false;
+  try { process.kill(run.owner.pid, 0); return true; }
+  catch (err) { return err instanceof Error && 'code' in err && err.code === 'EPERM'; }
+}
+
+/** Legacy records are normalized in memory. Unfinished records without a live owner are interrupted. */
 export function loadRun(cwd: string, id?: string): RunRecord {
   const target = id ?? listRunIds(cwd).at(-1);
-  if (!target) throw new Error('当前目录下还没有任何记录，先运行 unify ask');
-  if (!/^[\w-]+$/.test(target)) throw new Error(`无效的记录 id: ${target}`);
-  const run = readJson<RunRecord>(join(runsDir(cwd), target, 'run.json'));
-  if (!run) throw new Error(`找不到记录 ${target}`);
+  if (!target) throw new Error('当前目录下还没有记录');
+  const raw = readJson(join(runDir(cwd, target), 'run.json'));
+  if (!raw) throw new Error(`找不到记录 ${target}`);
+  let run: RunRecord;
+  if (typeof raw === 'object' && 'schemaVersion' in raw) run = recordSchema.parse(raw);
+  else {
+    const old = legacySchema.parse(raw);
+    const convert = (r: z.infer<typeof legacyResult>, suffix: string): z.infer<typeof resultSchema> => ({
+      ...r, targetId: r.provider, runId: `${old.id}-${suffix}`, status: r.ok ? 'succeeded' : 'failed',
+    });
+    run = {
+      schemaVersion: 2, kind: 'comparison', id: old.id, sessionId: old.id,
+      createdAt: old.createdAt, updatedAt: old.createdAt, question: old.question,
+      input: { cwd, prompt: old.question, history: [] }, targets: [], calls: [],
+      status: old.results.some((r) => r.ok) ? 'completed' : 'failed',
+      results: old.results.map((r, i) => convert(r, String(i))),
+      synthesis: old.synthesis ? { ...old.synthesis, result: convert(old.synthesis.result, 'synth') } : undefined,
+    };
+  }
+  if (run.id !== target) throw new Error('记录 id 与目录不一致');
+  if (['created', 'deciding', 'answering', 'synthesizing'].includes(run.status) && !ownerAlive(run)) {
+    run.status = 'interrupted';
+    for (const result of [...run.results, ...run.calls.map((c) => c.result), ...(run.synthesis ? [run.synthesis.result] : [])]) {
+      if (result.status === 'running') { result.status = 'interrupted'; result.ok = false; result.error = '上次执行未保存终态'; }
+    }
+  }
   return run;
+}
+
+export function latestComparison(cwd: string): RunRecord {
+  for (const id of listRunIds(cwd).reverse()) {
+    const run = loadRun(cwd, id);
+    if (run.kind === 'comparison') return run;
+  }
+  throw new Error('没有可继续的问答记录');
+}
+
+export function historyAfter(run: RunRecord): HistoryEntry[] {
+  const best = run.synthesis?.result.ok ? run.synthesis.result : run.results.find((r) => r.ok && r.text.trim());
+  return [...run.input.history, ...(best ? [{ turnId: run.id, question: run.question, answer: best.text }] : [])];
 }
