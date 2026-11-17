@@ -6,6 +6,7 @@ import { loadConfig, type Config, type RunRecord } from '../core/store.js';
 import type { ModelTarget, ProviderEvent } from '../core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
 import { defaultContext } from '../memory/scan.js';
+import type { MemoryContext } from '../memory/types.js';
 import { startMemoryServer, type MemoryServer } from '../memory/server.js';
 import { buildRegistry } from '../providers/index.js';
 import { defaultTargetIds, detectTargets } from '../core/targets.js';
@@ -13,6 +14,7 @@ import { COMMANDS, complete, listFiles, type Completion } from './complete.js';
 import { Editor } from './editor.js';
 import { KeyParser, type Key } from './keys.js';
 import { layout } from './markdown.js';
+import { MemoryView } from './memory.js';
 import { Screen, charWidth, rgb, textWidth, truncate, type Cell } from './screen.js';
 
 // ── palette ────────────────────────────────────────────────────────────────
@@ -94,6 +96,7 @@ export class App {
   private tokens = { input: 0, output: 0 };
   private branch = '';
   private memory?: Promise<MemoryServer>;
+  private mem?: MemoryView;
 
   private focus = 'input';
   private zoomId?: string;
@@ -123,6 +126,7 @@ export class App {
     private cwd: string,
     private cfg: Config,
     private all: ModelTarget[],
+    private memoryCtx: MemoryContext = defaultContext(cwd),
   ) {}
 
   // ── lifecycle ────────────────────────────────────────────────────────────
@@ -309,6 +313,20 @@ export class App {
     }
   }
 
+  /** Show the memory manager in place of the comparison screen until it is closed. */
+  openMemory(): void {
+    try {
+      this.mem = new MemoryView(this.memoryCtx, { close: () => { this.mem = undefined; }, web: () => this.memoryWeb() });
+    } catch (err) { this.say(`无法读取记忆: ${err instanceof Error ? err.message : err}`, RED); }
+    this.requestRender();
+  }
+
+  /** One web server per session; it stops when the TUI exits. */
+  private memoryWeb(): Promise<string> {
+    this.memory ??= startMemoryServer(this.memoryCtx);
+    return this.memory.then((m) => { this.requestRender(); return m.url; }, (err) => { this.memory = undefined; this.requestRender(); throw err; });
+  }
+
   private begin(): void {
     this.busy = true;
     this.busySince = Date.now();
@@ -390,12 +408,8 @@ export class App {
     else if (name === 'copy') this.copy();
     else if (name === 'help') this.help = true;
     else if (name === 'memory') {
-      // One server per session; it stops when the TUI exits.
-      this.memory ??= startMemoryServer(defaultContext(this.cwd));
-      this.memory.then((m) => this.say(`记忆管理界面（仅本机）: ${m.url}`, GOLD), (err) => {
-        this.memory = undefined;
-        this.say(`无法启动记忆管理界面: ${err instanceof Error ? err.message : err}`, RED);
-      });
+      if (arg === 'web') this.memoryWeb().then((url) => this.say(`记忆管理界面（仅本机）: ${url}`, GOLD), (err) => this.say(`无法启动记忆管理界面: ${err instanceof Error ? err.message : err}`, RED));
+      else this.openMemory();
     }
     else if (name === 'quit' || name === 'exit') this.onQuit();
     else if (name === 'models') {
@@ -422,6 +436,11 @@ export class App {
 
   // ── input ────────────────────────────────────────────────────────────────
   handleKey(k: Key): void {
+    if (this.mem) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      this.mem.handleKey(k);
+      return this.requestRender();
+    }
     if (k.name === 'wheelup' || k.name === 'wheeldown' || k.name === 'click') {
       this.mouse(k);
       return this.requestRender();
@@ -706,6 +725,10 @@ export class App {
     const s = new Screen(cols, rows);
     this.cursor = null;
     this.rects = [];
+    if (this.mem) {
+      this.cursor = this.mem.draw(s);
+      return s;
+    }
     this.drawHeader(s);
     const inputH = this.drawInput(s);
     this.drawFooter(s);
@@ -1003,7 +1026,7 @@ const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
 const MOUSE_OFF = '\x1b[?1006l\x1b[?1000l';
 
 /** Run the full-screen interface until the user quits. */
-export async function runTui(cwd: string, signal?: AbortSignal): Promise<number> {
+export async function runTui(cwd: string, signal?: AbortSignal, open?: 'memory'): Promise<number> {
   const out = process.stdout;
   const stdin = process.stdin;
   if (!out.isTTY || !stdin.isTTY) throw new Error('交互界面需要在终端中运行；脚本中请使用 unify ask');
@@ -1054,6 +1077,6 @@ export async function runTui(cwd: string, signal?: AbortSignal): Promise<number>
     out.on('resize', onResize);
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
-    else void app.init().catch(() => quit(1));
+    else void app.init().then(() => { if (open === 'memory') app.openMemory(); }).catch(() => quit(1));
   });
 }

@@ -67,7 +67,7 @@ test('TUI rejects duplicate target selection and /exit remains available', async
   submit(app, '/models a,a');
   app.invalidate();
   assert.match(app.snapshot().join('\n'), /不能重复选择/);
-  submit(app, '/memory');
+  submit(app, '/memory web');
   while (!/记忆管理界面/.test(app.snapshot().join('\n'))) { await new Promise((r) => setTimeout(r, 10)); app.invalidate(); }
   const url = /http:\/\/127\.0\.0\.1:\d+\//.exec(app.snapshot().join('\n'))[0];
   assert.match(await (await fetch(url)).text(), /Unify 记忆/);
@@ -211,4 +211,48 @@ test('TUI queues follow-ups while busy, Esc interrupts, and Ctrl+C needs two pre
   assert.match(screen(app), /再按一次 Ctrl\+C 退出/);
   app.handleKey({ name: 'ctrl+c' });
   assert.equal(quit, 1);
+});
+
+test('TUI memory view browses layers, edits a memory in place and undoes it', async (t) => {
+  const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs');
+  const base = workspace(t);
+  const home = `${base}/home`, cwd = `${base}/proj`;
+  mkdirSync(`${home}/.claude`, { recursive: true });
+  mkdirSync(`${home}/.codex`, { recursive: true });
+  mkdirSync(cwd);
+  writeFileSync(`${home}/.claude/CLAUDE.md`, '# 偏好\n\n- 回答使用中文\n- 改动前先说明计划\n');
+  writeFileSync(`${cwd}/CLAUDE.md`, '- 测试用 npm test\n');
+  writeFileSync(`${home}/.codex/AGENTS.md`, '- 先读测试\n');
+  const app = new App({ cols: () => 110, rows: () => 30, write() {} }, cwd, {}, [target('a', async function* () { yield { type: 'done', text: 'a' }; })],
+    { cwd, home, env: {}, platform: 'linux' });
+  t.after(() => app.dispose());
+  await app.init();
+  const press = (...names) => names.forEach((name) => app.handleKey(name.length === 1 ? { name: 'char', text: name } : { name }));
+  submit(app, '/memory');
+  let view = screen(app);
+  assert.match(view, /1 Claude Code\s+2 Codex\s+3 Gemini CLI\s+4 Pi/);
+  assert.match(view, /2 用户记忆\s+启动 · 人工/);
+  assert.match(view, /› {3}● ~\/\.claude\/CLAUDE\.md\s+2 │/);
+  assert.match(view, /偏好\n.*回答使用中文\n.*文件修改于/);
+
+  press('enter', 'down', 'e');
+  assert.match(screen(app), /编辑 ~\/\.claude\/CLAUDE\.md 第 4 行/);
+  app.handleKey({ name: 'paste', text: '，并等我确认' });
+  press('enter');
+  assert.equal(readFileSync(`${home}/.claude/CLAUDE.md`, 'utf8'), '# 偏好\n\n- 回答使用中文\n- 改动前先说明计划，并等我确认\n');
+  assert.match(screen(app), /已保存，按 u 撤销/);
+
+  press('c');
+  assert.match(screen(app), /复制到[\s\S]*Codex · 全局指令 · ~\/\.codex\/AGENTS\.md/);
+  press('down', 'down', 'down', 'enter'); // project → local → auto memory index → Codex global
+  assert.equal(readFileSync(`${home}/.codex/AGENTS.md`, 'utf8'), '- 先读测试\n\n## 偏好\n\n- 改动前先说明计划，并等我确认\n'); // the section travels with it
+
+  press('u', 'y');
+  assert.equal(readFileSync(`${home}/.codex/AGENTS.md`, 'utf8'), '- 先读测试\n');
+  press('tab');
+  assert.match(screen(app), /› {3}● ~\/\.codex\/AGENTS\.md\s+1 │/);
+  press('x');
+  assert.match(screen(app), /Codex 启动时的记忆上下文[\s\S]*<!-- 全局指令 · ~\/\.codex\/AGENTS\.md -->\n - 先读测试/);
+  press('esc', 'q');
+  assert.match(screen(app), /✦ unify/);
 });

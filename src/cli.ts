@@ -21,7 +21,7 @@ const HELP = `unify — 同时提问多个模型，再汇总与实施
   unify show [记录id]            查看结果及部分输出
   unify list                    查看记录
   unify doctor                  检查目标及能力
-  unify memory                  在浏览器中查看和管理各工具的记忆
+  unify memory                  查看和管理各工具的记忆（网页；--tui 为终端界面）
 
 ask 选项:
   -m, --models a,b               选择独立目标 id，不允许重复
@@ -38,6 +38,7 @@ retry 选项:
       --json                    输出 JSONL；继承原轮实际输入和模型
 
 memory 选项:
+      --tui                     在终端里交互式查看和修改
       --list                    在终端打印分层结构，不启动网页
       --json                    输出扫描结果 JSON
       --effective id            打印某个工具启动时拼接后的记忆（claude/codex/gemini/pi）
@@ -162,7 +163,8 @@ async function cmdExec(argv: string[]): Promise<number> {
 }
 
 async function cmdMemory(args: string[]): Promise<number> {
-  const { values } = parseArgs({ args, options: { list: { type: 'boolean' }, json: { type: 'boolean' }, effective: { type: 'string' }, port: { type: 'string' } } });
+  const { values } = parseArgs({ args, options: { tui: { type: 'boolean' }, list: { type: 'boolean' }, json: { type: 'boolean' }, effective: { type: 'string' }, port: { type: 'string' } } });
+  if (values.tui) return runTui(cwd, abort.signal, 'memory');
   const ctx = defaultContext(cwd);
   if (values.effective) { process.stdout.write(effectiveContext(scanMemory(ctx), values.effective)); return 0; }
   if (values.json) { process.stdout.write(JSON.stringify(scanMemory(ctx), null, 2) + '\n'); return 0; }
