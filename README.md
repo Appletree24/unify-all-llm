@@ -34,7 +34,7 @@ node dist/cli.js exec --with codex
 
 ### 同一个 CLI 比较多个模型
 
-`provider` 是协议适配器，`target` 是用户选择的模型配置。内置 `claude`、`codex`、`gemini` 各自也有同名默认目标。
+`provider` 是协议适配器，`target` 是用户选择的模型配置。内置 `claude`、`codex`、`gemini`、`deepseek` 各自也有同名默认目标。
 
 ```json
 {
@@ -56,6 +56,30 @@ node dist/cli.js exec --with codex
 替换示例中的模型名后使用。`providers`、`synthesizer`、`executor` 和 `decider` 引用目标 id；`--models fast,deep` 与 TUI `/models fast,deep` 使用相同 id。重复选择同一个 id 会报错。两个不同目标可以共用一个 provider，各自拥有独立的调用 id、结果和面板。
 
 旧的 `"models": {"codex": "<模型名>"}` 配置仍可用。`models.<目标id>` 显式覆盖该目标的 `model`。未配置 `providers` 时，使用所有可用目标，排除 `decider` 本身；需要控制调用数量时，请明确列出 `providers`。
+
+### DeepSeek
+
+DeepSeek 是内置目标，直接调用官方 API（`https://api.deepseek.com`，OpenAI 兼容协议），不需要安装 CLI。在 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 创建 API key 并放进环境变量即可：
+
+```sh
+export DEEPSEEK_API_KEY=sk-...
+node dist/cli.js doctor
+node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
+```
+
+默认模型是 `deepseek-flash`。换模型或同时比较多个模型用 `models` / `targets`，项目配置和用户配置都可以写：
+
+```json
+{
+  "models": { "deepseek": "deepseek-flash" },
+  "targets": {
+    "deepseek-pro": { "provider": "deepseek", "model": "deepseek-v4-pro", "label": "DeepSeek Pro" }
+  },
+  "providers": ["codex", "deepseek", "deepseek-pro"]
+}
+```
+
+模型名以 [DeepSeek 文档](https://api-docs.deepseek.com/) 为准。未设置 `DEEPSEEK_API_KEY` 时该目标显示为不可用，不会被默认选中；设置后，未配置 `providers` 的项目会把它计入默认目标。DeepSeek 按 API 用量计费，与网页版/App 的账号无关。它只回答，不运行本地工具，也不能作为实施目标；思考过程（`reasoning_content`）会显示在思考面板。需要走网关或代理时，在用户配置的 `custom.deepseek` 中写一个 `openai` 端点即可替换内置目标。
 
 ### OpenAI 兼容端点和自定义命令
 
@@ -92,6 +116,7 @@ node dist/cli.js exec --with codex
 | Claude | 限定 Read/Glob/Grep/WebSearch/WebFetch 工具 | 是 |
 | Codex | CLI `read-only` sandbox | 是 |
 | Gemini | CLI `plan` approval mode | 是 |
+| DeepSeek | 只发送 messages，不运行本地工具 | 否 |
 | OpenAI 端点 | 只发送 messages，不运行本地工具 | 否 |
 | 自定义命令 | 任意受信任命令，无内置隔离 | 否 |
 
