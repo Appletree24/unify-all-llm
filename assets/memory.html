@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unify 记忆</title>
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --line: #e2dfd6; --text: #1f1e1b; --dim: #6f6c63; --faint: #a09c90;
+  --accent: #9a6a12; --accent-bg: #fbf1d9; --ok: #2c7a51; --warn: #b45f06; --err: #b3261e; --agent: #6b4bc4; --human: #2563a8;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #17171a; --panel: #1f2024; --line: #33343a; --text: #e8e6e1; --dim: #a3a09a; --faint: #6d6b66;
+    --accent: #e8c468; --accent-bg: #3a3118; --ok: #5cc48f; --warn: #eba75a; --err: #f07f77; --agent: #b79cff; --human: #7fb2ee; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button { max-width: 100%; overflow-wrap: anywhere; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+button.danger:hover { border-color: var(--err); color: var(--err); }
+button.link { border: 0; background: none; padding: 0 4px; color: var(--dim); }
+button.link:hover { color: var(--accent); }
+input, select, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+textarea { width: 100%; font-family: var(--mono); font-size: 13px; line-height: 1.5; resize: vertical; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+header { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); padding: 10px 20px 0; }
+.top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.top h1 { font-size: 16px; margin: 0; color: var(--accent); }
+.top .cwd { font-family: var(--mono); font-size: 12px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.top input { width: 240px; max-width: 100%; }
+.tabs { display: flex; gap: 2px; margin-top: 10px; overflow-x: auto; }
+.tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 14px 8px; color: var(--dim); white-space: nowrap; }
+.tab.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.tab.off { color: var(--faint); }
+.tab small { margin-left: 6px; color: var(--faint); font-weight: 400; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; padding: 16px 20px 60px; max-width: 1400px; margin: 0 auto; }
+@media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 60px; } }
+.summary { color: var(--dim); margin: 0 0 10px; }
+.budget { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin-bottom: 16px; }
+.budget b { font-variant-numeric: tabular-nums; }
+.bar { flex: 1; min-width: 120px; height: 8px; border-radius: 4px; background: var(--line); display: flex; overflow: hidden; }
+.bar i { display: block; height: 100%; }
+.layer { position: relative; padding-left: 34px; margin-bottom: 14px; }
+.layer::before { content: ""; position: absolute; left: 12px; top: 26px; bottom: -14px; width: 2px; background: var(--line); }
+.layer:last-child::before { display: none; }
+.layer .n { position: absolute; left: 0; top: 2px; width: 26px; height: 26px; border-radius: 50%; background: var(--panel); border: 2px solid var(--c, var(--line)); display: grid; place-items: center; font-size: 12px; font-weight: 700; color: var(--c, var(--dim)); }
+.layer.ondemand .n { border-style: dashed; }
+.layer h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 30px; }
+.layer .note { color: var(--dim); font-size: 13px; margin: 2px 0 8px; max-width: 80ch; }
+.badge { font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
+.badge.agent { color: var(--agent); border-color: var(--agent); }
+.badge.human { color: var(--human); border-color: var(--human); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.err { color: var(--err); border-color: var(--err); }
+.file { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+.file.missing { border-style: dashed; background: none; }
+.file.shadow { opacity: .6; }
+.fh { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 7px 12px; }
+.fh .path { font-family: var(--mono); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.fh .meta { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.fh .acts { margin-left: auto; display: flex; gap: 2px; flex-wrap: wrap; }
+.heading { padding: 4px 12px; font-size: 12px; color: var(--dim); border-top: 1px solid var(--line); background: color-mix(in srgb, var(--line) 30%, transparent); }
+.entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 7px 12px; border-top: 1px solid var(--line); }
+.entry:hover { background: color-mix(in srgb, var(--accent-bg) 45%, transparent); }
+.entry pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.entry.code pre, .entry.editing textarea { font-family: var(--mono); font-size: 13px; }
+.entry .origin { grid-column: 1; font-size: 12px; color: var(--faint); display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.entry .acts { grid-row: 1 / span 2; grid-column: 2; display: flex; gap: 0; align-items: start; opacity: 0; }
+.entry:hover .acts, .entry:focus-within .acts { opacity: 1; }
+@media (hover: none) { .entry .acts { opacity: 1; } }
+@media (max-width: 600px) {
+  .entry { grid-template-columns: minmax(0, 1fr); }
+  .entry .acts { grid-row: auto; grid-column: 1; opacity: 1; margin-left: -4px; }
+  .layer { padding-left: 0; } .layer::before { display: none; }
+  .layer .n { position: static; display: inline-grid; width: 22px; height: 22px; margin-right: 6px; vertical-align: middle; float: left; margin-top: 4px; }
+  .fh .acts { margin-left: 0; }
+}
+.entry.editing { display: block; background: var(--accent-bg); }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+mark { background: var(--accent-bg); color: inherit; border-radius: 2px; }
+aside h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 0 0 8px; }
+aside section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+.issue { font-size: 13px; padding: 5px 0; border-top: 1px solid var(--line); cursor: pointer; overflow-wrap: anywhere; }
+.issue:first-of-type { border-top: 0; }
+.issue::before { content: "●"; margin-right: 6px; color: var(--faint); }
+.issue.warn::before { color: var(--warn); } .issue.error::before { color: var(--err); }
+.empty { color: var(--faint); font-size: 13px; }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text); padding: 0; width: min(920px, calc(100vw - 32px)); max-height: calc(100vh - 48px); }
+dialog::backdrop { background: rgba(0, 0, 0, .45); }
+dialog .dh { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+dialog .dh b { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; flex: 1; }
+dialog .db { padding: 14px; overflow: auto; max-height: calc(100vh - 170px); }
+dialog .df { display: flex; gap: 8px; justify-content: flex-end; align-items: center; padding: 10px 14px; border-top: 1px solid var(--line); }
+dialog pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: 13px; }
+.hist { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 12px; font-size: 13px; align-items: center; }
+.hist .t { color: var(--dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+#toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 7px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100vw - 32px); }
+#toast.on { opacity: 1; }
+#toast.bad { background: var(--err); color: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>✦ Unify 记忆</h1>
+    <span class="cwd" id="cwd"></span>
+    <input id="q" type="search" placeholder="搜索所有记忆…" aria-label="搜索所有记忆">
+    <button id="refresh" title="重新扫描">刷新</button>
+  </div>
+  <nav class="tabs" id="tabs"></nav>
+</header>
+<main>
+  <div id="layers"></div>
+  <aside>
+    <section><h3>问题与建议</h3><div id="issues"></div></section>
+    <section><h3>最近的修改</h3><div id="backups"></div></section>
+  </aside>
+</main>
+<dialog id="dlg"></dialog>
+<div id="toast" role="status"></div>
+<script>
+'use strict';
+const token = location.hash.slice(1);
+const $ = (id) => document.getElementById(id);
+/** Build DOM without innerHTML: memory content is untrusted text. */
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'style') el.style.cssText = v;
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid);
+  return el;
+}
+async function api(path, body) {
+  const res = await fetch(path, { method: body ? 'POST' : 'GET', headers: { 'x-unify-token': token, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status });
+  return data;
+}
+let toastTimer;
+function toast(text, bad) {
+  const t = $('toast');
+  t.textContent = text; t.className = 'on' + (bad ? ' bad' : '');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.className = ''), bad ? 6000 : 2500);
+}
+const ago = (ms) => {
+  const s = (Date.now() - ms) / 1000;
+  if (s < 60) return '刚刚';
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  if (s < 86400 * 30) return `${Math.floor(s / 86400)} 天前`;
+  return new Date(ms).toLocaleDateString();
+};
+const kb = (n) => (n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`);
+const kilo = (n) => (n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`);
+const SCOPE = { managed: ['组织', '--err'], user: ['用户', '--human'], project: ['项目', '--ok'], local: ['本地', '--warn'], nested: ['子目录', '--dim'], auto: ['自动', '--agent'], agent: ['子代理', '--agent'] };
+const WRITER = { human: ['人工维护', 'human'], agent: ['模型写入', 'agent'], admin: ['管理员下发', ''] };
+
+let state, raw = '', current = localStorage.getItem('unify-memory-harness') || '', query = '', busy = false;
+
+async function load(quiet) {
+  try {
+    const next = await api('/api/state');
+    const text = JSON.stringify(next);
+    if (text === raw) return;
+    raw = text; state = next;
+    if (!state.harnesses.some((x) => x.id === current)) current = (state.harnesses.find((x) => x.detected) || state.harnesses[0]).id;
+    render();
+    loadBackups();
+  } catch (err) { if (!quiet) toast(err.message, true); }
+}
+const harness = () => state.harnesses.find((x) => x.id === current);
+const matches = (e) => !query || e.text.toLowerCase().includes(query) || e.heading.join(' ').toLowerCase().includes(query);
+const countMatches = (hn) => hn.layers.reduce((a, l) => a + l.files.reduce((b, f) => b + f.entries.filter(matches).length, 0), 0);
+
+function render() {
+  $('cwd').textContent = state.cwd;
+  $('tabs').replaceChildren(...state.harnesses.map((hn) => {
+    const n = hn.layers.reduce((a, l) => a + l.files.filter((f) => f.exists).length, 0);
+    return h('button', { class: `tab${hn.id === current ? ' on' : ''}${hn.detected ? '' : ' off'}`, onclick: () => { current = hn.id; localStorage.setItem('unify-memory-harness', current); render(); } },
+      hn.name, h('small', {}, query ? `${countMatches(hn)} 处匹配` : hn.detected ? `${n} 个文件 · ~${kilo(hn.effective.tokens)} tok` : '未使用'));
+  }));
+  const hn = harness();
+  const startup = hn.layers.flatMap((l) => l.files.filter((f) => f.exists && f.load === 'startup' && !f.shadowedBy).map((f) => ({ l, f })));
+  const total = Math.max(1, startup.reduce((a, x) => a + x.f.tokens, 0));
+  $('layers').replaceChildren(
+    h('p', { class: 'summary' }, hn.summary),
+    h('div', { class: 'budget' },
+      h('span', {}, '启动时载入 ', h('b', {}, String(hn.effective.files)), ' 个文件 · 约 ', h('b', {}, kilo(hn.effective.tokens)), ' tokens · ', kb(hn.effective.bytes)),
+      h('div', { class: 'bar', title: '各层占启动上下文的比例' }, startup.map((x) => h('i', { style: `width:${(x.f.tokens / total) * 100}%;background:var(${SCOPE[x.l.scope][1]})`, title: `${x.l.title} · ${x.f.display} · ~${x.f.tokens} tok` }))),
+      h('button', { onclick: showEffective }, '查看拼接结果')),
+    ...hn.layers.map((l, i) => renderLayer(l, i)));
+  const issues = hn.issues;
+  $('issues').replaceChildren(...(issues.length ? issues.map((it) => h('div', { class: `issue ${it.level}`, onclick: () => it.path && focusFile(it.path) }, it.message)) : [h('div', { class: 'empty' }, '没有发现问题')]));
+}
+
+function renderLayer(l, i) {
+  const [scopeName, color] = SCOPE[l.scope];
+  const [writerName, writerClass] = WRITER[l.writer];
+  return h('section', { class: `layer${l.load === 'on-demand' ? ' ondemand' : ''}`, style: `--c:var(${color})` },
+    h('div', { class: 'n' }, String(i + 1)),
+    h('h2', {}, l.title,
+      h('span', { class: 'badge' }, scopeName),
+      h('span', { class: 'badge' }, l.load === 'startup' ? '启动时载入' : '按需载入'),
+      h('span', { class: `badge ${writerClass}` }, writerName),
+      l.readonly && h('span', { class: 'badge' }, '只读')),
+    h('p', { class: 'note' }, l.note),
+    l.files.map((f) => renderFile(l, f)),
+    l.dirs.map((d) => h('button', { onclick: () => newFile(d) }, `＋ 在 ${shorten(d)} 新建文件`)));
+}
+const shorten = (p) => (p.startsWith(state.cwd + '/') ? p.slice(state.cwd.length + 1) : p.startsWith(state.home + '/') ? '~' + p.slice(state.home.length) : p);
+
+function renderFile(l, f) {
+  const el = h('div', { class: `file${f.exists ? '' : ' missing'}${f.shadowedBy ? ' shadow' : ''}`, 'data-path': f.path });
+  const acts = h('div', { class: 'acts' });
+  if (f.exists) {
+    if (f.writable) acts.append(h('button', { class: 'link', onclick: () => addEntry(f) }, '＋ 新增'), h('button', { class: 'link', onclick: () => editFile(f) }, '编辑全文'));
+    else acts.append(h('button', { class: 'link', onclick: () => editFile(f) }, '查看全文'));
+    acts.append(h('button', { class: 'link', onclick: () => showHistory(f) }, '来历'));
+    if (f.writable) acts.append(h('button', { class: 'link danger', onclick: () => removeFile(f) }, '删除'));
+  } else if (f.writable) acts.append(h('button', { onclick: () => editFile(f) }, '创建'));
+  el.append(h('div', { class: 'fh' },
+    h('span', { class: 'path', title: f.path }, f.display),
+    !f.exists && h('span', { class: 'badge' }, l.readonly ? '未配置' : '尚未创建'),
+    f.shadowedBy && h('span', { class: 'badge warn', title: '同目录中有优先级更高的文件' }, `被 ${f.shadowedBy} 取代`),
+    f.importedBy && h('span', { class: 'badge', title: '通过 @导入 引入' }, `由 ${f.importedBy} 导入`),
+    f.appliesTo && h('span', { class: 'badge', title: '只在处理匹配这些路径的文件时载入' }, `仅 ${f.appliesTo.join(', ')}`),
+    f.exists && f.load !== l.load && !f.appliesTo && h('span', { class: 'badge' }, f.load === 'startup' ? '启动时载入' : '按需载入'),
+    f.sharedWith && h('span', { class: 'badge human', title: '同一个文件也被这些工具读取，修改会同时影响它们' }, `与 ${f.sharedWith.join('、')} 共用`),
+    f.exists && f.tracked === false && h('span', { class: 'badge' }, '未纳入 Git'),
+    f.exists && h('span', { class: 'meta' }, `${f.lines} 行 · ~${f.tokens} tok · 修改于 ${ago(f.mtime)}`),
+    acts));
+  if (f.meta && (f.meta.description || f.meta.name)) el.append(h('div', { class: 'heading' }, [f.meta.name, f.meta.type && `类型 ${f.meta.type}`, f.meta.description].filter(Boolean).join(' · ')));
+  let last = null;
+  for (const e of f.entries.filter(matches)) {
+    const path = e.heading.filter(Boolean).join(' › ');
+    if (path !== last) { if (path) el.append(h('div', { class: 'heading' }, path)); last = path; }
+    el.append(renderEntry(f, e));
+  }
+  if (f.exists && !f.entries.length) el.append(h('div', { class: 'entry' }, h('span', { class: 'empty' }, '（没有内容）')));
+  return el;
+}
+
+function highlight(text) {
+  if (!query) return [text];
+  const out = []; const lower = text.toLowerCase(); let at = 0, i;
+  while ((i = lower.indexOf(query, at)) >= 0) { out.push(text.slice(at, i), h('mark', {}, text.slice(i, i + query.length))); at = i + query.length; }
+  out.push(text.slice(at));
+  return out;
+}
+function originOf(f, e) {
+  const o = e.origin || { kind: 'untracked' };
+  const parts = [];
+  if (o.via) parts.push(h('span', { class: 'badge agent' }, o.via));
+  if (o.kind === 'git') parts.push(`${o.commit.author} · ${ago(o.commit.time)} · `, h('span', { title: o.commit.hash }, o.commit.summary));
+  else if (o.kind === 'uncommitted') parts.push('未提交的改动');
+  else parts.push(`文件修改于 ${ago(f.mtime)}`);
+  parts.push(h('span', {}, `· 第 ${e.start}${e.end > e.start ? `–${e.end}` : ''} 行`));
+  return parts;
+}
+function renderEntry(f, e) {
+  const row = h('div', { class: `entry ${e.kind}` }, h('pre', {}, highlight(e.text)), h('div', { class: 'origin' }, originOf(f, e)));
+  if (f.writable) row.append(h('div', { class: 'acts' },
+    h('button', { class: 'link', onclick: () => editEntry(row, f, e) }, '编辑'),
+    h('button', { class: 'link', onclick: () => transfer(f, e) }, '复制/移动'),
+    h('button', { class: 'link danger', onclick: () => act({ op: 'delete', path: f.path, baseHash: f.hash, start: e.start, end: e.end }, '已删除，可在“最近的修改”中恢复') }, '删除')));
+  return row;
+}
+
+async function act(body, done) {
+  try { await api('/api/entry', body); toast(done); await load(); return true; }
+  catch (err) { toast(err.message, true); if (err.status === 409) await load(); return false; }
+}
+function editEntry(row, f, e) {
+  busy = true;
+  const ta = h('textarea', { rows: String(Math.min(16, e.text.split('\n').length + 1)) });
+  ta.value = e.text;
+  const cancel = () => { busy = false; render(); };
+  const save = async () => { busy = false; if (!(await act({ op: 'update', path: f.path, baseHash: f.hash, start: e.start, end: e.end, text: ta.value }, '已保存'))) render(); };
+  ta.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') cancel(); if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) save(); });
+  row.className = 'entry editing';
+  row.replaceChildren(ta, h('div', { class: 'row' }, h('button', { class: 'primary', onclick: save }, '保存'), h('button', { onclick: cancel }, '取消'), h('span', { class: 'empty' }, 'Ctrl/⌘+Enter 保存 · Esc 取消')));
+  ta.focus();
+}
+
+function dialog(title, bodyKids, footKids) {
+  const d = $('dlg');
+  busy = true;
+  d.replaceChildren(h('div', { class: 'dh' }, h('b', {}, title), h('button', { class: 'link', onclick: () => d.close(), 'aria-label': '关闭' }, '✕')), h('div', { class: 'db' }, bodyKids), footKids && h('div', { class: 'df' }, footKids));
+  d.onclose = () => { busy = false; };
+  if (!d.open) d.showModal();
+  return d;
+}
+function editFile(f) {
+  const ta = h('textarea', { rows: '22', spellcheck: 'false' });
+  ta.value = f.content || '';
+  ta.readOnly = !f.writable;
+  const save = async () => {
+    try { await api('/api/file', { path: f.path, content: ta.value, baseHash: f.exists ? f.hash : '' }); $('dlg').close(); toast(f.exists ? '已保存' : '已创建'); await load(); }
+    catch (err) { toast(err.status === 409 ? '文件已在别处被修改。请复制你的改动，关闭后重新打开再合并。' : err.message, true); }
+  };
+  ta.addEventListener('keydown', (ev) => { if (ev.key === 's' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); if (f.writable) save(); } });
+  dialog(f.display, [ta, f.sharedWith && h('p', { class: 'empty' }, `这个文件也被 ${f.sharedWith.join('、')} 读取，修改会同时影响它们。`)],
+    f.writable ? [h('span', { class: 'empty', style: 'margin-right:auto' }, '保存前的版本会自动备份'), h('button', { onclick: () => $('dlg').close() }, '取消'), h('button', { class: 'primary', onclick: save }, f.exists ? '保存' : '创建')] : null);
+  ta.focus();
+}
+function addEntry(f) {
+  const ta = h('textarea', { rows: '5', placeholder: '- 一条新的记忆' });
+  const headings = [...new Set(f.entries.map((e) => e.heading[e.heading.length - 1]).filter(Boolean))];
+  const sel = h('select', {}, h('option', { value: '' }, '文件末尾'), headings.map((x) => h('option', { value: x }, `「${x}」小节`)));
+  const save = async () => { if (await act({ op: 'add', path: f.path, baseHash: f.hash, text: ta.value, heading: sel.value || undefined }, '已新增')) $('dlg').close(); };
+  dialog(`新增到 ${f.display}`, [ta, h('div', { class: 'row' }, '放在', sel)], [h('button', { onclick: () => $('dlg').close() }, '取消'), h('button', { class: 'primary', onclick: save }, '新增')]);
+  ta.focus();
+}
+function transfer(f, e) {
+  const sel = h('select', { style: 'max-width:100%' });
+  for (const hn of state.harnesses) {
+    const group = h('optgroup', { label: hn.name });
+    for (const l of hn.layers) for (const t of l.files) if (t.writable && t.path !== f.path && !t.shadowedBy) group.append(h('option', { value: t.path }, `${l.title} · ${t.display}${t.exists ? '' : '（新建）'}`));
+    if (group.children.length) sel.append(group);
+  }
+  const heading = h('input', { placeholder: '小节标题（可选）', value: e.heading[e.heading.length - 1] || '' });
+  const go = async (op) => { if (await act({ op, path: f.path, baseHash: f.hash, start: e.start, end: e.end, to: sel.value, heading: heading.value.trim() || undefined }, op === 'move' ? '已移动' : '已复制')) $('dlg').close(); };
+  dialog('复制或移动这条记忆', [h('pre', {}, e.text), h('div', { class: 'row' }, '到', sel), h('div', { class: 'row' }, '放在', heading),
+    h('p', { class: 'empty' }, '例如把项目里的个人习惯上移到用户层，或把 Claude 的一条约定同步给 Codex。')],
+    [h('button', { onclick: () => $('dlg').close() }, '取消'), h('button', { onclick: () => go('copy') }, '复制'), h('button', { class: 'primary', onclick: () => go('move') }, '移动')]);
+}
+async function removeFile(f) {
+  if (!confirm(`删除 ${f.display}？内容会先备份，可在“最近的修改”中恢复。`)) return;
+  try { await api('/api/delete', { path: f.path, baseHash: f.hash }); toast('已删除'); await load(); } catch (err) { toast(err.message, true); }
+}
+async function newFile(dir) {
+  const name = prompt('文件名（.md）', 'notes.md');
+  if (!name) return;
+  if (!/^[\w.\-/]+\.md$/.test(name) || name.includes('..')) return toast('文件名只能包含字母、数字、. _ - / 并以 .md 结尾', true);
+  editFile({ path: `${dir}/${name}`, display: `${shorten(dir)}/${name}`, exists: false, writable: true, content: '' });
+}
+async function showEffective() {
+  try {
+    const { text } = await api(`/api/effective?harness=${encodeURIComponent(current)}`);
+    dialog(`${harness().name} 启动时的记忆上下文`, [h('p', { class: 'empty' }, '按载入顺序拼接的结果，注释行标明每段来自哪一层。工具自身的系统提示与按需载入的内容不在其中。'), h('pre', {}, text || '（空）')],
+      [h('button', { onclick: () => navigator.clipboard.writeText(text).then(() => toast('已复制')) }, '复制')]);
+  } catch (err) { toast(err.message, true); }
+}
+async function showHistory(f) {
+  let backups = [];
+  try { backups = (await api(`/api/backups?path=${encodeURIComponent(f.path)}`)).backups; } catch { /* shown as empty */ }
+  const commits = f.history || [];
+  dialog(`${f.display} 的来历`, [
+    h('h3', {}, 'Git 提交'),
+    commits.length ? h('div', { class: 'hist' }, commits.flatMap((c) => [h('span', { class: 't' }, new Date(c.time).toLocaleString()), h('span', {}, `${c.summary} — ${c.author}`), h('code', {}, c.hash.slice(0, 7))]))
+      : h('p', { class: 'empty' }, f.tracked ? '还没有提交记录' : '此文件未纳入 Git，无法追溯作者；只能看到最后修改时间和在此处做过的修改。'),
+    h('h3', {}, '在此处做过的修改'),
+    backups.length ? h('div', { class: 'hist' }, backups.flatMap((b) => [h('span', { class: 't' }, new Date(b.time).toLocaleString()), h('span', {}, `${b.reason}之前的版本 · ${kb(b.bytes)}`), h('span', {}, h('button', { class: 'link', onclick: () => viewBackup(b) }, '查看'), h('button', { class: 'link', onclick: () => restore(b) }, '恢复'))]))
+      : h('p', { class: 'empty' }, '还没有')]);
+}
+async function viewBackup(b) {
+  try { const { content } = await api(`/api/backup?id=${encodeURIComponent(b.id)}`); dialog(`${new Date(b.time).toLocaleString()} 的版本`, [h('pre', {}, content)], [h('button', { class: 'primary', onclick: () => restore(b) }, '恢复这个版本')]); }
+  catch (err) { toast(err.message, true); }
+}
+async function restore(b) {
+  try { await api('/api/restore', { id: b.id }); if ($('dlg').open) $('dlg').close(); toast('已恢复'); await load(); } catch (err) { toast(err.message, true); }
+}
+async function loadBackups() {
+  try {
+    const { backups } = await api('/api/backups');
+    $('backups').replaceChildren(...(backups.length ? backups.slice(0, 8).map((b) => h('div', { class: 'issue', onclick: () => viewBackup(b) }, `${ago(b.time)} · ${b.reason} · ${b.path.split('/').slice(-2).join('/')}`)) : [h('div', { class: 'empty' }, '在这里做的每次修改都会留下可恢复的版本')]));
+  } catch { /* sidebar only */ }
+}
+function focusFile(path) {
+  const el = [...document.querySelectorAll('.file')].find((x) => x.dataset.path === path);
+  if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.style.outline = '2px solid var(--accent)'; setTimeout(() => (el.style.outline = ''), 1500); }
+}
+$('q').addEventListener('input', (ev) => { query = ev.target.value.trim().toLowerCase(); if (state) render(); });
+$('refresh').addEventListener('click', () => { raw = ''; load(); });
+// Harnesses write memory on their own; keep the view current while nothing is being edited.
+setInterval(() => { if (!busy && !document.hidden) load(true); }, 4000);
+if (!token) document.body.replaceChildren(h('p', { style: 'padding:40px' }, '缺少访问令牌：请打开 unify memory 打印的完整链接。'));
+else load();
+</script>
+</body>
+</html>

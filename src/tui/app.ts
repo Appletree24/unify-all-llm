@@ -5,6 +5,8 @@ import { basename, join } from 'node:path';
 import { loadConfig, type Config, type RunRecord } from '../core/store.js';
 import type { ModelTarget, ProviderEvent } from '../core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
+import { defaultContext } from '../memory/scan.js';
+import { startMemoryServer, type MemoryServer } from '../memory/server.js';
 import { buildRegistry } from '../providers/index.js';
 import { defaultTargetIds, detectTargets } from '../core/targets.js';
 import { COMMANDS, complete, listFiles, type Completion } from './complete.js';
@@ -91,6 +93,7 @@ export class App {
   private help = false;
   private tokens = { input: 0, output: 0 };
   private branch = '';
+  private memory?: Promise<MemoryServer>;
 
   private focus = 'input';
   private zoomId?: string;
@@ -145,6 +148,7 @@ export class App {
     this.ctl?.abort();
     this.detecting.abort();
     await this.active?.done.catch(() => undefined);
+    await this.memory?.then((m) => m.close(), () => undefined);
   }
 
   /** Wait for model cleanup and record persistence; also used by terminal hosts. */
@@ -385,6 +389,14 @@ export class App {
     else if (name === 'new') this.newConversation();
     else if (name === 'copy') this.copy();
     else if (name === 'help') this.help = true;
+    else if (name === 'memory') {
+      // One server per session; it stops when the TUI exits.
+      this.memory ??= startMemoryServer(defaultContext(this.cwd));
+      this.memory.then((m) => this.say(`记忆管理界面（仅本机）: ${m.url}`, GOLD), (err) => {
+        this.memory = undefined;
+        this.say(`无法启动记忆管理界面: ${err instanceof Error ? err.message : err}`, RED);
+      });
+    }
     else if (name === 'quit' || name === 'exit') this.onQuit();
     else if (name === 'models') {
       if (!arg) return this.say(`当前: ${this.selected.join(', ') || '无'}    用法: /models claude,codex`);

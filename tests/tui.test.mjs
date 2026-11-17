@@ -67,6 +67,10 @@ test('TUI rejects duplicate target selection and /exit remains available', async
   submit(app, '/models a,a');
   app.invalidate();
   assert.match(app.snapshot().join('\n'), /不能重复选择/);
+  submit(app, '/memory');
+  while (!/记忆管理界面/.test(app.snapshot().join('\n'))) { await new Promise((r) => setTimeout(r, 10)); app.invalidate(); }
+  const url = /http:\/\/127\.0\.0\.1:\d+\//.exec(app.snapshot().join('\n'))[0];
+  assert.match(await (await fetch(url)).text(), /Unify 记忆/);
   let quit = false;
   app.onQuit = () => { quit = true; };
   submit(app, '/exit');

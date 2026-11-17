@@ -161,6 +161,39 @@ node dist/cli.js list
 
 每次重试创建新记录，只包含所选目标，原记录不变。重试不会重复计入原轮历史；它记录 `retryOf` 并保留原始 prompt 和模型选择。自定义传输配置改变时拒绝重试，需重新提问。实施可能已产生文件修改，所以没有自动重试实施的入口。
 
+## 记忆管理
+
+Claude Code、Codex、Gemini CLI 和 Pi 各有一套“记忆”：启动时自动载入的指令文件，以及模型自己写下的笔记。它们分散在系统目录、用户目录、仓库各级目录里，规则各不相同。`unify memory` 按每个工具自己的分层把它们摆出来，并可以直接修改：
+
+```sh
+node dist/cli.js memory              # 启动本机网页界面，打印带令牌的链接
+node dist/cli.js memory --list       # 只在终端打印分层结构
+node dist/cli.js memory --effective claude   # 打印某个工具启动时拼接后的记忆
+node dist/cli.js memory --json       # 扫描结果，供脚本使用
+```
+
+TUI 中输入 `/memory` 也会启动同一个界面。
+
+| 工具 | 分层（按载入顺序，越靠后越优先） |
+| --- | --- |
+| Claude Code | 组织策略（只读）→ 用户 `~/.claude/CLAUDE.md` 与 `rules/` → 项目各级 `CLAUDE.md`、`.claude/CLAUDE.md`、`.claude/rules/` → `CLAUDE.local.md` → 子目录 `CLAUDE.md`（按需）→ 自动记忆 `~/.claude/projects/<项目>/memory/` → 子代理记忆 |
+| Codex | 全局 `~/.codex/AGENTS.md` → 项目根到当前目录逐级的 `AGENTS.md`（同目录 `AGENTS.override.md` 优先）→ 子目录（不参与本次运行）→ `~/.codex/memories/` |
+| Gemini CLI | 全局 `~/.gemini/GEMINI.md`（含 `save_memory` 写入的小节）→ 项目各级 `GEMINI.md` → 子目录（按需）；文件名跟随 `settings.json` 的 `context.fileName` |
+| Pi | 全局 `~/.pi/agent/AGENTS.md` → 上级目录到当前目录逐级的 `AGENTS.md`（没有时取 `CLAUDE.md`） |
+
+界面里能做的事：
+
+- **看分层**：每层标明作用范围、启动时载入还是按需载入、由人维护还是模型写入；尚未创建的位置也会列出，可以直接创建。被同目录更高优先级文件取代的、由 `@导入` 引入的、只对某些路径生效的规则、被多个工具共用的文件（例如 Codex 与 Pi 共用 `AGENTS.md`）都有标记。
+- **看每条记忆和它的来历**：文件按标题拆成条目（列表项、段落、代码块）。纳入 Git 的文件逐条显示最后修改它的提交、作者和时间，未提交的改动单独标出；模型自己写入的内容（Claude 自动记忆、Gemini 的 `save_memory`）有标签。“来历”里可以看文件的提交历史和在这里做过的每次修改。未纳入 Git 的文件只能追溯到最后修改时间。
+- **修改**：单条编辑、删除、新增到指定小节，或编辑全文、新建和删除文件。还可以把一条记忆复制或移动到另一层或另一个工具，例如把项目里的个人习惯上移到用户层，或把 Claude 的约定同步给 Codex。
+- **看模型实际收到什么**：按载入顺序拼接的启动上下文、估算的 token 数和各层占比。token 数按字符估算，不是各家分词器的精确值。
+- **发现问题**：失效的 `@导入`、重复的记忆、`MEMORY.md` 超出启动载入上限的部分、Codex 项目指令超过 32 KiB、被取代而不会读取的文件。
+- **搜索** 所有工具的全部记忆。界面每几秒重新扫描，工具自己写入的新记忆会自动出现。
+
+每次修改前的版本保存在 `~/.unify/memory-backups/`（保留最近 200 个），可以查看和恢复。保存时会校验文件自读取后没有被别处改过，冲突时不覆盖。只有扫描列出的记忆文件位置可以写入，组织策略只读；符号链接（如 `CLAUDE.md → AGENTS.md`）会写入其目标而不是替换链接。
+
+服务只监听 `127.0.0.1`，所有接口都需要链接里的随机令牌并校验 Host，其他网站或本机其他用户无法读写。分层规则按各工具的公开文档实现，工具升级后可能变化；规则集中在 `src/memory/scan.ts` 的四个函数里，新增工具只需再写一个。
+
 ## 状态、上下文与记录
 
 问答轮次的正常阶段为 `created → deciding（可选）→ answering → synthesizing（可选）`。最终状态为 `completed`、`partial`、`failed` 或 `cancelled`。单次调用有独立的 `succeeded`、`failed`、`cancelled`、`timed_out` 状态；部分输出会随失败保留，但不会进入汇总或成为可实施方案。

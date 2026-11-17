@@ -33,6 +33,7 @@ export const COMMANDS: CommandSpec[] = [
   { name: 'cancel', detail: '取消本轮，或只取消某个目标', arg: 'target' },
   { name: 'new', detail: '开始新对话' },
   { name: 'copy', detail: '复制当前回答' },
+  { name: 'memory', detail: '在浏览器中查看和管理各工具的记忆' },
   { name: 'mouse', detail: '开关鼠标滚轮（关闭后可直接拖选文本）' },
   { name: 'help', detail: '快捷键与命令' },
   { name: 'exit', detail: '退出' },
