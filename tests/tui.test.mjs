@@ -72,3 +72,139 @@ test('TUI rejects duplicate target selection and /exit remains available', async
   submit(app, '/exit');
   assert.equal(quit, true);
 });
+
+const type = (app, text) => app.handleKey({ name: 'char', text });
+const screen = (app) => { app.invalidate(); return app.snapshot().join('\n'); };
+/** The composer's text: what sits between the last two horizontal rules. */
+const composer = (app) => {
+  app.invalidate();
+  const lines = app.snapshot();
+  const rules = lines.flatMap((l, i) => (/^─+$/.test(l) ? [i] : []));
+  return lines.slice(rules.at(-2) + 1, rules.at(-1)).join('\n');
+};
+
+test('key parser understands kitty, modifyOtherKeys and word-motion chords', async () => {
+  const { KeyParser } = await import('../dist/tui/keys.js');
+  const names = (s) => new KeyParser().feed(s).map((k) => k.name);
+  assert.deepEqual(names('\x1b[13;2u\x1b[27;2;13~\x1b[13u'), ['altenter', 'altenter', 'enter']);
+  assert.deepEqual(names('\x1b[27u\x1b[99;5u\x1b[9;2u\x1b[127;3u'), ['esc', 'ctrl+c', 'shifttab', 'wordback']);
+  assert.deepEqual(names('\x1b[1;5D\x1b[1;3C\x1bb\x1bf\x1b\x7f\x1b[3;5~\x1b[D'), ['wordleft', 'wordright', 'wordleft', 'wordright', 'wordback', 'worddel', 'left']);
+  assert.deepEqual(new KeyParser().feed('\x1b[200~a\x1b[13;2ub\x1b[201~'), [{ name: 'paste', text: 'a\x1b[13;2ub' }]);
+});
+
+test('editor follows readline conventions across lines and words', async () => {
+  const { Editor } = await import('../dist/tui/editor.js');
+  const ed = new Editor();
+  ed.insert('first line\nsecond 行 x');
+  ed.deleteWordBack();
+  assert.equal(ed.text, 'first line\nsecond 行 ');
+  ed.home(); ed.killToEnd();
+  assert.equal(ed.text, 'first line\n');
+  assert.equal(ed.vertical(1), false);
+  assert.equal(ed.vertical(-1), true);
+  assert.equal(ed.caret, 0);
+  ed.wordRight(); ed.wordRight(); ed.killToStart();
+  assert.equal(ed.text, '\n');
+  ed.killToEnd();
+  assert.equal(ed.text, '');
+});
+
+test('TUI completes commands, targets and files from the composer', async (t) => {
+  const cwd = workspace(t);
+  const { writeFileSync, mkdirSync } = await import('node:fs');
+  mkdirSync(`${cwd}/src`);
+  writeFileSync(`${cwd}/src/orchestrator.ts`, '');
+  writeFileSync(`${cwd}/notes.md`, '');
+  const prompts = [];
+  const mk = (id) => target(id, async function* (req) { prompts.push(req.prompt); yield { type: 'done', text: id }; });
+  const app = new App({ cols: () => 100, rows: () => 30, write() {} }, cwd, { providers: ['alpha'] }, [mk('alpha'), mk('beta')]);
+  t.after(() => app.dispose());
+  await app.init();
+
+  type(app, '/');
+  assert.match(screen(app), /› \/models/);
+  assert.match(screen(app), /\/synth/);
+  type(app, 'sy');
+  assert.doesNotMatch(screen(app), /\/models/);
+  app.handleKey({ name: 'enter' }); // /synth needs its argument: completes, does not run
+  assert.equal(composer(app), '❯ /synth');
+  assert.match(screen(app), /› alpha/);
+  app.handleKey({ name: 'down' });
+  app.handleKey({ name: 'enter' });
+  app.handleKey({ name: 'enter' });
+  assert.match(screen(app), /汇总模型: beta/);
+
+  type(app, '/mod');
+  app.handleKey({ name: 'tab' });
+  type(app, 'alpha,b');
+  app.handleKey({ name: 'tab' });
+  app.handleKey({ name: 'enter' });
+  assert.match(screen(app), /之后的问题将发给: alpha, beta/);
+
+  type(app, '看看 @orch');
+  assert.match(screen(app), /› src\/orchestrator\.ts/);
+  app.handleKey({ name: 'esc' });
+  assert.doesNotMatch(screen(app), /› src\/orchestrator\.ts/);
+  app.handleKey({ name: 'backspace' });
+  app.handleKey({ name: 'tab' });
+  type(app, '的并发');
+  app.handleKey({ name: 'enter' });
+  await app.waitForIdle();
+  assert.ok(prompts.some((p) => p.endsWith('看看 @src/orchestrator.ts 的并发')));
+
+  app.handleKey({ name: 'up' }); // history, without reopening a popup that would trap the arrows
+  assert.equal(composer(app), '❯ 看看 @src/orchestrator.ts 的并发');
+  app.handleKey({ name: 'up' });
+  assert.equal(composer(app), '❯ /models alpha,beta');
+  app.handleKey({ name: 'down' });
+  app.handleKey({ name: 'down' });
+  assert.match(composer(app), /^❯ 继续追问/);
+});
+
+test('TUI queues follow-ups while busy, Esc interrupts, and Ctrl+C needs two presses to quit', async (t) => {
+  const cwd = workspace(t);
+  const gate = deferred(), started = deferred();
+  const seen = [];
+  const a = target('a', async function* (req) {
+    const q = req.prompt.split('\n').pop();
+    seen.push(q);
+    if (q === 'ONE') { started.resolve(); await gate.promise; }
+    if (q === 'HANG') { started2.resolve(); await aborted(req.signal); return; }
+    yield { type: 'done', text: `re:${q}`, usage: { inputTokens: 1200, outputTokens: 34 } };
+  });
+  const started2 = deferred();
+  const app = new App({ cols: () => 100, rows: () => 30, write() {} }, cwd, {}, [a]);
+  t.after(() => app.dispose());
+  await app.init();
+  let quit = 0;
+  app.onQuit = () => { quit++; };
+
+  submit(app, 'ONE');
+  await started.promise;
+  submit(app, 'TWO');
+  assert.match(screen(app), /已排队\s+TWO/);
+  assert.match(screen(app), /Esc 中断 · 1 条排队/);
+  gate.resolve();
+  while (!seen.includes('TWO')) await new Promise(setImmediate);
+  await app.waitForIdle();
+  await new Promise(setImmediate);
+  assert.match(screen(app), /re:TWO/);
+  assert.match(screen(app), /↑2\.4k ↓68 · 第 2 轮/);
+
+  submit(app, 'HANG');
+  await started2.promise;
+  submit(app, 'LATER');
+  app.handleKey({ name: 'esc' });
+  await app.waitForIdle();
+  await new Promise(setImmediate);
+  assert.deepEqual(seen, ['ONE', 'TWO', 'HANG']);
+  assert.equal(composer(app), '❯ LATER');
+  assert.match(screen(app), /排队的消息已放回输入框/);
+
+  app.handleKey({ name: 'ctrl+c' }); // clears the composer
+  app.handleKey({ name: 'ctrl+c' });
+  assert.equal(quit, 0);
+  assert.match(screen(app), /再按一次 Ctrl\+C 退出/);
+  app.handleKey({ name: 'ctrl+c' });
+  assert.equal(quit, 1);
+});

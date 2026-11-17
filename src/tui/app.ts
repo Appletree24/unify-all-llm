@@ -1,10 +1,14 @@
 import { spawn } from 'node:child_process';
-import { basename } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, join } from 'node:path';
 import { loadConfig, type Config, type RunRecord } from '../core/store.js';
 import type { ModelTarget, ProviderEvent } from '../core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
 import { buildRegistry } from '../providers/index.js';
 import { defaultTargetIds, detectTargets } from '../core/targets.js';
+import { COMMANDS, complete, listFiles, type Completion } from './complete.js';
+import { Editor } from './editor.js';
 import { KeyParser, type Key } from './keys.js';
 import { layout } from './markdown.js';
 import { Screen, charWidth, rgb, textWidth, truncate, type Cell } from './screen.js';
@@ -20,11 +24,14 @@ const PROVIDER_COLORS: Record<string, string> = {
   claude: rgb(217, 119, 87),
   codex: rgb(25, 195, 155),
   gemini: rgb(96, 150, 255),
+  deepseek: rgb(110, 130, 250),
 };
 const FALLBACK_COLORS = [rgb(230, 130, 180), rgb(120, 200, 230), rgb(170, 210, 110)];
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+const kilo = (n: number) => (n < 1000 ? String(n) : n < 1e6 ? `${(n / 1000).toFixed(1)}k` : `${(n / 1e6).toFixed(2)}M`);
+const EDITING = new Set(['char', 'paste', 'backspace', 'delete', 'wordback', 'worddel', 'altenter', 'ctrl+j', 'ctrl+w', 'ctrl+u', 'ctrl+k', 'ctrl+d']);
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
 interface Pane {
@@ -68,10 +75,22 @@ export class App {
   private active?: WorkflowHandle;
   private detecting = new AbortController();
 
-  private chars: string[] = [];
-  private caret = 0;
+  private ed = new Editor();
   private history: string[] = [];
   private histIdx = 0;
+  private draft = '';
+  private comp?: Completion;
+  private compIdx = 0;
+  private compOff = false;
+  private files?: string[];
+  /** Messages submitted while a turn is running; sent in order once it ends. */
+  private queue: string[] = [];
+  private userCancel = false;
+  private busySince = 0;
+  private quitArmed = 0;
+  private help = false;
+  private tokens = { input: 0, output: 0 };
+  private branch = '';
 
   private focus = 'input';
   private zoomId?: string;
@@ -105,6 +124,7 @@ export class App {
 
   // ── lifecycle ────────────────────────────────────────────────────────────
   async init(): Promise<void> {
+    try { this.branch = /^ref: refs\/heads\/(.+)$/m.exec(readFileSync(join(this.cwd, '.git', 'HEAD'), 'utf8'))?.[1] ?? ''; } catch { /* not a repository */ }
     this.render();
     this.ticker = setInterval(() => {
       if (this.busy || this.installed.size < this.all.length) {
@@ -218,7 +238,7 @@ export class App {
   private async ask(question: string, retryIds?: string[]): Promise<void> {
     if (!this.selected.length) return this.say('没有可用的模型，请先配置模型并检查登录状态', RED);
     const previous = this.lastRun;
-    this.busy = true;
+    this.begin();
     this.ctl = new AbortController();
     this.question = question;
     this.turn++;
@@ -238,12 +258,11 @@ export class App {
         onEvent: (ev) => this.workflowEvent(ev),
       });
       this.lastRun = this.active.record;
-      await this.active.done;
+      this.addUsage(await this.active.done);
     } catch (err) {
       this.say(`出错: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
-      this.busy = false;
-      this.requestRender();
+      this.finish();
     }
   }
 
@@ -269,7 +288,7 @@ export class App {
     const pane = (this.exec = this.newPane('exec', 'exec', `实施 · ${executor.label}`, VIOLET));
     this.focus = 'input';
     this.zoomId = undefined;
-    this.busy = true;
+    this.begin();
     const ctl = (this.ctl = new AbortController());
     this.render();
     try {
@@ -277,13 +296,42 @@ export class App {
         cwd: this.cwd, config: this.cfg, targets: this.all, executor, source, from, signal: ctl.signal,
         onEvent: (ev) => { if (ev.type === 'provider') this.apply(pane, ev.event); },
       });
-      await this.active.done;
+      this.addUsage(await this.active.done);
       if (pane.status === 'ok') this.say('实施完成，请用 git diff 检查改动', GOLD);
     } catch (err) {
       this.say(`实施失败: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
-      this.busy = false;
-      this.requestRender();
+      this.finish();
+    }
+  }
+
+  private begin(): void {
+    this.busy = true;
+    this.busySince = Date.now();
+    this.userCancel = false;
+  }
+
+  /** End of a turn: send the next queued message, or hand the queue back after an interrupt. */
+  private finish(): void {
+    this.busy = false;
+    this.requestRender();
+    if (!this.queue.length || this.disposed) return;
+    if (!this.userCancel) return void this.ask(this.queue.shift()!);
+    const queued = this.queue.splice(0).join('\n\n');
+    this.ed.set(this.ed.empty ? queued : `${queued}\n\n${this.ed.text}`);
+    this.say('已中断，排队的消息已放回输入框', YELLOW);
+  }
+
+  private interrupt(): void {
+    this.userCancel = true;
+    this.ctl?.abort();
+    this.say('已取消当前请求', YELLOW);
+  }
+
+  private addUsage(run: RunRecord): void {
+    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : [])]) {
+      this.tokens.input += r.usage?.inputTokens ?? 0;
+      this.tokens.output += r.usage?.outputTokens ?? 0;
     }
   }
 
@@ -324,9 +372,9 @@ export class App {
     if (name === 'exec') this.startExec(arg || undefined);
     else if (name === 'cancel') {
       if (!this.busy) return this.say('没有正在运行的请求');
-      if (!arg) this.ctl?.abort();
-      else if (!this.active?.cancelTarget(arg)) return this.say(`目标 ${arg} 未在回答`, YELLOW);
-      this.say(arg ? `已取消 ${arg}` : '已取消当前请求', YELLOW);
+      if (!arg) return this.interrupt();
+      if (!this.active?.cancelTarget(arg)) return this.say(`目标 ${arg} 未在回答`, YELLOW);
+      this.say(`已取消 ${arg}`, YELLOW);
     } else if (name === 'retry') {
       if (this.busy) return this.say('请先等待当前请求结束', YELLOW);
       if (!this.lastRun) return this.say('没有可重试的记录', YELLOW);
@@ -336,6 +384,7 @@ export class App {
     }
     else if (name === 'new') this.newConversation();
     else if (name === 'copy') this.copy();
+    else if (name === 'help') this.help = true;
     else if (name === 'quit' || name === 'exit') this.onQuit();
     else if (name === 'models') {
       if (!arg) return this.say(`当前: ${this.selected.join(', ') || '无'}    用法: /models claude,codex`);
@@ -355,7 +404,7 @@ export class App {
       this.cfg = { ...this.cfg, synthesizer: arg };
       this.say(`汇总模型: ${arg}`);
     } else {
-      this.say('命令: /exec /models /synth /cancel [目标] /retry [目标] /mouse /new /copy /exit /quit');
+      this.say(`未知命令 /${name}；输入 / 查看命令列表，/help 查看快捷键`, YELLOW);
     }
   }
 
@@ -366,6 +415,11 @@ export class App {
       return this.requestRender();
     }
     this.notice = '';
+    if (k.name !== 'ctrl+c') this.quitArmed = 0;
+    if (this.help) {
+      this.help = false;
+      if (k.name !== 'ctrl+c' && k.name !== 'ctrl+d') return this.requestRender();
+    }
     if (this.confirm) {
       const c = this.confirm;
       this.confirm = undefined;
@@ -373,25 +427,29 @@ export class App {
       else this.say('已取消');
       return this.requestRender();
     }
+    const typing = this.focus === 'input';
     switch (k.name) {
       case 'ctrl+c':
-        if (this.busy) {
-          this.ctl?.abort();
-          this.say('已取消当前请求', YELLOW);
-        } else if (this.chars.length) {
-          this.chars = [];
-          this.caret = 0;
-        } else this.onQuit();
+        if (this.busy) this.interrupt();
+        else if (!this.ed.empty) this.ed.clear();
+        else if (Date.now() - this.quitArmed < 2000) this.onQuit();
+        else {
+          this.quitArmed = Date.now();
+          this.say('再按一次 Ctrl+C 退出', YELLOW);
+        }
         break;
       case 'ctrl+d':
-        this.onQuit();
+        if (typing && !this.ed.empty) this.ed.del();
+        else this.onQuit();
         break;
       case 'tab':
       case 'shifttab':
-        this.cycleFocus(k.name === 'tab' ? 1 : -1);
+        if (typing && this.comp) this.accept();
+        else this.cycleFocus(k.name === 'tab' ? 1 : -1);
         break;
       case 'ctrl+e':
-        this.startExec();
+        if (typing && !this.ed.empty) this.ed.end();
+        else this.startExec();
         break;
       case 'ctrl+y':
         this.copy();
@@ -408,10 +466,38 @@ export class App {
         this.scrollPane(this.findPane(this.focus) ?? this.bottomPane() ?? this.panes[this.activeAnswer], k.name === 'pgup' ? -1 : 1, true);
         break;
       default:
-        if (this.focus === 'input') this.inputKey(k);
+        if (typing) this.inputKey(k);
         else this.paneKey(k);
     }
+    this.suggest(EDITING.has(k.name));
     this.requestRender();
+  }
+
+  /** Recompute the completion popup for the text at the caret. */
+  private suggest(edited: boolean): void {
+    if (edited) this.compOff = false;
+    let c: Completion | undefined;
+    if (this.focus === 'input' && !this.compOff && !this.ed.empty) {
+      const targets = this.all.filter((t) => this.installed.get(t.id)).map((t) => ({ id: t.id, label: t.label, exec: t.adapter.capabilities.exec }));
+      c = complete(this.ed.chars, this.ed.caret, targets, () => (this.files ??= listFiles(this.cwd)));
+      // Nothing left to complete: do not keep Tab and Enter captive.
+      if (c && c.kind !== 'file' && c.items.length === 1 && c.items[0].value === this.ed.chars.slice(c.start, c.end).join('')) c = undefined;
+    }
+    const same = !!c && !edited && this.comp?.kind === c.kind && this.comp.start === c.start;
+    this.compIdx = same ? clamp(this.compIdx, 0, c!.items.length - 1) : 0;
+    this.comp = c;
+  }
+
+  /** Apply the highlighted suggestion. Returns whether the text changed. */
+  private accept(): boolean {
+    const c = this.comp;
+    const item = c?.items[this.compIdx];
+    if (!c || !item) return false;
+    const current = this.ed.chars.slice(c.start, c.end).join('');
+    const value = c.kind === 'command' && !/\s/.test(this.ed.chars[c.end] ?? '') ? `${item.value} ` : item.value;
+    this.ed.replace(c.start, c.end, value);
+    this.compOff = false;
+    return item.value !== current;
   }
 
   private mouse(k: Key): void {
@@ -484,75 +570,100 @@ export class App {
     }
   }
 
-  private insert(text: string): void {
-    const add = Array.from(text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ')).filter(
-      (c) => c === '\n' || charWidth(c.codePointAt(0)!) > 0,
-    );
-    this.chars.splice(this.caret, 0, ...add);
-    this.caret += add.length;
-  }
-
   private inputKey(k: Key): void {
-    const n = this.chars.length;
+    const ed = this.ed;
     switch (k.name) {
       case 'char':
       case 'paste':
-        this.insert(k.text ?? '');
+        ed.insert(k.text ?? '');
         break;
       case 'altenter':
       case 'ctrl+j':
-        this.insert('\n');
+        ed.insert('\n');
         break;
-      case 'enter':
+      case 'enter': {
+        const c = this.comp;
+        if (c && this.accept()) {
+          // A completed command runs at once unless it still needs its argument.
+          const spec = c.kind === 'command' ? COMMANDS.find((v) => `/${v.name}` === c.items[this.compIdx].value) : undefined;
+          if (!spec || spec.required) break;
+        }
         this.submit();
         break;
+      }
+      case 'esc':
+        if (this.comp) this.compOff = true;
+        else if (this.busy) this.interrupt();
+        break;
       case 'backspace':
-        if (this.caret > 0) this.chars.splice(--this.caret, 1);
+        ed.backspace();
         break;
       case 'delete':
-        this.chars.splice(this.caret, 1);
+        ed.del();
         break;
       case 'left':
-        this.caret = Math.max(0, this.caret - 1);
+      case 'ctrl+b':
+        ed.left();
         break;
       case 'right':
-        this.caret = Math.min(n, this.caret + 1);
+      case 'ctrl+f':
+        ed.right();
+        break;
+      case 'wordleft':
+        ed.wordLeft();
+        break;
+      case 'wordright':
+        ed.wordRight();
+        break;
+      case 'wordback':
+      case 'ctrl+w':
+        ed.deleteWordBack();
+        break;
+      case 'worddel':
+        ed.deleteWordForward();
         break;
       case 'home':
       case 'ctrl+a':
-        this.caret = 0;
+        ed.home();
         break;
       case 'end':
-        this.caret = n;
+        ed.end();
         break;
       case 'ctrl+u':
-        this.chars = [];
-        this.caret = 0;
+        ed.killToStart();
+        break;
+      case 'ctrl+k':
+        ed.killToEnd();
         break;
       case 'up':
       case 'down': {
-        if (this.chars.includes('\n') || this.history.length === 0) break;
-        this.histIdx = clamp(this.histIdx + (k.name === 'up' ? -1 : 1), 0, this.history.length);
-        this.chars = Array.from(this.history[this.histIdx] ?? '');
-        this.caret = this.chars.length;
+        const dir = k.name === 'up' ? -1 : 1;
+        if (this.comp) {
+          const n = this.comp.items.length;
+          this.compIdx = (this.compIdx + dir + n) % n;
+          break;
+        }
+        if (ed.vertical(dir)) break;
+        const next = clamp(this.histIdx + dir, 0, this.history.length);
+        if (next === this.histIdx) break;
+        if (this.histIdx === this.history.length) this.draft = ed.text;
+        this.histIdx = next;
+        ed.set(this.history[next] ?? this.draft);
+        this.compOff = true; // arrows keep walking history rather than a popup
         break;
       }
     }
   }
 
   private submit(): void {
-    const text = this.chars.join('').trim();
+    const text = this.ed.text.trim();
     if (!text) return;
-    if (text.startsWith('/')) {
-      this.chars = [];
-      this.caret = 0;
-      return this.command(text);
-    }
-    if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
-    this.history.push(text);
+    if (this.history[this.history.length - 1] !== text) this.history.push(text);
     this.histIdx = this.history.length;
-    this.chars = [];
-    this.caret = 0;
+    this.draft = '';
+    this.ed.clear();
+    if (text.startsWith('/')) return this.command(text);
+    if (this.busy) return void this.queue.push(text);
     void this.ask(text);
   }
 
@@ -587,6 +698,7 @@ export class App {
     const inputH = this.drawInput(s);
     this.drawFooter(s);
     this.drawBody(s, 2, rows - 3 - inputH);
+    this.drawPopup(s);
     return s;
   }
 
@@ -601,25 +713,23 @@ export class App {
       x = s.put(x, 0, !known ? SPIN[this.frame % 10] : deciding ? '◆' : on ? '●' : '○', color);
       x = s.put(x + 1, 0, deciding ? `${a.label} 决策` : a.label, color) + 2;
     }
-    const right = `${this.turn > 1 ? `第 ${this.turn} 轮 · ` : ''}${basename(this.cwd)}`;
-    const rx = s.cols - textWidth(right) - 1;
-    if (rx > x) s.put(rx, 0, right, DIM);
     if (this.question) {
       s.put(1, 1, '❯', GOLD);
       s.put(3, 1, truncate(this.question.replace(/\s+/g, ' '), s.cols - 4), '1');
     }
   }
 
-  /** Draws the input box above the footer and returns its height. */
+  /** Draws the activity line, queued messages and composer above the footer; returns their height. */
   private drawInput(s: Screen): number {
-    const inner = s.cols - 6;
+    const inner = s.cols - 3;
     // Wrap the input manually so the caret position is known exactly.
+    const { chars, caret } = this.ed;
     const lines: Cell[][] = [[]];
     let cx = 0;
     let cy = 0;
     let w = 0;
-    this.chars.forEach((ch, i) => {
-      if (i === this.caret) [cx, cy] = [w, lines.length - 1];
+    chars.forEach((ch, i) => {
+      if (i === caret) [cx, cy] = [w, lines.length - 1];
       const cw = ch === '\n' ? 0 : charWidth(ch.codePointAt(0)!);
       if (ch === '\n' || w + cw > inner) {
         lines.push([]);
@@ -630,47 +740,59 @@ export class App {
         w += cw;
       }
       // A caret sitting right after a newline belongs to the new line.
-      if (ch === '\n' && i + 1 === this.caret) [cx, cy] = [0, lines.length - 1];
+      if (ch === '\n' && i + 1 === caret) [cx, cy] = [0, lines.length - 1];
     });
-    if (this.caret >= this.chars.length) [cx, cy] = [w, lines.length - 1];
+    if (caret >= chars.length) [cx, cy] = [w, lines.length - 1];
     if (cx >= inner) [cx, cy] = [0, cy + 1];
     while (lines.length <= cy) lines.push([]);
 
-    const h = Math.min(5, lines.length);
+    const h = Math.min(Math.max(3, Math.floor(s.rows / 3)), lines.length);
     const first = clamp(cy - h + 1, 0, lines.length - h);
+    const queued = this.queue.slice(0, 3);
     const y = s.rows - 1 - (h + 2);
-    this.inputTop = y;
+    const top = y - 1 - queued.length;
+    this.inputTop = top;
     const active = this.focus === 'input' && !this.confirm;
     const st = active ? GOLD : BORDER;
-    s.put(0, y, '╭' + '─'.repeat(s.cols - 2) + '╮', st);
-    for (let i = 0; i < h; i++) {
-      s.put(0, y + 1 + i, '│', st);
-      s.put(s.cols - 1, y + 1 + i, '│', st);
-      if (i === 0 && first === 0) s.put(2, y + 1, '❯', active ? GOLD : DIM);
-      s.putCells(4, y + 1 + i, lines[first + i], s.cols - 2);
-    }
-    s.put(0, y + h + 1, '╰' + '─'.repeat(s.cols - 2) + '╯', st);
-    if (this.chars.length === 0) {
+
+    this.drawActivity(s, top);
+    queued.forEach((q, i) => {
+      const more = i === 2 && this.queue.length > 3 ? ` (+${this.queue.length - 3})` : '';
+      s.put(1, top + 1 + i, truncate(`↳ 已排队${more}  ${q.replace(/\s+/g, ' ')}`, s.cols - 2), DIM);
+    });
+    s.put(0, y, '─'.repeat(s.cols), st);
+    s.put(0, y + h + 1, '─'.repeat(s.cols), st);
+    if (first === 0) s.put(0, y + 1, '❯', active ? GOLD : DIM);
+    for (let i = 0; i < h; i++) s.putCells(2, y + 1 + i, lines[first + i], s.cols - 1);
+    if (chars.length === 0) {
       const hint = this.busy
-        ? '生成中…  Ctrl+C 取消'
+        ? '继续输入会排队，本轮结束后发送…'
         : this.turn === 0
-          ? '问点什么…  Enter 发送 · Ctrl+J 换行'
+          ? '问点什么…  / 命令 · @ 引用文件'
           : '继续追问，或输入 /exec 让模型按方案动手';
-      s.put(4, y + 1, truncate(hint, inner), DIM);
+      s.put(2, y + 1, truncate(hint, inner), DIM);
     }
-    if (active) this.cursor = { x: 4 + cx, y: y + 1 + (cy - first) };
-    return h + 2;
+    if (active) this.cursor = { x: 2 + cx, y: y + 1 + (cy - first) };
+    return h + 3 + queued.length;
   }
 
-  private drawFooter(s: Screen): void {
-    const y = s.rows - 1;
+  /** One line above the composer: confirmation, notice, what is running, or key hints. */
+  private drawActivity(s: Screen, y: number): void {
     if (this.confirm) return void s.put(1, y, truncate(this.confirm.text, s.cols - 2), `1;${YELLOW}`);
     if (this.notice) return void s.put(1, y, truncate(this.notice, s.cols - 2), this.noticeColor);
+    if (this.busy) {
+      const done = this.panes.filter((p) => p.status !== 'run').length;
+      const stage = this.exec?.status === 'run' ? '实施中' : this.synth?.status === 'run' ? '汇总中' : this.panes.length ? `回答中 ${done}/${this.panes.length}` : '准备中';
+      let x = s.put(1, y, SPIN[this.frame % 10], GOLD);
+      x = s.put(x + 1, y, stage, '1');
+      s.put(x + 1, y, truncate(`${Math.floor((Date.now() - this.busySince) / 1000)}s · Esc 中断${this.queue.length ? ` · ${this.queue.length} 条排队` : ''}`, s.cols - x - 2), DIM);
+      return;
+    }
     const hints =
       this.focus === 'input'
         ? this.panes.length
-          ? ['Tab 切换面板', '滚轮 滚动', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+N 新对话', '/exit 退出']
-          : ['Enter 发送', '/models 选择模型', '/exit 退出']
+          ? ['Tab 切换面板', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+R 思考', 'Ctrl+N 新对话', '/help 帮助']
+          : ['Enter 发送', 'Shift+Enter 换行', '/ 命令', '@ 文件', '/help 帮助']
         : ['↑↓/滚轮 滚动', 'Enter 放大', 'y 复制', 'Ctrl+E 按此回答实施', 'Esc 返回'];
     let x = 1;
     for (const h of hints) {
@@ -681,7 +803,68 @@ export class App {
     }
   }
 
+  /** Status line: where we are, who answers, what the session has used. */
+  private drawFooter(s: Screen): void {
+    const y = s.rows - 1;
+    const used = this.tokens.input + this.tokens.output;
+    const right = [used ? `↑${kilo(this.tokens.input)} ↓${kilo(this.tokens.output)}` : '', this.turn > 1 ? `第 ${this.turn} 轮` : ''].filter(Boolean).join(' · ');
+    const rx = s.cols - textWidth(right) - 1;
+    if (right) s.put(rx, y, right, DIM);
+    const home = homedir();
+    const branch = this.branch ? ` (${this.branch})` : '';
+    const where = (this.cwd === home || this.cwd.startsWith(home + '/') ? '~' + this.cwd.slice(home.length) : this.cwd) + branch;
+    const who = this.selected.length ? `${this.selected.join(' + ')}${this.cfg.synthesizer && this.selected.length > 1 ? ` → ${this.cfg.synthesizer}` : ''}` : '';
+    const room = (right ? rx : s.cols) - 2;
+    const left = textWidth(where) + textWidth(who) + 3 <= room ? where : basename(this.cwd) + branch;
+    const x = s.put(1, y, truncate(left, room), DIM);
+    if (who && x + 3 + textWidth(who) <= room + 1) s.put(s.put(x, y, ' · ', BORDER), y, who, DIM);
+  }
+
+  /** Completion list floating over the body, directly above the activity line. */
+  private drawPopup(s: Screen): void {
+    const c = this.comp;
+    if (!c || this.focus !== 'input' || this.confirm) return;
+    const n = Math.min(c.items.length, 8, Math.max(1, this.inputTop - 3));
+    const first = clamp(this.compIdx - n + 1, 0, Math.max(0, c.items.length - n));
+    const labelW = Math.min(Math.max(...c.items.map((i) => textWidth(i.label))), c.kind === 'file' ? s.cols - 6 : 24);
+    const y0 = this.inputTop - n;
+    s.put(0, y0 - 1, '─'.repeat(s.cols), BORDER);
+    for (let i = 0; i < n; i++) {
+      const item = c.items[first + i];
+      const on = first + i === this.compIdx;
+      s.put(0, y0 + i, ' '.repeat(s.cols));
+      s.put(1, y0 + i, on ? '›' : ' ', GOLD);
+      const x = s.put(3, y0 + i, truncate(item.label, labelW), on ? `1;${GOLD}` : '', s.cols - 1);
+      if (item.detail) s.put(Math.max(x, 3 + labelW) + 2, y0 + i, truncate(item.detail, Math.max(0, s.cols - labelW - 7)), DIM, s.cols - 1);
+    }
+    if (c.items.length > n) s.put(s.cols - 12, y0 - 1, ` ${this.compIdx + 1}/${c.items.length} `, DIM);
+  }
+
+  private drawHelp(s: Screen, y: number, h: number): void {
+    const keys: [string, string][] = [
+      ['Enter', '发送；生成中发送会排队，本轮结束后自动发出'],
+      ['Shift+Enter / Alt+Enter / Ctrl+J', '换行'],
+      ['Esc', '中断本轮（排队的消息放回输入框）'],
+      ['Ctrl+C', '中断本轮；空闲时清空输入，输入为空时连按两次退出'],
+      ['↑ ↓', '多行内移动；到首/末行时翻阅历史'],
+      ['Ctrl+A/E · Alt+←/→ · Ctrl+W · Ctrl+U/K', '行首/行尾 · 按词移动 · 删词 · 删到行首/行尾'],
+      ['@', '模糊搜索并引用项目文件'],
+      ['Tab', '接受补全；否则在输入框与各面板间切换'],
+      ['Ctrl+R · Ctrl+Y · Ctrl+N', '显示思考 · 复制 · 新对话'],
+      ['Ctrl+E', '输入为空时：按汇总或聚焦的回答实施'],
+    ];
+    const rows: [string, string][] = [...keys, ['', ''], ...COMMANDS.map((c): [string, string] => [`/${c.name}`, c.detail])];
+    const kw = Math.min(Math.max(...rows.map((r) => textWidth(r[0]))), Math.floor(s.cols / 2));
+    s.put(2, y, '快捷键与命令', `1;${GOLD}`);
+    rows.slice(0, h - 3).forEach(([key, text], i) => {
+      s.put(2, y + 2 + i, truncate(key, kw), '');
+      s.put(4 + kw, y + 2 + i, truncate(text, Math.max(0, s.cols - kw - 6)), DIM);
+    });
+    s.put(2, y + h - 1, '按任意键返回', DIM);
+  }
+
   private drawBody(s: Screen, y: number, h: number): void {
+    if (this.help) return this.drawHelp(s, y, h);
     if (this.panes.length === 0) return this.drawWelcome(s, y, h);
     const bottom = this.bottomPane();
     const zoomed = this.zoomId ? this.findPane(this.zoomId) : undefined;
@@ -826,10 +1009,11 @@ export async function runTui(cwd: string, signal?: AbortSignal): Promise<number>
     Object.values(buildRegistry(cfg)),
   );
   const parser = new KeyParser();
-  const restore = () => out.write(MOUSE_OFF + '\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l');
+  const restore = () => out.write(MOUSE_OFF + '\x1b[<u\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l');
 
-  // alternate screen, no auto-wrap, bracketed paste
-  out.write('\x1b[?1049h\x1b[?7l\x1b[?2004h' + MOUSE_ON);
+  // alternate screen, no auto-wrap, bracketed paste, and (where supported) the kitty
+  // keyboard protocol so Shift+Enter and Esc are reported unambiguously
+  out.write('\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[>1u' + MOUSE_ON);
   stdin.setRawMode(true);
   stdin.setEncoding('utf8');
   stdin.resume();
