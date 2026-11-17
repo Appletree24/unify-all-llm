@@ -1,6 +1,8 @@
 export interface Key {
   /** 'char' | 'paste' | 'enter' | 'altenter' | 'backspace' | 'delete' | 'tab' | 'shifttab' | 'esc'
-   *  | 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'pgup' | 'pgdn' | 'ctrl+<letter>' */
+   *  | 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'pgup' | 'pgdn' | 'ctrl+<letter>'
+   *  | 'wordleft' | 'wordright' | 'wordback' | 'worddel'
+   *  'altenter' is any modified Enter (Shift, Alt or Ctrl): it inserts a newline. */
   name: string;
   text?: string;
   /** Screen cell of a mouse event ('wheelup' | 'wheeldown' | 'click'), 0-based. */
@@ -18,6 +20,22 @@ const CSI_LETTER: Record<string, string> = {
   Z: 'shifttab',
 };
 const CSI_TILDE: Record<number, string> = { 1: 'home', 7: 'home', 4: 'end', 8: 'end', 3: 'delete', 5: 'pgup', 6: 'pgdn' };
+
+const ALT: Record<string, string> = { b: 'wordleft', f: 'wordright', d: 'worddel', '\x7f': 'wordback', '\b': 'wordback' };
+
+/** A key reported with explicit modifiers (kitty CSI u, xterm modifyOtherKeys). mod: 1 shift, 2 alt, 4 ctrl. */
+function modified(code: number, mod: number): Key | undefined {
+  if (!Number.isFinite(code)) return undefined;
+  if (code === 13) return { name: mod ? 'altenter' : 'enter' };
+  if (code === 27) return { name: 'esc' };
+  if (code === 9) return { name: mod & 1 ? 'shifttab' : 'tab' };
+  if (code === 127 || code === 8) return { name: mod & 6 ? 'wordback' : 'backspace' };
+  if (code < 32) return undefined;
+  const ch = String.fromCodePoint(code);
+  if (mod & 4) return /^[a-z]$/i.test(ch) ? { name: `ctrl+${ch.toLowerCase()}` } : undefined;
+  if (mod & 2) return ALT[ch.toLowerCase()] ? { name: ALT[ch.toLowerCase()] } : undefined;
+  return { name: 'char', text: ch };
+}
 
 /** Turns raw-mode stdin chunks into keys. Bracketed pastes arrive as a single 'paste'. */
 export class KeyParser {
@@ -56,7 +74,7 @@ export class KeyParser {
           i += 2;
           continue;
         }
-        const m = /^\x1b(?:\[([0-9;?<]*)([@-~])|O([A-Z]))/.exec(rest);
+        const m = /^\x1b(?:\[([0-9;:?<]*)([@-~])|O([A-Z]))/.exec(rest);
         if (m && m[1]?.startsWith('<')) {
           // SGR mouse report: ESC [ < button ; x ; y (M press | m release)
           const [b, x, y] = m[1].slice(1).split(';').map(Number);
@@ -68,12 +86,21 @@ export class KeyParser {
         }
         if (m) {
           const final = m[2] ?? m[3];
-          const name = final === '~' ? CSI_TILDE[parseInt(m[1], 10)] : CSI_LETTER[final];
-          if (name) out.push({ name });
+          const params = (m[1] ?? '').split(';').map((p) => parseInt(p, 10));
+          const mod = ((params[1] || 1) - 1) & 7;
+          if (final === 'u' || (final === '~' && params[0] === 27)) {
+            const key = modified(final === 'u' ? params[0] : params[2], mod);
+            if (key) out.push(key);
+          } else {
+            let name = final === '~' ? CSI_TILDE[params[0]] : CSI_LETTER[final];
+            if (mod & 6) name = name === 'left' ? 'wordleft' : name === 'right' ? 'wordright' : name === 'delete' ? 'worddel' : name;
+            if (name) out.push({ name });
+          }
           i += m[0].length;
           continue;
         }
-        i += 2; // Alt+<key>: ignored
+        if (ALT[rest[1]]) out.push({ name: ALT[rest[1]] }); // other Alt+<key> chords are ignored
+        i += 2;
         continue;
       }
       if (ch === '\r') out.push({ name: 'enter' });

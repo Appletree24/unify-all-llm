@@ -3,9 +3,12 @@ import type { ModelTarget, ProviderAdapter } from '../core/types.js';
 import { claude } from './claude.js';
 import { codex } from './codex.js';
 import { customAdapter } from './custom.js';
+import { deepseek } from './deepseek.js';
 import { gemini } from './gemini.js';
 
-const builtin: Record<string, ProviderAdapter> = { claude, codex, gemini };
+const builtin: Record<string, ProviderAdapter> = { claude, codex, gemini, deepseek };
+/** HTTP built-ins a user-level custom entry may replace, e.g. to route through a gateway. */
+const replaceable = new Set(['deepseek']);
 export const RESERVED: Record<string, string> = { jev: 'Jev（System One 决策模型）' };
 
 /** Resolve adapter capabilities and model configuration once, before running anything. */
@@ -18,7 +21,7 @@ export function buildRegistry(config: Config): Record<string, ModelTarget> {
     async *run() { throw new Error('Claude Code 已通过 disableClaude 禁用'); },
   };
   for (const [id, c] of Object.entries(cfg.custom ?? {})) {
-    if (Object.hasOwn(builtin, id)) throw new Error(`自定义模型 ${id} 与内置模型重名`);
+    if (Object.hasOwn(builtin, id) && !replaceable.has(id)) throw new Error(`自定义模型 ${id} 与内置模型重名`);
     adapters[id] = customAdapter(id, RESERVED[id] ? { label: 'Jev', ...c } : c);
   }
   const targets: Record<string, ModelTarget> = {};

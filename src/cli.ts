@@ -6,6 +6,8 @@ import { latestComparison, listRunIds, loadRun, type RunRecord } from './core/st
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent } from './core/workflow.js';
 import { buildRegistry } from './providers/index.js';
 import { detectTargets } from './core/targets.js';
+import { effectiveContext, defaultContext, scanMemory } from './memory/scan.js';
+import { startMemoryServer } from './memory/server.js';
 import { runTui } from './tui/app.js';
 import { FanOutView, bold, dim, header, red, secs, streamEvent } from './ui/term.js';
 
@@ -19,6 +21,7 @@ const HELP = `unify — 同时提问多个模型，再汇总与实施
   unify show [记录id]            查看结果及部分输出
   unify list                    查看记录
   unify doctor                  检查目标及能力
+  unify memory                  查看和管理各工具的记忆（网页；--tui 为终端界面）
 
 ask 选项:
   -m, --models a,b               选择独立目标 id，不允许重复
@@ -33,6 +36,13 @@ ask 选项:
 retry 选项:
       --target a,b              默认重试所有失败或中断目标
       --json                    输出 JSONL；继承原轮实际输入和模型
+
+memory 选项:
+      --tui                     在终端里交互式查看和修改
+      --list                    在终端打印分层结构，不启动网页
+      --json                    输出扫描结果 JSON
+      --effective id            打印某个工具启动时拼接后的记忆（claude/codex/gemini/pi）
+      --port 端口               网页监听端口（默认随机，仅本机可访问）
 
 exec 选项:
   -w, --with id                 支持实施的执行目标
@@ -152,6 +162,35 @@ async function cmdExec(argv: string[]): Promise<number> {
   } finally { view.stop(); }
 }
 
+async function cmdMemory(args: string[]): Promise<number> {
+  const { values } = parseArgs({ args, options: { tui: { type: 'boolean' }, list: { type: 'boolean' }, json: { type: 'boolean' }, effective: { type: 'string' }, port: { type: 'string' } } });
+  if (values.tui) return runTui(cwd, abort.signal, 'memory');
+  const ctx = defaultContext(cwd);
+  if (values.effective) { process.stdout.write(effectiveContext(scanMemory(ctx), values.effective)); return 0; }
+  if (values.json) { process.stdout.write(JSON.stringify(scanMemory(ctx), null, 2) + '\n'); return 0; }
+  if (values.list) {
+    for (const h of scanMemory(ctx).harnesses) {
+      process.stdout.write(`\n${bold(h.name)} ${dim(h.detected ? `启动载入 ${h.effective.files} 个文件 · 约 ${h.effective.tokens} tokens` : '未使用')}\n`);
+      h.layers.forEach((l, i) => {
+        process.stdout.write(`  ${i + 1}. ${l.title} ${dim(`${l.load === 'startup' ? '启动时载入' : '按需载入'} · ${l.writer === 'agent' ? '模型写入' : l.writer === 'admin' ? '管理员下发' : '人工维护'}`)}\n`);
+        for (const f of l.files) {
+          const note = !f.exists ? '尚未创建' : f.shadowedBy ? `被 ${f.shadowedBy} 取代` : `${f.entries.length} 条 · ${f.lines} 行 · 约 ${f.tokens} tokens${f.importedBy ? ` · 由 ${f.importedBy} 导入` : ''}${f.sharedWith ? ` · 与 ${f.sharedWith.join('、')} 共用` : ''}`;
+          process.stdout.write(`     ${f.exists ? '●' : '○'} ${f.display} ${dim(note)}\n`);
+        }
+      });
+      for (const issue of h.issues) process.stdout.write(`  ${issue.level === 'info' ? dim('·') : red('!')} ${issue.message}\n`);
+    }
+    return 0;
+  }
+  const port = values.port === undefined ? 0 : Number(values.port);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('--port 需要 0–65535 的整数');
+  const server = await startMemoryServer(ctx, port);
+  process.stdout.write(`记忆管理界面: ${server.url}\n${dim('仅本机可访问，链接中带有访问令牌，请勿分享。Ctrl+C 停止。')}\n`);
+  await new Promise<void>((done) => { if (abort.signal.aborted) done(); else abort.signal.addEventListener('abort', () => done(), { once: true }); });
+  await server.close();
+  return 0;
+}
+
 function show(run: RunRecord): void {
   process.stdout.write(`${bold(run.id)} · ${run.status}\n\n${run.question}\n`);
   for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : [])]) {
@@ -176,6 +215,7 @@ async function main(): Promise<number> {
         process.stdout.write(`${id} · ${run.kind} · ${run.status} · ${run.question.replace(/\s+/g, ' ').slice(0, 70)}\n`);
       }
       return 0;
+    case 'memory': return cmdMemory(rest);
     case 'doctor': {
       const cfg = loadConfig(cwd);
       const targets = Object.values(buildRegistry(cfg));

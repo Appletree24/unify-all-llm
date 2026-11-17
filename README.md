@@ -34,7 +34,7 @@ node dist/cli.js exec --with codex
 
 ### 同一个 CLI 比较多个模型
 
-`provider` 是协议适配器，`target` 是用户选择的模型配置。内置 `claude`、`codex`、`gemini` 各自也有同名默认目标。
+`provider` 是协议适配器，`target` 是用户选择的模型配置。内置 `claude`、`codex`、`gemini`、`deepseek` 各自也有同名默认目标。
 
 ```json
 {
@@ -56,6 +56,30 @@ node dist/cli.js exec --with codex
 替换示例中的模型名后使用。`providers`、`synthesizer`、`executor` 和 `decider` 引用目标 id；`--models fast,deep` 与 TUI `/models fast,deep` 使用相同 id。重复选择同一个 id 会报错。两个不同目标可以共用一个 provider，各自拥有独立的调用 id、结果和面板。
 
 旧的 `"models": {"codex": "<模型名>"}` 配置仍可用。`models.<目标id>` 显式覆盖该目标的 `model`。未配置 `providers` 时，使用所有可用目标，排除 `decider` 本身；需要控制调用数量时，请明确列出 `providers`。
+
+### DeepSeek
+
+DeepSeek 是内置目标，直接调用官方 API（`https://api.deepseek.com`，OpenAI 兼容协议），不需要安装 CLI。在 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 创建 API key 并放进环境变量即可：
+
+```sh
+export DEEPSEEK_API_KEY=sk-...
+node dist/cli.js doctor
+node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
+```
+
+默认模型是 `deepseek-flash`。换模型或同时比较多个模型用 `models` / `targets`，项目配置和用户配置都可以写：
+
+```json
+{
+  "models": { "deepseek": "deepseek-flash" },
+  "targets": {
+    "deepseek-pro": { "provider": "deepseek", "model": "deepseek-v4-pro", "label": "DeepSeek Pro" }
+  },
+  "providers": ["codex", "deepseek", "deepseek-pro"]
+}
+```
+
+模型名以 [DeepSeek 文档](https://api-docs.deepseek.com/) 为准。未设置 `DEEPSEEK_API_KEY` 时该目标显示为不可用，不会被默认选中；设置后，未配置 `providers` 的项目会把它计入默认目标。DeepSeek 按 API 用量计费，与网页版/App 的账号无关。它只回答，不运行本地工具，也不能作为实施目标；思考过程（`reasoning_content`）会显示在思考面板。需要走网关或代理时，在用户配置的 `custom.deepseek` 中写一个 `openai` 端点即可替换内置目标。
 
 ### OpenAI 兼容端点和自定义命令
 
@@ -92,6 +116,7 @@ node dist/cli.js exec --with codex
 | Claude | 限定 Read/Glob/Grep/WebSearch/WebFetch 工具 | 是 |
 | Codex | CLI `read-only` sandbox | 是 |
 | Gemini | CLI `plan` approval mode | 是 |
+| DeepSeek | 只发送 messages，不运行本地工具 | 否 |
 | OpenAI 端点 | 只发送 messages，不运行本地工具 | 否 |
 | 自定义命令 | 任意受信任命令，无内置隔离 | 否 |
 
@@ -101,7 +126,14 @@ Gemini 必须支持 `--approval-mode plan`。该模式允许写计划文件，�
 
 ## 交互与重试
 
-TUI 支持并排阅读、思考过程切换、复制、滚动和放大。`Ctrl+C` 取消当前整轮；空闲且输入为空时退出。退出会等待已启动调用清理并保存记录。`/exit` 与 `/quit` 等效。
+TUI 支持并排阅读、思考过程切换、复制、滚动和放大，输入区的操作习惯与 Codex、Pi 等终端工具一致：
+
+- **命令补全**：输入 `/` 弹出命令列表，继续输入过滤，`↑↓` 选择，`Tab` 补全，`Enter` 补全并执行；`/models`、`/synth`、`/exec`、`/retry`、`/cancel` 的参数会补全目标 id。
+- **文件引用**：输入 `@` 模糊搜索项目文件（`git ls-files`，非 Git 目录则有界遍历），选中后以 `@路径` 写入问题。它只是文本引用，由各模型 CLI 自己决定是否读取；只发送 messages 的 HTTP 目标读不到文件内容。
+- **多行编辑**：`Shift+Enter`、`Alt+Enter` 或 `Ctrl+J` 换行；`Ctrl+A/E` 行首行尾，`Alt+←/→`（或 `Ctrl+←/→`）按词移动，`Ctrl+W` 删词，`Ctrl+U/K` 删到行首/行尾。`↑↓` 先在多行内移动，到首末行再翻阅历史，未发送的草稿会保留。`Shift+Enter` 需要终端支持 kitty 键盘协议或 modifyOtherKeys，否则请用另外两个键。
+- **排队发送**：生成过程中可以继续输入并发送，消息排在输入框上方，本轮结束后依次发出。
+- **中断与退出**：`Esc` 或 `Ctrl+C` 中断当前整轮，排队的消息放回输入框。空闲时 `Ctrl+C` 先清空输入，输入为空时连按两次退出；`Ctrl+D`、`/exit`、`/quit` 直接退出。退出会等待已启动调用清理并保存记录。
+- **状态栏**：输入框上方显示当前阶段、已用时间和排队数；底部显示目录与分支、当前目标与汇总目标、本次会话累计的输入/输出 token（由各 provider 上报，不上报的不计）。
 
 | 操作 | 含义 |
 | --- | --- |
@@ -115,6 +147,9 @@ TUI 支持并排阅读、思考过程切换、复制、滚动和放大。`Ctrl+C
 | `/exec [目标]` | 使用汇总或唯一成功答案实施 |
 | `/new` | 开始独立会话 |
 | `/copy` | 复制当前结果 |
+| `/help` | 快捷键与命令一览 |
+
+输入框有内容时 `Ctrl+E` 是行尾；输入为空或焦点在面板上时才是实施。
 
 CLI 对应命令：
 
@@ -125,6 +160,52 @@ node dist/cli.js list
 ```
 
 每次重试创建新记录，只包含所选目标，原记录不变。重试不会重复计入原轮历史；它记录 `retryOf` 并保留原始 prompt 和模型选择。自定义传输配置改变时拒绝重试，需重新提问。实施可能已产生文件修改，所以没有自动重试实施的入口。
+
+## 记忆管理
+
+Claude Code、Codex、Gemini CLI 和 Pi 各有一套“记忆”：启动时自动载入的指令文件，以及模型自己写下的笔记。它们分散在系统目录、用户目录、仓库各级目录里，规则各不相同。`unify memory` 按每个工具自己的分层把它们摆出来，并可以直接修改：
+
+```sh
+node dist/cli.js memory              # 启动本机网页界面，打印带令牌的链接
+node dist/cli.js memory --tui        # 终端内的交互界面
+node dist/cli.js memory --list       # 只在终端打印分层结构
+node dist/cli.js memory --effective claude   # 打印某个工具启动时拼接后的记忆
+node dist/cli.js memory --json       # 扫描结果，供脚本使用
+```
+
+终端里也有同样的界面：`node dist/cli.js memory --tui`，或在 TUI 中输入 `/memory`（`/memory web` 启动网页）。左侧按载入顺序列出各层与文件，右侧是所选文件的逐条记忆和来历。
+
+| 键 | 作用 |
+| --- | --- |
+| `Tab` / `1`–`4` | 切换工具 |
+| `↑↓`、`→` / `Enter`、`←` | 选择文件，进入右侧选择记忆，返回 |
+| `e` `a` `d` | 编辑、新增、删除所选记忆（`a` 在尚未创建的文件上会创建它） |
+| `c` `m` | 复制、移动到另一层或另一个工具 |
+| `u` | 撤销最近一次修改 |
+| `x` `i` `/` | 查看启动时拼接的上下文、问题列表、搜索 |
+| `w` `r` `q` | 打开网页界面、重新扫描、返回 |
+
+编辑全文、新建规则文件、查看提交历史和恢复任意旧版本目前只在网页里。
+
+| 工具 | 分层（按载入顺序，越靠后越优先） |
+| --- | --- |
+| Claude Code | 组织策略（只读）→ 用户 `~/.claude/CLAUDE.md` 与 `rules/` → 项目各级 `CLAUDE.md`、`.claude/CLAUDE.md`、`.claude/rules/` → `CLAUDE.local.md` → 子目录 `CLAUDE.md`（按需）→ 自动记忆 `~/.claude/projects/<项目>/memory/` → 子代理记忆 |
+| Codex | 全局 `~/.codex/AGENTS.md` → 项目根到当前目录逐级的 `AGENTS.md`（同目录 `AGENTS.override.md` 优先）→ 子目录（不参与本次运行）→ `~/.codex/memories/` |
+| Gemini CLI | 全局 `~/.gemini/GEMINI.md`（含 `save_memory` 写入的小节）→ 项目各级 `GEMINI.md` → 子目录（按需）；文件名跟随 `settings.json` 的 `context.fileName` |
+| Pi | 全局 `~/.pi/agent/AGENTS.md` → 上级目录到当前目录逐级的 `AGENTS.md`（没有时取 `CLAUDE.md`） |
+
+界面里能做的事：
+
+- **看分层**：每层标明作用范围、启动时载入还是按需载入、由人维护还是模型写入；尚未创建的位置也会列出，可以直接创建。被同目录更高优先级文件取代的、由 `@导入` 引入的、只对某些路径生效的规则、被多个工具共用的文件（例如 Codex 与 Pi 共用 `AGENTS.md`）都有标记。
+- **看每条记忆和它的来历**：文件按标题拆成条目（列表项、段落、代码块）。纳入 Git 的文件逐条显示最后修改它的提交、作者和时间，未提交的改动单独标出；模型自己写入的内容（Claude 自动记忆、Gemini 的 `save_memory`）有标签。“来历”里可以看文件的提交历史和在这里做过的每次修改。未纳入 Git 的文件只能追溯到最后修改时间。
+- **修改**：单条编辑、删除、新增到指定小节，或编辑全文、新建和删除文件。还可以把一条记忆复制或移动到另一层或另一个工具，例如把项目里的个人习惯上移到用户层，或把 Claude 的约定同步给 Codex。
+- **看模型实际收到什么**：按载入顺序拼接的启动上下文、估算的 token 数和各层占比。token 数按字符估算，不是各家分词器的精确值。
+- **发现问题**：失效的 `@导入`、重复的记忆、`MEMORY.md` 超出启动载入上限的部分、Codex 项目指令超过 32 KiB、被取代而不会读取的文件。
+- **搜索** 所有工具的全部记忆。界面每几秒重新扫描，工具自己写入的新记忆会自动出现。
+
+每次修改前的版本保存在 `~/.unify/memory-backups/`（保留最近 200 个），可以查看和恢复。保存时会校验文件自读取后没有被别处改过，冲突时不覆盖。只有扫描列出的记忆文件位置可以写入，组织策略只读；符号链接（如 `CLAUDE.md → AGENTS.md`）会写入其目标而不是替换链接。
+
+服务只监听 `127.0.0.1`，所有接口都需要链接里的随机令牌并校验 Host，其他网站或本机其他用户无法读写。分层规则按各工具的公开文档实现，工具升级后可能变化；规则集中在 `src/memory/scan.ts` 的四个函数里，新增工具只需再写一个。
 
 ## 状态、上下文与记录
 
