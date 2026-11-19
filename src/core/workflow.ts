@@ -74,7 +74,7 @@ class Journal {
     const call: CallRecord = {
       id, scope, target: snapshotTarget(target),
       input: { prompt, cwd: this.opts.cwd, mode: scope === 'exec' ? 'exec' : 'ask', timeoutMs },
-      result: { runId: id, targetId: target.id, provider: target.adapter.id, model: target.model, status: 'running', ok: false, text: '', reasoning: '', durationMs: 0 },
+      result: { runId: id, targetId: target.id, provider: target.adapter.id, model: target.model, reasoningEffort: target.reasoningEffort, status: 'running', ok: false, text: '', reasoning: '', durationMs: 0 },
     };
     this.record.calls.push(call);
     return call;
@@ -162,7 +162,7 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     if (!saved) throw new Error(`记录不包含目标 ${id}`);
     if (t.adapter.id !== saved.provider) throw new Error(`目标 ${id} 的 provider 已改变`);
     if (!isDeepStrictEqual(t.adapter.configuration, saved.configuration)) throw new Error(`目标 ${id} 的传输配置已改变，请重新提问`);
-    return { ...t, model: saved.model };
+    return { ...t, model: saved.model, reasoningEffort: saved.reasoningEffort };
   });
   record.targets = targets.map(snapshotTarget);
   const journal = new Journal(record, opts);

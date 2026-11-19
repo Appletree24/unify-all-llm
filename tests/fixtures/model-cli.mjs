@@ -13,9 +13,16 @@ if (process.argv.includes('--version')) {
   const modelFlag = process.argv.findIndex((a) => a === '-m' || a === '--model');
   const answer = `answer-${modelFlag >= 0 ? process.argv[modelFlag + 1] : name}`;
   if (name === 'codex') {
-    emit({ type: 'item.completed', item: { type: 'agent_message', text: answer } });
-    if (scenario === 'wait') await new Promise(() => setInterval(() => {}, 1000));
-    if (scenario !== 'truncate') emit({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 5 } });
+    if (scenario === 'turn-failed' || scenario === 'error-exit') {
+      emit({ type: 'error', message: 'fixture connection error' });
+      if (scenario === 'turn-failed') emit({ type: 'turn.failed', error: { message: 'fixture upstream failure' } });
+      process.exitCode = 1;
+    } else {
+      if (scenario === 'reconnected') emit({ type: 'error', message: 'Reconnecting... 1/5' });
+      emit({ type: 'item.completed', item: { type: 'agent_message', text: answer } });
+      if (scenario === 'wait') await new Promise(() => setInterval(() => {}, 1000));
+      if (scenario !== 'truncate') emit({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 5 } });
+    }
   } else if (name === 'claude') {
     emit({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: answer } } });
     if (scenario !== 'truncate') emit({ type: 'result', result: answer });

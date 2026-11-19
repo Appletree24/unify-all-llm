@@ -5,6 +5,8 @@ import { z } from 'zod';
 
 const id = z.string().regex(/^[a-z][\w-]*$/i).refine((s) => !['__proto__', 'constructor', 'prototype'].includes(s), '保留名称');
 const text = z.string().trim().min(1);
+export const effortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+export type ReasoningEffort = z.infer<typeof effortSchema>;
 const seconds = z.number().positive().max(2_147_483);
 export const customSchema = z.discriminatedUnion('type', [
   z.strictObject({
@@ -17,14 +19,17 @@ export const customSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('command'), label: text.optional(), command: text, args: z.array(z.string()).optional() }),
 ]);
 const schema = z.strictObject({
+  showReasoning: z.boolean().optional(), mouse: z.boolean().optional(),
   disableClaude: z.boolean().optional(),
   providers: z.array(id).min(1).refine((a) => new Set(a).size === a.length, '目标不能重复').optional(),
   synthesizer: id.optional(), executor: id.optional(), decider: id.optional(),
+  reasoningEffort: z.record(id, z.union([effortSchema, z.literal('default')])).optional(),
   models: z.record(id, text).optional(),
-  targets: z.record(id, z.strictObject({ provider: id, model: text.optional(), label: text.optional() })).optional(),
+  targets: z.record(id, z.strictObject({ provider: id, model: text.optional(), reasoningEffort: effortSchema.optional(), label: text.optional() })).optional(),
   timeoutSec: seconds.optional(), execTimeoutSec: seconds.optional(), decisionTimeoutSec: seconds.optional(),
   concurrency: z.number().int().min(1).max(64).optional(),
   custom: z.record(id, customSchema).optional(),
+  quotaCommands: z.record(id, z.strictObject({ command: text, args: z.array(z.string()).optional() })).optional(),
 });
 export type Config = z.infer<typeof schema>;
 export type CustomProviderConfig = z.infer<typeof customSchema>;
@@ -49,9 +54,14 @@ export function loadConfig(cwd: string): Config {
   const projectPath = join(cwd, 'unify.config.json');
   const user = parseConfig(readJson(userPath) ?? {}, userPath);
   const project = parseConfig(readJson(projectPath) ?? {}, projectPath);
+  return mergeConfig(user, project);
+}
+
+export function mergeConfig(user: Config, project: Config): Config {
   return {
-    ...user, ...project, custom: user.custom,
+    ...user, ...project, custom: user.custom, quotaCommands: user.quotaCommands,
     disableClaude: user.disableClaude === true || project.disableClaude === true,
+    reasoningEffort: { ...user.reasoningEffort, ...project.reasoningEffort },
     models: { ...user.models, ...project.models }, targets: { ...user.targets, ...project.targets },
   };
 }

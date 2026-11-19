@@ -27,7 +27,9 @@ export interface CommandSpec {
 
 export const COMMANDS: CommandSpec[] = [
   { name: 'models', detail: '选择之后提问的目标，如 /models codex,deepseek', arg: 'targets' },
+  { name: 'settings', detail: '设置模型、思考强度、官方 API 和运行偏好' },
   { name: 'synth', detail: '设置汇总目标', arg: 'target', required: true },
+  { name: 'quota', detail: '监控各模型的套餐余量和重置时间' },
   { name: 'exec', detail: '按汇总或唯一成功回答实施，可指定执行目标', arg: 'executor' },
   { name: 'retry', detail: '重试失败的目标，或指定目标重新回答', arg: 'targets' },
   { name: 'cancel', detail: '取消本轮，或只取消某个目标', arg: 'target' },

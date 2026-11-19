@@ -56,8 +56,8 @@ test('built-in DeepSeek target authenticates from the environment and streams re
     for await (const chunk of req) body += chunk;
     seen.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(body) });
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-    res.write('data: {"choices":[{"index":0,"delta":{"reasoning_content":"想"}}]}\n\n');
-    res.write('data: {"choices":[{"index":0,"delta":{"content":"答"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n');
+    res.write('data: {"choices":[{"index":0,"delta":{"reasoning_content":"想","content":null}}]}\n\n');
+    res.write('data: {"choices":[{"index":0,"delta":{"content":"答","reasoning_content":null,"reasoning":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n');
     res.end('data: [DONE]\n\n');
   });
   server.listen(0, '127.0.0.1');
@@ -94,4 +94,31 @@ test('built-in DeepSeek target authenticates from the environment and streams re
   const gateway = buildRegistry({ custom: { deepseek: { type: 'openai', baseUrl: 'http://127.0.0.1:9/v1', model: 'm' } } });
   assert.equal(gateway.deepseek.adapter.configuration.baseUrl, 'http://127.0.0.1:9/v1');
   assert.throws(() => buildRegistry({ custom: { codex: { type: 'command', command: 'x' } } }), /重名/);
+});
+
+test('HTTP targets encode effort for their transport and leave provider defaults untouched', async t => {
+  const { officialAdapter, officialApis } = await import('../dist/providers/official.js');
+  const { buildRegistry } = await import('../dist/providers/index.js');
+  const { effortChoices } = await import('../dist/providers/effort.js');
+  const bodies = [];
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n');
+  });
+  const cwd = workspace(t);
+  for (const [id, model, reasoningEffort, expected] of [
+    ['deepseek', 'deepseek-flash', undefined, {}],
+    ['deepseek', 'deepseek-flash', 'none', { thinking: { type: 'disabled' } }],
+    ['gemini-api', 'gemini-3.6-flash', 'medium', { reasoning_effort: 'medium' }],
+    ['openai', 'o3', 'high', { reasoning_effort: 'high' }],
+    ['anthropic', 'claude-haiku-4-5', 'low', { thinking: { type: 'enabled', budget_tokens: 1024 }, max_tokens: 5120 }],
+  ]) {
+    const adapter = officialAdapter(officialApis.find(p => p.id === id), { model, apiKey: 'fixture' });
+    const target = { id, model, label: id, adapter, reasoningEffort };
+    if (reasoningEffort) assert.ok(effortChoices(target).includes(reasoningEffort));
+    assert.equal((await runOne(target, options(cwd))).status, 'succeeded');
+    assert.deepEqual(bodies.pop(), { model, stream: true, messages: [{ role: 'user', content: 'question' }], ...expected });
+  }
+  assert.throws(() => buildRegistry({ reasoningEffort: { gemini: 'high' } }), /不支持思考强度/);
+  assert.throws(() => buildRegistry({ reasoningEffort: { nonexistent: 'low' } }), /未知目标/);
 });

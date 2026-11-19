@@ -1,9 +1,10 @@
+import { atomicWrite } from './atomic-write.js';
 import { randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { z } from 'zod';
-import { customSchema, readJson } from './config.js';
+import { customSchema, effortSchema, readJson } from './config.js';
 export { loadConfig, type Config } from './config.js';
 
 const safeId = z.string().regex(/^[\w-]+$/);
@@ -11,9 +12,9 @@ const capabilities = z.object({
   askPolicy: z.enum(['read-tools', 'sandbox-read-only', 'provider-plan', 'text-only', 'unrestricted-command']),
   exec: z.boolean(),
 });
-const targetSchema = z.object({ id: safeId, label: z.string(), provider: safeId, model: z.string().optional(), capabilities, configuration: customSchema.optional() });
+const targetSchema = z.object({ id: safeId, label: z.string(), provider: safeId, model: z.string().optional(), reasoningEffort: effortSchema.optional(), capabilities, configuration: customSchema.optional() });
 const resultSchema = z.object({
-  runId: safeId, targetId: safeId, provider: safeId, model: z.string().optional(),
+  runId: safeId, targetId: safeId, provider: safeId, model: z.string().optional(), reasoningEffort: effortSchema.optional(),
   status: z.enum(['running', 'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted']),
   ok: z.boolean(), text: z.string(), reasoning: z.string(), error: z.string().optional(), durationMs: z.number().nonnegative(),
   usage: z.object({ inputTokens: z.number().optional(), outputTokens: z.number().optional() }).optional(),
@@ -61,17 +62,6 @@ const runsDir = (cwd: string) => join(cwd, '.unify', 'runs');
 
 function runDir(cwd: string, id: string): string {
   return join(runsDir(cwd), safeId.parse(id));
-}
-
-function atomicWrite(path: string, content: string): void {
-  const temp = `${path}.${randomUUID()}.tmp`;
-  const fd = openSync(temp, 'wx', 0o600);
-  try {
-    try { writeFileSync(fd, content, 'utf8'); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(temp, path);
-  } finally {
-    rmSync(temp, { force: true });
-  }
 }
 
 /** Reserve an exclusive directory before starting model work. */

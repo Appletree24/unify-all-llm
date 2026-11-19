@@ -4,7 +4,7 @@
 
 ## 启动
 
-需要 Node.js 20+。安装并登录要使用的模型 CLI，然后：
+需要 Node.js 20+。使用官方 API 可以直接启动，在 TUI 中输入 `/settings` 接入。使用模型 CLI 时请先安装并登录对应工具。
 
 ```sh
 npm ci
@@ -25,9 +25,9 @@ node dist/cli.js exec --with codex
 
 ## 模型配置
 
-用户配置放在 `~/.unify/config.json`，项目配置放在 `./unify.config.json`。项目覆盖用户配置，`models` 和 `targets` 按键合并。以下两个例外固定生效：
+用户配置放在 `~/.unify/config.json`，项目配置放在 `./unify.config.json`。项目覆盖用户配置，`models`、`targets` 和 `reasoningEffort` 按键合并。以下两个例外固定生效：
 
-- `custom` 只从用户配置加载，项目不能配置新的命令或服务器。
+- `custom` 和 `quotaCommands` 只从用户配置加载，项目不能配置新的命令或服务器。
 - 任一配置设置 `disableClaude: true`，都会完全禁用内置 Claude Code，包括版本检测和基于 Claude 的目标。
 
 配置在启动调用前校验：未知字段、未知引用、重复目标、错误类型、不合理的超时或并发数都会报错。`timeoutSec`、`decisionTimeoutSec`、`execTimeoutSec` 必须是有限正数，最大 2147483 秒；`concurrency` 是 1–64 的整数。
@@ -57,9 +57,51 @@ node dist/cli.js exec --with codex
 
 旧的 `"models": {"codex": "<模型名>"}` 配置仍可用。`models.<目标id>` 显式覆盖该目标的 `model`。未配置 `providers` 时，使用所有可用目标，排除 `decider` 本身；需要控制调用数量时，请明确列出 `providers`。
 
-### DeepSeek
+### 设置与思考强度
 
-DeepSeek 是内置目标，直接调用官方 API（`https://api.deepseek.com`，OpenAI 兼容协议），不需要安装 CLI。在 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 创建 API key 并放进环境变量即可：
+输入 `/settings` 打开设置。方向键选择，Enter 保存，Esc 返回。常用设置写入当前项目的 `unify.config.json`，从下一次调用生效。官方 API 凭证、自定义端点和额度查询命令保存在用户目录。
+
+- **模型与思考强度**可逐个选择目标，从对应服务商的列表选择模型和思考档位。「默认」让底层服务或 CLI 决定强度。回答、决策、汇总和实施均使用实际调用目标的设置，重试回答沿用原轮的模型与强度。
+- **回答、汇总与执行**设置默认回答目标、汇总模型、执行模型和决策模型。**并发与超时**设置并发数和各阶段超时。**高级配置**支持目标别名、自定义端点或命令、额度查询命令及禁用 Claude Code。
+- **显示思考过程**与**鼠标滚动**设置界面默认行为。`Ctrl+R` 和 `/mouse` 仍可在当前会话临时切换。
+
+以下配置让两个目标使用相同的 DeepSeek 模型，以不同强度独立回答，并用高强度目标汇总：
+
+```json
+{
+  "targets": {
+    "quick": { "provider": "deepseek", "reasoningEffort": "low" },
+    "review": { "provider": "deepseek", "reasoningEffort": "high" }
+  },
+  "providers": ["quick", "review"],
+  "synthesizer": "review"
+}
+```
+
+界面把选择保存在 `reasoningEffort.<目标 ID>`，优先于该目标别名中的 `reasoningEffort`。旧配置继续使用原有默认行为。Codex CLI 使用 `model_reasoning_effort`，Claude Code 使用 `--effort`。已有的模型 ID 和目标别名会保留在列表里。Gemini CLI 的思考配置别名可以先写入 `models` 或 `targets`，再从列表选择。[Gemini CLI 模型别名](https://geminicli.com/docs/cli/generation-settings/)
+
+DeepSeek 区分关闭思考和设置思考强度。Gemini API 和兼容推理模型使用 `reasoning_effort`。Anthropic 的兼容接口使用思考预算，界面对支持手动预算的 Claude 4 系列提供 1024、4096、8192 token 三档。具体可用档位还取决于模型及客户端版本。[DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/) · [Gemini API](https://ai.google.dev/gemini-api/docs/openai) · [Anthropic 兼容接口](https://platform.claude.com/docs/en/api/openai-sdk)
+
+### 在 TUI 中接入官方 API
+
+1. 输入 `/settings`，进入「官方 API 接入」，用方向键选择 DeepSeek、OpenAI、Anthropic 或 Gemini API，按 Enter。
+2. 用方向键选择模型，按 Enter 确认。
+3. 在隐藏输入框粘贴 API Key，按 Enter 保存并选用该服务商。现在可以直接提问。Esc 可取消设置。
+
+| 服务商 | 目标 ID | 可选密钥环境变量 |
+| --- | --- | --- |
+| [DeepSeek](https://api-docs.deepseek.com/) | `deepseek` | `DEEPSEEK_API_KEY` |
+| [OpenAI](https://developers.openai.com/api/docs/models/gpt-4.1-mini) | `openai` | `OPENAI_API_KEY` |
+| [Anthropic](https://platform.claude.com/docs/en/api/openai-sdk) | `anthropic` | `ANTHROPIC_API_KEY` |
+| [Gemini API](https://ai.google.dev/gemini-api/docs/openai) | `gemini-api` | `GEMINI_API_KEY` |
+
+设置保存在 `~/.unify/api/<目标 ID>.json`。粘贴的密钥以明文存放在此文件中（POSIX 权限 `0600`）。如果希望只从环境取密钥，首次配置时设置表中的环境变量，密钥框留空即可。再次打开 `/settings` 可以更换模型或密钥，留空会沿用已保存的密钥。删除对应文件即可移除保存的设置。聊天记录和运行快照只包含模型和端点配置。
+
+保存后，当前会话的下一个问题只发给刚选用的服务商。要并排比较，输入例如 `/models codex,deepseek`。下次启动沿用已有的默认目标选择规则，CLI 的 `--models` 也能使用已接入的目标。用户或项目配置中的 `models.<目标 ID>` 优先于在 TUI 设置的默认模型。
+
+### DeepSeek 示例
+
+在 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 创建 API Key。可以通过上面的 TUI 接入，也可以直接从环境启用内置 DeepSeek 目标。
 
 ```sh
 export DEEPSEEK_API_KEY=sk-...
@@ -79,7 +121,7 @@ node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
 }
 ```
 
-模型名以 [DeepSeek 文档](https://api-docs.deepseek.com/) 为准。未设置 `DEEPSEEK_API_KEY` 时该目标显示为不可用，不会被默认选中；设置后，未配置 `providers` 的项目会把它计入默认目标。DeepSeek 按 API 用量计费，与网页版/App 的账号无关。它只回答，不运行本地工具，也不能作为实施目标；思考过程（`reasoning_content`）会显示在思考面板。需要走网关或代理时，在用户配置的 `custom.deepseek` 中写一个 `openai` 端点即可替换内置目标。
+模型名以 [DeepSeek 文档](https://api-docs.deepseek.com/) 为准。提供密钥后，未配置 `providers` 的项目会把它计入默认目标。DeepSeek 按 API 用量计费，与网页版/App 的账号无关。它只回答，不运行本地工具，也不能作为实施目标；思考过程（`reasoning_content`）会显示在思考面板。需要走网关或代理时，在用户配置的 `custom.deepseek` 中写一个 `openai` 端点即可替换内置目标。
 
 ### OpenAI 兼容端点和自定义命令
 
@@ -105,7 +147,7 @@ node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
 }
 ```
 
-无需鉴权的端点可以省略 `apiKeyEnv`。密钥值仅从环境读取，不保存到记录。OpenAI 端点使用 `/chat/completions` 流式协议；命令从 stdin 读取问题，以 stdout 输出正文，stderr 输出诊断，只有退出码 0 才能成功。POSIX 参数直接传递，支持空格；Windows `.cmd` 经 shell 启动，只支持受限参数字符，问题始终通过 stdin 传入。
+无需鉴权的端点可以省略 `apiKeyEnv`。自定义端点的密钥从指定环境变量读取。OpenAI 端点使用 `/chat/completions` 流式协议；命令从 stdin 读取问题，以 stdout 输出正文，stderr 输出诊断，只有退出码 0 才能成功。POSIX 参数直接传递，支持空格；Windows `.cmd` 经 shell 启动，只支持受限参数字符，问题始终通过 stdin 传入。
 
 `decider` 可指定任意问答目标，决定本轮选择哪些目标以及是否汇总。无效决策、决策失败和决策超时都回退到全部选中目标；用户手动选择目标优先。总取消不会触发回退调用。汇总目标不可用时，使用按选择顺序排列的第一个成功目标。
 
@@ -116,7 +158,7 @@ node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
 | Claude | 限定 Read/Glob/Grep/WebSearch/WebFetch 工具 | 是 |
 | Codex | CLI `read-only` sandbox | 是 |
 | Gemini | CLI `plan` approval mode | 是 |
-| DeepSeek | 只发送 messages，不运行本地工具 | 否 |
+| 官方 API | 只发送 messages，不运行本地工具 | 否 |
 | OpenAI 端点 | 只发送 messages，不运行本地工具 | 否 |
 | 自定义命令 | 任意受信任命令，无内置隔离 | 否 |
 
@@ -126,18 +168,58 @@ Gemini 必须支持 `--approval-mode plan`。该模式允许写计划文件，�
 
 ## 交互与重试
 
+### 查看套餐剩余额度
+
+打开交互界面后，每个模型名称旁都会显示剩余额度。开始问答后，额度固定在各自的面板底边，汇总和实施面板也会显示实际使用模型的额度。每 60 秒自动刷新，有足够空间时会显示重置时间。`+N` 表示还有 N 项额度，输入 `/quota` 可查看完整列表，按 `r` 立即刷新，按 `Esc` 返回。
+
+```sh
+node dist/cli.js quota            # 查看一次
+node dist/cli.js quota --watch    # 持续监控，Ctrl+C 退出
+node dist/cli.js quota --json     # 输出 JSON，配合 --watch 时每行一轮快照
+```
+
+| 接入方式 | 显示内容 |
+| --- | --- |
+| Codex | 当前 CLI 账号返回的用量窗口、剩余百分比和重置时间 |
+| Claude Code | 当前订阅返回的用量窗口、剩余百分比和重置时间，需要支持额度查询的 CLI 版本 |
+| Gemini CLI | 使用当前 Google 登录的有效访问令牌读取 Code Assist 各模型配额。令牌过期时打开 Gemini CLI 刷新登录；加密凭证、API key 和 Vertex AI 可通过自定义额度命令接入 |
+| DeepSeek 官方 API | 当前 API Key 对应账户按币种显示的可用余额 |
+| 自定义命令和 OpenAI 兼容网关 | 通过用户配置的 `quotaCommands` 读取该服务的额度 |
+
+同一 provider 下的模型别名共用一次查询。每个别名都会展示该 provider 返回的额度，重复出现的账户余额只计一份。禁用的目标、缺少凭证和查询失败都有单独的状态，真实的零余额会显示为 0。
+
+自定义网关可以在 `~/.unify/config.json` 中用 provider id 指定额度命令。例如，为上面的 `local` 端点配置查询脚本：
+
+```json
+{
+  "quotaCommands": {
+    "local": { "command": "/absolute/path/to/gateway-quota", "args": ["--json"] }
+  }
+}
+```
+
+命令在项目目录运行，从标准输出返回一个 JSON 对象并以 0 退出。每项填写 `label`、数值型 `remaining` 和 `unit`。`total` 和 ISO 8601 格式的 `resetsAt` 可选。读取缓存时可以用顶层 `observedAt` 标注数据时间。
+
+```json
+{"limits":[{"label":"月请求包","remaining":420,"total":1000,"unit":"次","resetsAt":"2027-01-01T00:00:00+08:00"}]}
+```
+
+### 终端交互
+
 TUI 支持并排阅读、思考过程切换、复制、滚动和放大，输入区的操作习惯与 Codex、Pi 等终端工具一致：
 
 - **命令补全**：输入 `/` 弹出命令列表，继续输入过滤，`↑↓` 选择，`Tab` 补全，`Enter` 补全并执行；`/models`、`/synth`、`/exec`、`/retry`、`/cancel` 的参数会补全目标 id。
 - **文件引用**：输入 `@` 模糊搜索项目文件（`git ls-files`，非 Git 目录则有界遍历），选中后以 `@路径` 写入问题。它只是文本引用，由各模型 CLI 自己决定是否读取；只发送 messages 的 HTTP 目标读不到文件内容。
-- **多行编辑**：`Shift+Enter`、`Alt+Enter` 或 `Ctrl+J` 换行；`Ctrl+A/E` 行首行尾，`Alt+←/→`（或 `Ctrl+←/→`）按词移动，`Ctrl+W` 删词，`Ctrl+U/K` 删到行首/行尾。`↑↓` 先在多行内移动，到首末行再翻阅历史，未发送的草稿会保留。`Shift+Enter` 需要终端支持 kitty 键盘协议或 modifyOtherKeys，否则请用另外两个键。
+- **多行编辑**：`Shift+Enter`、`Alt+Enter` 或 `Ctrl+J` 换行；`Ctrl+A/E` 行首行尾，`Alt+←/→`（或 `Ctrl+←/→`）按词移动，`Ctrl+W` 删词，`Ctrl+U/K` 删到行首/行尾。`↑↓` 先在多行内移动，到首末行再翻阅历史，未发送的草稿会保留。`Shift+Enter` 需要终端支持 kitty 键盘协议或 xterm modifyOtherKeys。在 tmux 中还需允许转发扩展按键，可运行 `tmux set -s extended-keys on`。如果终端无法发送 `Shift+Enter`，可以用 `Ctrl+J`。
 - **排队发送**：生成过程中可以继续输入并发送，消息排在输入框上方，本轮结束后依次发出。
 - **中断与退出**：`Esc` 或 `Ctrl+C` 中断当前整轮，排队的消息放回输入框。空闲时 `Ctrl+C` 先清空输入，输入为空时连按两次退出；`Ctrl+D`、`/exit`、`/quit` 直接退出。退出会等待已启动调用清理并保存记录。
 - **状态栏**：输入框上方显示当前阶段、已用时间和排队数；底部显示目录与分支、当前目标与汇总目标、本次会话累计的输入/输出 token（由各 provider 上报，不上报的不计）。
 
 | 操作 | 含义 |
 | --- | --- |
+| `/settings` | 设置 API、模型、思考强度、工作流和界面 |
 | `/models a,b` | 后续问题手动选择目标 |
+| `/quota` | 查看所有目标的套餐剩余额度 |
 | `/synth a` | 设置后续汇总目标 |
 | `/cancel b` | 取消正在回答或排队的目标 b，其余继续 |
 | `/cancel` | 取消本轮，包括决策或汇总 |

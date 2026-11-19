@@ -1,3 +1,5 @@
 {
-  "disableClaude": true
+  "showReasoning": true,
+  "disableClaude": true,
+  "synthesizer": "deepseek"
 }

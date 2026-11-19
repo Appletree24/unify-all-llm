@@ -40,6 +40,11 @@ async function invoke(args, opts, onOutput) {
 
 test('CLI JSONL separates target, provider and call identities; continue and retry read records', { skip: process.platform === 'win32' }, async (t) => {
   const opts = environment(t);
+  const path = join(opts.cwd, 'unify.config.json');
+  const config = JSON.parse(readFileSync(path));
+  config.targets.fast.reasoningEffort = 'low';
+  config.reasoningEffort = { deep: 'high' };
+  writeFileSync(path, JSON.stringify(config));
   const result = await invoke(['ask', 'FIRST', '--json'], opts);
   assert.equal(result.code, 0, result.stderr);
   const events = result.stdout.trim().split('\n').map(JSON.parse);
@@ -53,10 +58,17 @@ test('CLI JSONL separates target, provider and call identities; continue and ret
   const current = loadRun(opts.cwd);
   assert.match(current.input.prompt, /FIRST/);
   assert.match(current.input.prompt, /SECOND/);
+  assert.deepEqual(current.targets.map(t => t.reasoningEffort), ['low', 'high']);
+  config.reasoningEffort.deep = 'medium';
+  writeFileSync(path, JSON.stringify(config));
   const retry = await invoke(['retry', current.id, '--target', 'deep', '--json'], opts);
   assert.equal(retry.code, 0, retry.stderr);
   assert.equal(loadRun(opts.cwd).retryOf, current.id);
   const log = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+  const invocations = log.filter(l => l.args.includes('exec'));
+  assert.ok(invocations.filter(l => l.args.includes('fast')).every(l => l.args.includes('model_reasoning_effort="low"')));
+  assert.ok(invocations.at(-1).args.includes('model_reasoning_effort="high"'));
+  assert.equal(loadRun(opts.cwd).results[0].reasoningEffort, 'high');
   assert.ok(log.every((l) => l.name !== 'claude'), 'disabled Claude must never execute, including --version');
 });
 
@@ -75,6 +87,22 @@ test('fixture CLI adapters require their terminal and a successful process exit'
       const log = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').map(JSON.parse);
       assert.ok(log.some((l) => l.args.includes('plan')));
     }
+  }
+});
+
+test('Codex reconnects can succeed and failures preserve the CLI diagnostic', { skip: process.platform === 'win32' }, async (t) => {
+  const opts = environment(t);
+  for (const [scenario, diagnostic] of [
+    ['reconnected', undefined],
+    ['turn-failed', 'fixture upstream failure'],
+    ['error-exit', 'fixture connection error'],
+  ]) {
+    opts.env.UNIFY_TEST_SCENARIO = scenario;
+    const reply = await invoke(['ask', 'fixture', '--models', 'fast', '--no-synth', '--json'], opts);
+    assert.equal(reply.code, diagnostic ? 1 : 0, reply.stderr);
+    const [result] = loadRun(opts.cwd).results;
+    if (diagnostic) assert.ok(result.error.includes(diagnostic), result.error);
+    else assert.equal(result.text, 'answer-fast');
   }
 });
 
@@ -107,4 +135,38 @@ test('CLI SIGINT keeps stdout valid JSONL and saves partial results before exit'
   const record = loadRun(opts.cwd);
   assert.equal(record.results[0].status, 'cancelled');
   assert.equal(record.results[0].text, 'answer-fast');
+});
+
+test('quota --watch samples each provider once, isolates failures and exits on interrupt', { skip: process.platform === 'win32' }, async (t) => {
+  const opts = environment(t);
+  const helper = join(opts.cwd, 'quota.cjs');
+  const result = { limits: [{ label: '每月请求', remaining: 0, total: 100, unit: '次' }] };
+  writeFileSync(helper, `require('node:fs').appendFileSync(process.env.UNIFY_TEST_LOG, process.argv[2] + '\\n');
+    if (process.argv[2] === 'gemini') { console.error('private stderr'); process.exit(1); }
+    console.log(JSON.stringify(${JSON.stringify(result)}));`);
+  const command = (id) => ({ command: process.execPath, args: [helper, id] });
+  writeFileSync(join(opts.env.HOME, '.unify', 'config.json'), JSON.stringify({
+    disableClaude: true,
+    custom: { deepseek: { type: 'command', command: 'uninstalled-gateway' } },
+    quotaCommands: { codex: command('codex'), claude: command('disabled'), gemini: command('gemini') },
+  }));
+  writeFileSync(join(opts.cwd, 'unify.config.json'), JSON.stringify({
+    targets: { fast: { provider: 'codex', model: 'mini' } },
+    quotaCommands: { deepseek: command('untrusted') },
+  }));
+  const run = await invoke(['quota', '--watch', '--json'], opts, (output, child) => {
+    if (output.endsWith('\n')) child.kill('SIGINT');
+  });
+  assert.equal(run.code, 130, run.stderr);
+  const rows = Object.fromEntries(JSON.parse(run.stdout).map(row => [row.targetId, row]));
+  assert.deepEqual(rows.fast.reading, { status: 'ok', ...result });
+  assert.deepEqual(rows.codex.reading, rows.fast.reading);
+  assert.equal(rows.fast.provider, 'codex');
+  assert.equal(rows.fast.model, 'mini');
+  assert.match(rows.claude.reading.message, /disableClaude/);
+  assert.equal(rows.gemini.reading.status, 'error');
+  assert.match(rows.deepseek.reading.message, /quotaCommands.deepseek/);
+  assert.doesNotMatch(run.stdout + run.stderr, /private stderr/);
+  assert.deepEqual(readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').sort(), ['codex', 'gemini']);
+  assert.deepEqual(listRunIds(opts.cwd), []);
 });

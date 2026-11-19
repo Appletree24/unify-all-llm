@@ -20,7 +20,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
   const started = Date.now();
   const ctl = new AbortController();
   const res: RunResult = {
-    runId: opts.runId ?? randomUUID(), targetId: target.id, provider: target.adapter.id, model: target.model,
+    runId: opts.runId ?? randomUUID(), targetId: target.id, provider: target.adapter.id, model: target.model, reasoningEffort: target.reasoningEffort,
     status: 'running', ok: false, text: '', reasoning: '', durationMs: 0,
   };
   let stopped = false;
@@ -47,7 +47,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
       if (ctl.signal.aborted) return;
       if (opts.mode === 'exec' && !target.adapter.capabilities.exec) throw new Error(`${target.label} 不支持实施`);
       for await (const ev of target.adapter.run({
-        prompt: opts.prompt, cwd: opts.cwd, mode: opts.mode, model: target.model, signal: ctl.signal,
+        prompt: opts.prompt, cwd: opts.cwd, mode: opts.mode, model: target.model, reasoningEffort: target.reasoningEffort, signal: ctl.signal,
       })) {
         if (stopped || ctl.signal.aborted) break;
         if (terminal) throw new Error('模型在终态后继续发送事件');

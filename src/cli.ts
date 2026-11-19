@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { loadConfig, parseConfig, timeoutMillis } from './core/config.js';
 import { latestComparison, listRunIds, loadRun, type RunRecord } from './core/store.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent } from './core/workflow.js';
@@ -9,6 +10,7 @@ import { detectTargets } from './core/targets.js';
 import { effectiveContext, defaultContext, scanMemory } from './memory/scan.js';
 import { startMemoryServer } from './memory/server.js';
 import { runTui } from './tui/app.js';
+import { formatQuota, QUOTA_REFRESH_MS, readTargetQuotas } from './quota/index.js';
 import { FanOutView, bold, dim, header, red, secs, streamEvent } from './ui/term.js';
 
 const HELP = `unify — 同时提问多个模型，再汇总与实施
@@ -21,6 +23,7 @@ const HELP = `unify — 同时提问多个模型，再汇总与实施
   unify show [记录id]            查看结果及部分输出
   unify list                    查看记录
   unify doctor                  检查目标及能力
+  unify quota [--watch] [--json] 查看各目标剩余额度，--watch 每分钟刷新
   unify memory                  查看和管理各工具的记忆（网页；--tui 为终端界面）
 
 ask 选项:
@@ -55,7 +58,7 @@ exec 选项:
   providers: ["fast", "gemini"]；concurrency: 3。
   custom 端点和命令仅从用户配置加载，详见 README。
   disableClaude: true 完全禁用 Claude Code，包括版本检测。
-  TUI: /models /synth /cancel [目标] /retry [目标] /exec /new /copy /exit /quit。
+  TUI: /settings /models /quota /synth /cancel [目标] /retry [目标] /exec /new /copy /exit /quit。
 `;
 
 const cwd = process.cwd();
@@ -162,6 +165,34 @@ async function cmdExec(argv: string[]): Promise<number> {
   } finally { view.stop(); }
 }
 
+async function cmdQuota(args: string[]): Promise<number> {
+  const { values } = parseArgs({ args, options: { watch: { type: 'boolean' }, json: { type: 'boolean' } } });
+  const targets = Object.values(buildRegistry(loadConfig(cwd)));
+  const liveScreen = values.watch && !values.json && process.stdout.isTTY;
+  if (liveScreen) process.stdout.write('\x1b[?1049h');
+  try {
+    do {
+      const rows = await readTargetQuotas(targets, cwd, abort.signal);
+      if (values.json) {
+        process.stdout.write(JSON.stringify(rows) + '\n');
+      } else {
+        if (liveScreen) process.stdout.write('\x1b[2J\x1b[H');
+        process.stdout.write(`套餐剩余额度 · ${new Date().toLocaleString('zh-CN')}${values.watch ? ' · 每分钟刷新，Ctrl+C 退出' : ''}\n`);
+        for (const row of rows) {
+          const title = [row.targetId, row.provider !== row.targetId ? row.provider : undefined, row.model].filter(Boolean).join(' / ');
+          process.stdout.write(`\n${bold(title)}\n  ${formatQuota(row.reading).join('\n  ')}\n`);
+        }
+      }
+      if (values.watch) await delay(QUOTA_REFRESH_MS, undefined, { signal: abort.signal });
+    } while (values.watch && !abort.signal.aborted);
+  } catch (err) {
+    if (!abort.signal.aborted) throw err;
+  } finally {
+    if (liveScreen) process.stdout.write('\x1b[?1049l');
+  }
+  return signalExit;
+}
+
 async function cmdMemory(args: string[]): Promise<number> {
   const { values } = parseArgs({ args, options: { tui: { type: 'boolean' }, list: { type: 'boolean' }, json: { type: 'boolean' }, effective: { type: 'string' }, port: { type: 'string' } } });
   if (values.tui) return runTui(cwd, abort.signal, 'memory');
@@ -216,6 +247,7 @@ async function main(): Promise<number> {
       }
       return 0;
     case 'memory': return cmdMemory(rest);
+    case 'quota': return cmdQuota(rest);
     case 'doctor': {
       const cfg = loadConfig(cwd);
       const targets = Object.values(buildRegistry(cfg));

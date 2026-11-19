@@ -14,7 +14,7 @@ export interface ProcOptions {
 }
 
 /** POSIX children own a process group; cancellation includes inherited-pipe descendants. */
-function start(cmd: string, args: string[], opts: ProcOptions) {
+function start(cmd: string, args: string[], opts: ProcOptions, interactive = false) {
   opts.signal?.throwIfAborted();
   if (isWin && ![cmd, ...args].every((a) => SAFE_ARG.test(a))) throw new Error('Windows shell 参数包含不支持的字符');
   const child = spawn(cmd, args, { cwd: opts.cwd, shell: isWin, detached: !isWin, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
@@ -63,7 +63,7 @@ function start(cmd: string, args: string[], opts: ProcOptions) {
   child.stdin.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code !== 'EPIPE' && !opts.signal?.aborted) failure ??= err;
   });
-  child.stdin.end(opts.stdin ?? '', 'utf8');
+  if (!interactive) child.stdin.end(opts.stdin ?? '', 'utf8');
   return {
     child,
     async finish() {
@@ -82,9 +82,7 @@ function start(cmd: string, args: string[], opts: ProcOptions) {
   };
 }
 
-/** Malformed JSONL is a protocol failure, never silently discarded output. */
-export async function* runJsonl(cmd: string, args: string[], opts: ProcOptions): AsyncGenerator<Record<string, any>> {
-  const p = start(cmd, args, opts);
+async function* readJsonl(p: ReturnType<typeof start>): AsyncGenerator<Record<string, any>> {
   const rl = createInterface({ input: p.child.stdout, crlfDelay: Infinity });
   try {
     for await (const line of rl) {
@@ -97,6 +95,26 @@ export async function* runJsonl(cmd: string, args: string[], opts: ProcOptions):
     rl.close();
     await p.cleanup();
   }
+}
+
+/** Malformed JSONL is a protocol failure, never silently discarded output. */
+export async function* runJsonl(cmd: string, args: string[], opts: ProcOptions): AsyncGenerator<Record<string, any>> {
+  yield* readJsonl(start(cmd, args, opts));
+}
+
+/** Keep stdin open for a control request. The first matching reply ends the exchange. */
+export async function requestJsonl<T>(
+  cmd: string, args: string[], opts: ProcOptions, request: object,
+  reply: (message: Record<string, any>, send: (value: object) => void) => T | undefined,
+): Promise<T> {
+  const proc = start(cmd, args, opts, true);
+  const send = (value: object) => { proc.child.stdin.write(JSON.stringify(value) + '\n'); };
+  send(request);
+  for await (const message of readJsonl(proc)) {
+    const result = reply(message, send);
+    if (result !== undefined) return result;
+  }
+  throw new Error(`${cmd} 未返回查询结果`);
 }
 
 /** Plain commands succeed only after stdout EOF and a zero exit code. */

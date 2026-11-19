@@ -20,6 +20,7 @@ export const claude: ProviderAdapter = {
     } else {
       args.push('--permission-mode', 'acceptEdits');
     }
+    if (req.reasoningEffort) args.push('--effort', req.reasoningEffort);
     if (req.model) args.push('--model', req.model);
 
     let acc = '';

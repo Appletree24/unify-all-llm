@@ -2,6 +2,7 @@ import { commandExists, runText } from '../core/proc.js';
 import type { ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
 import { z } from 'zod';
 import type { CustomProviderConfig } from '../core/config.js';
+import { httpEffort } from './effort.js';
 import { sseData } from './sse.js';
 export type { CustomProviderConfig } from '../core/config.js';
 
@@ -20,23 +21,23 @@ const chunkSchema = z.object({
   choices: z.array(z.object({
     index: z.number().optional(), finish_reason: z.string().nullable().optional(),
     delta: z.object({
-      content: z.string().nullable().optional(), reasoning_content: z.string().optional(), reasoning: z.string().optional(),
+      content: z.string().nullish(), reasoning_content: z.string().nullish(), reasoning: z.string().nullish(),
     }).optional(),
   })).optional(),
   usage: z.object({ prompt_tokens: z.number().optional(), completion_tokens: z.number().optional() }).nullable().optional(),
 });
 
-function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'openai' }>): ProviderAdapter {
+function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'openai' }>, getKey = () => c.apiKeyEnv ? process.env[c.apiKeyEnv] : undefined): ProviderAdapter {
   return {
     id,
     label: c.label ?? id,
     capabilities: { askPolicy: 'text-only', exec: false },
     async detect() {
       // Configuration only; reachability is discovered on first use.
-      return { installed: !c.apiKeyEnv || !!process.env[c.apiKeyEnv], version: c.model };
+      return { installed: !c.apiKeyEnv || !!getKey(), version: c.model };
     },
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
-      const key = c.apiKeyEnv ? process.env[c.apiKeyEnv] : undefined;
+      const key = getKey();
       if (c.apiKeyEnv && !key) {
         yield { type: 'error', message: `环境变量 ${c.apiKeyEnv} 未设置` };
         return;
@@ -48,6 +49,7 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
         body: JSON.stringify({
           model: req.model ?? c.model,
           stream: true,
+          ...httpEffort(c.baseUrl, req.reasoningEffort),
           messages: [...(c.system ? [{ role: 'system', content: c.system }] : []), { role: 'user', content: req.prompt }],
         }),
       });
@@ -107,8 +109,8 @@ function commandAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'co
   };
 }
 
-export function customAdapter(id: string, c: CustomProviderConfig): ProviderAdapter {
-  const inner = c.type === 'openai' ? openaiAdapter(id, c) : c.type === 'command' ? commandAdapter(id, c) : undefined;
+export function customAdapter(id: string, c: CustomProviderConfig, getKey?: () => string | undefined): ProviderAdapter {
+  const inner = c.type === 'openai' ? openaiAdapter(id, c, getKey) : c.type === 'command' ? commandAdapter(id, c) : undefined;
   if (!inner) throw new Error(`自定义模型 "${id}" 的 type 必须是 "openai" 或 "command"`);
   return {
     ...inner,

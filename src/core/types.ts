@@ -1,4 +1,5 @@
-import type { CustomProviderConfig } from './config.js';
+import type { CustomProviderConfig, ReasoningEffort } from './config.js';
+import type { QuotaReader } from '../quota/types.js';
 
 /** ask requests an answer using the provider's declared policy; exec permits edits. */
 export type RunMode = 'ask' | 'exec';
@@ -26,6 +27,7 @@ export interface RunRequest {
   cwd: string;
   mode: RunMode;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
   signal?: AbortSignal;
 }
 
@@ -39,6 +41,7 @@ export interface ProviderAdapter {
   label: string;
   capabilities: Capabilities;
   configuration?: CustomProviderConfig;
+  readQuota?: QuotaReader;
   detect(signal?: AbortSignal): Promise<DetectResult>;
   run(req: RunRequest): AsyncGenerator<ProviderEvent>;
 }
@@ -49,6 +52,7 @@ export interface ModelTarget {
   label: string;
   adapter: ProviderAdapter;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
 }
 
 export interface TargetSnapshot {
@@ -56,6 +60,7 @@ export interface TargetSnapshot {
   label: string;
   provider: string;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
   capabilities: Capabilities;
   configuration?: CustomProviderConfig;
 }
@@ -67,6 +72,7 @@ export interface RunResult {
   targetId: string;
   provider: string;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
   status: RunStatus;
   ok: boolean;
   text: string;
@@ -79,5 +85,5 @@ export interface RunResult {
 }
 
 export function snapshotTarget(target: ModelTarget): TargetSnapshot {
-  return { id: target.id, label: target.label, provider: target.adapter.id, model: target.model, capabilities: { ...target.adapter.capabilities }, configuration: target.adapter.configuration ? structuredClone(target.adapter.configuration) : undefined };
+  return { id: target.id, label: target.label, provider: target.adapter.id, model: target.model, reasoningEffort: target.reasoningEffort, capabilities: { ...target.adapter.capabilities }, configuration: target.adapter.configuration ? structuredClone(target.adapter.configuration) : undefined };
 }

@@ -9,12 +9,17 @@ import { defaultContext } from '../memory/scan.js';
 import type { MemoryContext } from '../memory/types.js';
 import { startMemoryServer, type MemoryServer } from '../memory/server.js';
 import { buildRegistry } from '../providers/index.js';
+import { readTargetQuotas } from '../quota/index.js';
 import { defaultTargetIds, detectTargets } from '../core/targets.js';
 import { COMMANDS, complete, listFiles, type Completion } from './complete.js';
+import { readApiProfile, saveApiProfile, type ApiProfile, type OfficialApi } from '../providers/official.js';
+import { SettingsView, writeSetting } from './settings.js';
+import { ApiView } from './api.js';
 import { Editor } from './editor.js';
 import { KeyParser, type Key } from './keys.js';
 import { layout } from './markdown.js';
 import { MemoryView } from './memory.js';
+import { QuotaView } from './quota.js';
 import { Screen, charWidth, rgb, textWidth, truncate, type Cell } from './screen.js';
 
 // ── palette ────────────────────────────────────────────────────────────────
@@ -40,6 +45,7 @@ const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n
 
 interface Pane {
   id: string; // 'a:<target>' | 'synth' | 'exec'
+  targetId: string;
   kind: 'answer' | 'synth' | 'exec';
   title: string;
   color: string;
@@ -97,6 +103,10 @@ export class App {
   private branch = '';
   private memory?: Promise<MemoryServer>;
   private mem?: MemoryView;
+  private settings?: SettingsView;
+  private api?: ApiView;
+  private quota?: QuotaView;
+  private quotaDetails = false;
 
   private focus = 'input';
   private zoomId?: string;
@@ -120,6 +130,7 @@ export class App {
   private inputTop = 0;
   private mouseOn = true;
   private manualModels = false;
+  private sessionSynth?: string;
 
   constructor(
     private io: TuiIO,
@@ -130,8 +141,13 @@ export class App {
   ) {}
 
   // ── lifecycle ────────────────────────────────────────────────────────────
-  async init(): Promise<void> {
+  async init(open?: 'memory'): Promise<void> {
     try { this.branch = /^ref: refs\/heads\/(.+)$/m.exec(readFileSync(join(this.cwd, '.git', 'HEAD'), 'utf8'))?.[1] ?? ''; } catch { /* not a repository */ }
+    this.showReasoning = this.cfg.showReasoning ?? false;
+    this.mouseOn = this.cfg.mouse ?? true;
+    if (!this.mouseOn) this.io.setMouse?.(false);
+    if (open === 'memory') this.openMemory();
+    else this.startQuotaMonitor();
     this.render();
     this.ticker = setInterval(() => {
       if (this.busy || this.installed.size < this.all.length) {
@@ -139,15 +155,26 @@ export class App {
         this.render();
       }
     }, 100);
-    this.installed = await detectTargets(this.all, this.detecting.signal);
+    const initial = this.all;
+    const detected = await detectTargets(initial, this.detecting.signal);
     if (this.disposed) return;
-    const wanted = defaultTargetIds(this.cfg, this.all);
-    this.selected = this.cfg.providers ?? wanted.filter((id) => this.installed.get(id));
+    for (const target of initial) {
+      if (this.adapter(target.id) === target) this.installed.set(target.id, detected.get(target.id) ?? false);
+    }
+    if (!this.manualModels) {
+      const wanted = defaultTargetIds(this.cfg, this.all);
+      this.selected = this.cfg.providers ?? wanted.filter((id) => this.installed.get(id));
+    }
     this.requestRender();
+  }
+
+  private startQuotaMonitor(): void {
+    this.quota ??= new QuotaView((signal) => readTargetQuotas(this.all, this.cwd, signal), () => this.requestRender());
   }
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.quota?.dispose();
     if (this.ticker) clearInterval(this.ticker);
     this.ctl?.abort();
     this.detecting.abort();
@@ -192,8 +219,9 @@ export class App {
     return this.all.find((a) => a.id === id);
   }
 
-  private newPane(id: string, kind: Pane['kind'], title: string, color: string): Pane {
-    return { id, kind, title, color, text: '', reasoning: '', status: 'run', start: Date.now(), scroll: 0, follow: true, viewH: 1, maxScroll: 0 };
+  private newPane(targetId: string, kind: Pane['kind'], title: string, color: string): Pane {
+    const id = kind === 'answer' ? `a:${targetId}` : kind;
+    return { id, targetId, kind, title, color, text: '', reasoning: '', status: 'run', start: Date.now(), scroll: 0, follow: true, viewH: 1, maxScroll: 0 };
   }
 
   private apply(p: Pane, ev: ProviderEvent): void {
@@ -230,9 +258,9 @@ export class App {
   // ── flows ────────────────────────────────────────────────────────────────
   private workflowEvent(ev: WorkflowEvent): void {
     if (ev.type === 'stage' && ev.stage === 'answering') {
-      this.panes = ev.targets.map((t) => this.newPane(`a:${t.id}`, 'answer', t.label, this.colorOf(t.id)));
+      this.panes = ev.targets.map((t) => this.newPane(t.id, 'answer', t.label, this.colorOf(t.id)));
     } else if (ev.type === 'call' && ev.scope === 'synthesis') {
-      this.synth = this.newPane('synth', 'synth', `汇总 · ${ev.target.label}`, GOLD);
+      this.synth = this.newPane(ev.target.id, 'synth', `汇总 · ${ev.target.label}`, GOLD);
     } else if (ev.type === 'provider') {
       const pane = ev.scope === 'answer' ? this.panes.find((p) => p.id === `a:${ev.targetId}`) : ev.scope === 'synthesis' ? this.synth : ev.scope === 'exec' ? this.exec : undefined;
       if (pane) this.apply(pane, ev.event);
@@ -244,7 +272,7 @@ export class App {
   }
 
   private async ask(question: string, retryIds?: string[]): Promise<void> {
-    if (!this.selected.length) return this.say('没有可用的模型，请先配置模型并检查登录状态', RED);
+    if (!this.selected.length) return this.say('没有可用的模型，输入 /settings 接入官方 API，或检查 CLI 登录状态', RED);
     const previous = this.lastRun;
     this.begin();
     this.ctl = new AbortController();
@@ -293,7 +321,7 @@ export class App {
   }
 
   private async runExec(executor: ModelTarget, source: RunRecord, from?: string): Promise<void> {
-    const pane = (this.exec = this.newPane('exec', 'exec', `实施 · ${executor.label}`, VIOLET));
+    const pane = (this.exec = this.newPane(executor.id, 'exec', `实施 · ${executor.label}`, VIOLET));
     this.focus = 'input';
     this.zoomId = undefined;
     this.begin();
@@ -316,7 +344,12 @@ export class App {
   /** Show the memory manager in place of the comparison screen until it is closed. */
   openMemory(): void {
     try {
-      this.mem = new MemoryView(this.memoryCtx, { close: () => { this.mem = undefined; }, web: () => this.memoryWeb() });
+      this.mem = new MemoryView(this.memoryCtx, {
+        close: () => { this.mem = undefined; this.startQuotaMonitor(); },
+        web: () => this.memoryWeb(),
+      });
+      this.quota?.dispose();
+      this.quota = undefined;
     } catch (err) { this.say(`无法读取记忆: ${err instanceof Error ? err.message : err}`, RED); }
     this.requestRender();
   }
@@ -388,10 +421,72 @@ export class App {
     this.say('已开始新对话');
   }
 
+  private useApi(api: OfficialApi, profile: ApiProfile): void {
+    const registry = buildRegistry(this.cfg, other => other.id === api.id ? profile : readApiProfile(other));
+    const updated = Object.values(registry).filter(t => t.adapter.id === api.id);
+    saveApiProfile(api, profile);
+    this.all = [...this.all.filter(t => t.adapter.id !== api.id), ...updated];
+    for (const t of updated) this.installed.set(t.id, true);
+    this.selected = [api.id];
+    this.manualModels = true;
+    this.quota?.dispose();
+    this.quota = undefined;
+    this.startQuotaMonitor();
+    this.say(`已选用 ${api.label} · ${registry[api.id].model ?? profile.model}，可以直接提问`, GOLD);
+  }
+
+  private applySetting(field: keyof Config, value: unknown, entry?: string): void {
+    const { cfg, targets } = writeSetting(this.cwd, field, value, entry);
+    if (field === 'synthesizer' || !targets.some(t => t.id === this.sessionSynth)) this.sessionSynth = undefined;
+    if (this.sessionSynth) cfg.synthesizer = this.sessionSynth;
+    this.cfg = cfg;
+    this.all = targets;
+    if (field === 'mouse') {
+      this.mouseOn = cfg.mouse ?? true;
+      this.io.setMouse?.(this.mouseOn);
+    }
+    if (field === 'showReasoning') this.showReasoning = cfg.showReasoning ?? false;
+    if (field === 'providers') this.manualModels = false;
+    this.selected = this.selected.filter(id => targets.some(t => t.id === id));
+    const selectDefaults = () => {
+      if (!this.manualModels) this.selected = cfg.providers ?? defaultTargetIds(cfg, targets).filter(id => this.installed.get(id));
+    };
+    const transportChanged = ['targets', 'custom', 'disableClaude'].includes(field);
+    if (transportChanged) this.installed.clear();
+    selectDefaults();
+    if (targets.some(t => !this.installed.has(t.id))) void detectTargets(targets, this.detecting.signal).then(installed => {
+      if (this.disposed || this.all !== targets) return;
+      this.installed = installed;
+      selectDefaults();
+      this.requestRender();
+    });
+    if (['targets', 'models', 'custom', 'quotaCommands', 'disableClaude'].includes(field)) {
+      this.quota?.dispose();
+      this.quota = undefined;
+      this.startQuotaMonitor();
+    }
+  }
+
   private command(line: string): void {
     const [name, ...rest] = line.slice(1).trim().split(/\s+/);
     const arg = rest.join(' ');
-    if (name === 'exec') this.startExec(arg || undefined);
+    if (name === 'settings') {
+      if (arg) return this.say('请单独输入 /settings', YELLOW);
+      if (this.busy) return this.say('请等待本轮结束后修改设置', YELLOW);
+      this.settings = new SettingsView(
+        this.cwd,
+        () => ({ cfg: this.cfg, targets: this.all, selected: this.selected, showReasoning: this.showReasoning, mouse: this.mouseOn }),
+        (field, value, entry) => this.applySetting(field, value, entry),
+        () => {
+          this.api = new ApiView(this.cfg, (api, profile) => {
+            this.useApi(api, profile);
+            this.settings = undefined;
+          }, () => { this.api = undefined; });
+        },
+        () => { this.settings = undefined; },
+      );
+    }
+    else if (name === 'exec') this.startExec(arg || undefined);
     else if (name === 'cancel') {
       if (!this.busy) return this.say('没有正在运行的请求');
       if (!arg) return this.interrupt();
@@ -407,6 +502,7 @@ export class App {
     else if (name === 'new') this.newConversation();
     else if (name === 'copy') this.copy();
     else if (name === 'help') this.help = true;
+    else if (name === 'quota') this.quotaDetails = true;
     else if (name === 'memory') {
       if (arg === 'web') this.memoryWeb().then((url) => this.say(`记忆管理界面（仅本机）: ${url}`, GOLD), (err) => this.say(`无法启动记忆管理界面: ${err instanceof Error ? err.message : err}`, RED));
       else this.openMemory();
@@ -427,6 +523,7 @@ export class App {
       this.say(this.mouseOn ? '鼠标滚轮已开启（选择文本请按住 Shift 拖动）' : '鼠标已关闭，可直接拖动选择文本');
     } else if (name === 'synth') {
       if (!this.installed.get(arg)) return this.say(`"${arg}" 不可用`, RED);
+      this.sessionSynth = arg;
       this.cfg = { ...this.cfg, synthesizer: arg };
       this.say(`汇总模型: ${arg}`);
     } else {
@@ -436,6 +533,19 @@ export class App {
 
   // ── input ────────────────────────────────────────────────────────────────
   handleKey(k: Key): void {
+    const view = this.api ?? this.settings;
+    if (view) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      view.handleKey(k);
+      return this.requestRender();
+    }
+    if (this.quotaDetails && this.quota) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      if (k.name === 'esc' || k.name === 'ctrl+c' || (k.name === 'char' && k.text === 'q')) {
+        this.quotaDetails = false;
+      } else this.quota.handleKey(k);
+      return this.requestRender();
+    }
     if (this.mem) {
       if (k.name === 'ctrl+d') return this.onQuit();
       this.mem.handleKey(k);
@@ -511,8 +621,8 @@ export class App {
     if (this.focus === 'input' && !this.compOff && !this.ed.empty) {
       const targets = this.all.filter((t) => this.installed.get(t.id)).map((t) => ({ id: t.id, label: t.label, exec: t.adapter.capabilities.exec }));
       c = complete(this.ed.chars, this.ed.caret, targets, () => (this.files ??= listFiles(this.cwd)));
-      // Nothing left to complete: do not keep Tab and Enter captive.
-      if (c && c.kind !== 'file' && c.items.length === 1 && c.items[0].value === this.ed.chars.slice(c.start, c.end).join('')) c = undefined;
+      // Keep exact command matches visible; completed arguments need no popup.
+      if (c && c.kind === 'argument' && c.items.length === 1 && c.items[0].value === this.ed.chars.slice(c.start, c.end).join('')) c = undefined;
     }
     const same = !!c && !edited && this.comp?.kind === c.kind && this.comp.start === c.start;
     this.compIdx = same ? clamp(this.compIdx, 0, c!.items.length - 1) : 0;
@@ -689,7 +799,7 @@ export class App {
   private submit(): void {
     const text = this.ed.text.trim();
     if (!text) return;
-    if (this.history[this.history.length - 1] !== text) this.history.push(text);
+    if (!/^\/settings\s/.test(text) && this.history[this.history.length - 1] !== text) this.history.push(text);
     this.histIdx = this.history.length;
     this.draft = '';
     this.ed.clear();
@@ -725,6 +835,15 @@ export class App {
     const s = new Screen(cols, rows);
     this.cursor = null;
     this.rects = [];
+    const view = this.api ?? this.settings;
+    if (view) {
+      view.draw(s);
+      return s;
+    }
+    if (this.quotaDetails && this.quota) {
+      this.quota.draw(s);
+      return s;
+    }
     if (this.mem) {
       this.cursor = this.mem.draw(s);
       return s;
@@ -827,7 +946,7 @@ export class App {
       this.focus === 'input'
         ? this.panes.length
           ? ['Tab 切换面板', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+R 思考', 'Ctrl+N 新对话', '/help 帮助']
-          : ['Enter 发送', 'Shift+Enter 换行', '/ 命令', '@ 文件', '/help 帮助']
+          : ['Enter 发送', 'Shift+Enter/Ctrl+J 换行', '/quota 套餐余量', '/ 命令', '@ 文件', '/help 帮助']
         : ['↑↓/滚轮 滚动', 'Enter 放大', 'y 复制', 'Ctrl+E 按此回答实施', 'Esc 返回'];
     let x = 1;
     for (const h of hints) {
@@ -927,35 +1046,42 @@ export class App {
 
   private drawWelcome(s: Screen, y: number, h: number): void {
     const n = this.all.length;
-    const nameW = Math.max(...this.all.map((a) => textWidth(a.label)));
+    const nameW = Math.min(Math.max(1, ...this.all.map((a) => textWidth(a.label))), Math.floor(s.cols / 3));
     const mid = Math.floor((n - 1) / 2);
-    const diagramW = 2 + nameW + 4 + 12;
-    const x0 = Math.max(1, Math.floor((s.cols - diagramW) / 2));
+    const showDiagram = s.cols - nameW >= 48;
+    const quotaOffset = 2 + nameW + (showDiagram ? 18 : 2);
+    const blockW = Math.min(s.cols - 2, quotaOffset + 52);
+    const x0 = Math.floor((s.cols - blockW) / 2);
+    const quotaW = blockW - quotaOffset;
     const blockH = n + 4;
     let row = y + Math.max(0, Math.floor((h - blockH) / 2));
-    this.all.forEach((a, i) => {
+    for (const [i, a] of this.all.entries()) {
+      if (row >= y + h) break;
       const on = this.selected.includes(a.id);
       const known = this.installed.has(a.id);
       const color = on ? this.colorOf(a.id) : BORDER;
-      let x = s.put(x0, row, !known ? SPIN[this.frame % 10] : on ? '●' : '○', color);
-      x = s.put(x + 1, row, a.label.padEnd(nameW), on ? `1;${color}` : DIM);
-      const joint = n === 1 ? '─' : i === mid ? (i === 0 ? '┬' : i === n - 1 ? '┴' : '┼') : i === 0 ? '╮' : i === n - 1 ? '╯' : '┤';
-      x = s.put(x + 1, row, '──' + joint, color === BORDER ? BORDER : DIM);
-      if (i === mid) {
-        x = s.put(x, row, '──▶ ', DIM);
-        s.put(x, row, '✦ 最优解', `1;${GOLD}`);
-      } else if (a.id === this.cfg.decider && this.installed.get(a.id)) {
-        s.put(x + 1, row, '决策', GOLD);
-      } else if (known && !this.installed.get(a.id)) {
-        s.put(x + 1, row, '未安装', BORDER);
+      const tag = known && !this.installed.get(a.id) ? (a.adapter.configuration?.type === 'openai' ? '缺少密钥' : '未安装') : a.id === this.cfg.decider ? '决策' : '';
+      const tagStyle = tag === '决策' ? GOLD : DIM;
+      s.put(x0, row, !known ? SPIN[this.frame % 10] : on ? '●' : '○', color);
+      s.put(x0 + 2, row, truncate(a.label, nameW), on ? `1;${color}` : DIM);
+      if (showDiagram) {
+        const joint = n === 1 ? '─' : i === mid ? (i === 0 ? '┬' : i === n - 1 ? '┴' : '┼') : i === 0 ? '╮' : i === n - 1 ? '╯' : '┤';
+        const x = s.put(x0 + 3 + nameW, row, '──' + joint, color === BORDER ? BORDER : DIM);
+        if (i === mid) s.put(s.put(x, row, '──▶ ', DIM), row, '✦ 最优解', `1;${GOLD}`);
+        else if (tag) s.put(x + 1, row, tag, tagStyle);
+      }
+      const summary = this.quota?.summary(a.id, quotaW) ?? '余量查询中…';
+      const end = s.put(x0 + quotaOffset, row, truncate(summary, quotaW), DIM);
+      if ((!showDiagram || i === mid) && tag && end + 2 + textWidth(tag) <= x0 + blockW) {
+        s.put(end + 2, row, tag, tagStyle);
       }
       row++;
-    });
+    }
     const center = (text: string, st: string, at: number) => {
       if (at < y + h) s.put(Math.max(1, Math.floor((s.cols - textWidth(text)) / 2)), at, truncate(text, s.cols - 2), st);
     };
     center('一个问题 · 多个模型 · 一份最优解', '', row + 1);
-    center('各模型独立作答，再由一个模型匿名评审、去伪存真', DIM, row + 2);
+    center('输入 /settings 接入官方 API', DIM, row + 2);
   }
 
   private drawPane(s: Screen, x: number, y: number, w: number, h: number, p: Pane, focused: boolean, hint = ''): void {
@@ -1011,13 +1137,15 @@ export class App {
     tx = s.put(tx, y, `  ${status} `, DIM, right - 1);
     if (hint && tx + textWidth(hint) + 4 < right) s.put(right - textWidth(hint) - 3, y, ` ${hint} `, DIM, right - 1);
 
-    // bottom edge: who is who, and where we are
-    if (p.note) s.put(x + 2, y + h - 1, ` ${p.note} `, DIM, right - 1);
-    if (p.maxScroll) {
-      const pos = ` ${Math.min(lines.length, p.scroll + innerH)}/${lines.length} `;
-      const px = right - textWidth(pos) - 2;
-      if (px > x + 2 + (p.note ? textWidth(p.note) + 3 : 0)) s.put(px, y + h - 1, pos, DIM, right - 1);
-    }
+    const footY = y + h - 1;
+    const pos = p.maxScroll ? ` ${Math.min(lines.length, p.scroll + innerH)}/${lines.length} ` : '';
+    const footEnd = right - 1 - textWidth(pos);
+    const available = Math.max(1, footEnd - x - 4);
+    const quotaWidth = p.note ? Math.max(12, Math.floor(available / 2)) : available;
+    const quota = this.quota?.summary(p.targetId, quotaWidth) ?? '余量查询中…';
+    const end = s.put(x + 2, footY, ` ${quota} `, DIM, footEnd);
+    if (p.note && end + 4 < footEnd) s.put(end, footY, truncate(p.note, footEnd - end - 1) + ' ', DIM, footEnd);
+    if (pos) s.put(footEnd, footY, pos, DIM, right - 1);
   }
 }
 
@@ -1044,11 +1172,10 @@ export async function runTui(cwd: string, signal?: AbortSignal, open?: 'memory')
     Object.values(buildRegistry(cfg)),
   );
   const parser = new KeyParser();
-  const restore = () => out.write(MOUSE_OFF + '\x1b[<u\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l');
+  const restore = () => out.write(MOUSE_OFF + '\x1b[<u\x1b[>4;0m\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l');
 
-  // alternate screen, no auto-wrap, bracketed paste, and (where supported) the kitty
-  // keyboard protocol so Shift+Enter and Esc are reported unambiguously
-  out.write('\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[>1u' + MOUSE_ON);
+  // Request xterm modifyOtherKeys, then prefer kitty's keyboard protocol where supported.
+  out.write('\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[>4;2m\x1b[>1u' + MOUSE_ON);
   stdin.setRawMode(true);
   stdin.setEncoding('utf8');
   stdin.resume();
@@ -1077,6 +1204,6 @@ export async function runTui(cwd: string, signal?: AbortSignal, open?: 'memory')
     out.on('resize', onResize);
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
-    else void app.init().then(() => { if (open === 'memory') app.openMemory(); }).catch(() => quit(1));
+    else void app.init(open).catch(() => quit(1));
   });
 }

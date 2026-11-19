@@ -15,7 +15,7 @@ const widthOf = (cells: Cell[]) => cells.reduce((a, c) => a + c.w, 0);
 const add = (base: string, extra: string) => (base ? `${extra};${base}` : extra);
 
 /** Wrap to `width` columns. Latin words break at spaces, CJK breaks anywhere. */
-function wrap(cells: Cell[], width: number, hang = 0): Cell[][] {
+export function wrap(cells: Cell[], width: number, hang = 0): Cell[][] {
   width = Math.max(4, width);
   if (width <= hang + 4) hang = 0;
   const out: Cell[][] = [];
