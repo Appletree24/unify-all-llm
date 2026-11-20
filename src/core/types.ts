@@ -39,6 +39,8 @@ export interface DetectResult {
 export interface ProviderAdapter {
   id: string;
   label: string;
+  defaultModel?: string;
+  autoSelect?: boolean;
   capabilities: Capabilities;
   configuration?: CustomProviderConfig;
   readQuota?: QuotaReader;

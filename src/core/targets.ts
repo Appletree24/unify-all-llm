@@ -9,5 +9,5 @@ export async function detectTargets(targets: ModelTarget[], signal?: AbortSignal
 }
 
 export function defaultTargetIds(cfg: Config, targets: ModelTarget[]): string[] {
-  return cfg.providers ?? targets.filter((t) => t.id !== cfg.decider).map((t) => t.id);
+  return cfg.providers ?? targets.filter((t) => t.id !== cfg.decider && t.adapter.autoSelect !== false).map((t) => t.id);
 }

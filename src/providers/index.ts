@@ -5,6 +5,7 @@ import { codex } from './codex.js';
 import { customAdapter } from './custom.js';
 import { officialAdapter, officialApis, readApiProfile } from './official.js';
 import { gemini } from './gemini.js';
+import { geminiPro } from './antigravity.js';
 import { readClaudeQuota } from '../quota/claude.js';
 import { readCodexQuota } from '../quota/codex.js';
 import { commandQuota } from '../quota/command.js';
@@ -23,6 +24,7 @@ export const RESERVED: Record<string, string> = { jev: 'Jev（System One 决策�
 export function buildRegistry(config: Config, readProfile = readApiProfile): Record<string, ModelTarget> {
   const cfg = parseConfig(config);
   const adapters = { ...builtin };
+  if (!cfg.custom?.[geminiPro.id] && !cfg.targets?.[geminiPro.id]) adapters[geminiPro.id] = geminiPro;
   for (const api of officialApis) {
     // Existing user transports and target aliases keep their IDs across upgrades.
     if (cfg.custom?.[api.id] || (api.id !== 'deepseek' && cfg.targets?.[api.id])) continue;
@@ -56,6 +58,7 @@ export function buildRegistry(config: Config, readProfile = readApiProfile): Rec
   }
   for (const [id, model] of Object.entries(cfg.models ?? {})) targets[id].model = model;
   for (const target of Object.values(targets)) {
+    target.model ??= target.adapter.defaultModel;
     const effort = cfg.reasoningEffort?.[target.id] ?? cfg.targets?.[target.id]?.reasoningEffort;
     if (effort === 'default') continue;
     if (effort && !effortChoices(target).includes(effort)) throw new Error(`目标 ${target.id} 不支持思考强度 ${effort}`);

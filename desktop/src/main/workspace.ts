@@ -5,6 +5,7 @@ import { loadConfig, parseConfig, readJson, type Config } from '../../../src/cor
 import { projectConfigPath, userConfigPath, writeSetting } from '../../../src/core/settings.js';
 import { listRunIds, loadRun, type RunRecord } from '../../../src/core/store.js';
 import { defaultTargetIds, detectTargets } from '../../../src/core/targets.js';
+import { ModelTests } from '../../../src/core/model-tests.js';
 import type { ModelTarget } from '../../../src/core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../../../src/core/workflow.js';
 import { defaultContext } from '../../../src/memory/scan.js';
@@ -44,14 +45,17 @@ export class Workspace {
   private readonly runCache = new Map<string, { mtime: number; run: RunRecord }>();
   private quotaCache?: { at: number; value: Promise<TargetQuota[]> };
   private memory?: Promise<MemoryServer>;
+  private readonly modelTests: ModelTests;
 
   constructor(readonly cwd: string, private readonly push: (p: Push) => void) {
+    this.modelTests = new ModelTests(cwd, () => this.pushInfo());
     this.reload();
     void gitBranch(cwd).then((b) => { this.branch = b; this.pushInfo(); });
   }
 
   /** Re-read both config layers; an invalid file is reported instead of crashing the window. */
   reload(redetect = true): void {
+    void this.modelTests.reset();
     try {
       this.cfg = loadConfig(this.cwd);
       this.targets = Object.values(buildRegistry(this.cfg));
@@ -90,6 +94,7 @@ export class Workspace {
         modelOverride: this.cfg.models?.[t.id],
         reasoningEffort: t.reasoningEffort,
         installed: this.installed.get(t.id),
+        test: this.modelTests.state(t),
         exec: t.adapter.capabilities.exec, askPolicy: t.adapter.capabilities.askPolicy,
         models: targetModelIds(t, this.targets), efforts: [...effortChoices(t)],
       };
@@ -263,6 +268,13 @@ export class Workspace {
     return this.quotaCache.value;
   }
 
+  async testTarget(id: string): Promise<void> {
+    if (this.configError) throw new Error(this.configError);
+    const target = this.targets.find(t => t.id === id);
+    if (!target) throw new Error(`未知目标 ${id}`);
+    await this.modelTests.run(target, this.cfg.timeoutSec);
+  }
+
   settings(): SettingsInfo {
     const userPath = userConfigPath();
     const projectPath = projectConfigPath(this.cwd);
@@ -314,7 +326,7 @@ export class Workspace {
     this.detectCtl.abort();
     const pending = [...this.handles.values()];
     for (const h of pending) h.cancel();
-    await Promise.all(pending.map((h) => h.done.catch(() => undefined)));
+    await Promise.all([this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined))]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 }

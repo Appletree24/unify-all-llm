@@ -4,6 +4,8 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { customAdapter } from '../dist/providers/custom.js';
 import { runOne } from '../dist/core/orchestrator.js';
+import { defaultTargetIds } from '../dist/core/targets.js';
+import { geminiPro } from '../dist/providers/antigravity.js';
 import { sseData } from '../dist/providers/sse.js';
 import { options, workspace } from './helpers.mjs';
 
@@ -121,4 +123,9 @@ test('HTTP targets encode effort for their transport and leave provider defaults
   }
   assert.throws(() => buildRegistry({ reasoningEffort: { gemini: 'high' } }), /不支持思考强度/);
   assert.throws(() => buildRegistry({ reasoningEffort: { nonexistent: 'low' } }), /未知目标/);
+});
+test('subscription chat is selectable without adding it to existing automatic comparisons', () => {
+  const target = { id: geminiPro.id, adapter: geminiPro };
+  assert.deepEqual(defaultTargetIds({}, [target]), []);
+  assert.deepEqual(defaultTargetIds({ providers: [target.id] }, [target]), [target.id]);
 });

@@ -266,6 +266,46 @@ test('TUI completes commands, targets and files from the composer', async (t) =>
   assert.match(composer(app), /^❯ 继续追问/);
 });
 
+test('settings test the selected target on demand and show the actual chat outcome', async (t) => {
+  const cwd = workspace(t);
+  const release = deferred();
+  const requests = [];
+  const alias = { ...target('pro', async function* (req) {
+    requests.push(req);
+    if (requests.length === 1) {
+      await release.promise;
+      yield { type: 'delta', text: 'partial' };
+      yield { type: 'error', message: 'account not eligible in this region' };
+    } else {
+      yield { type: 'done', text: 'OK' };
+    }
+  }), model: 'configured-model', reasoningEffort: 'high' };
+  const other = target('other', async function* () { assert.fail('wrong target'); });
+  const app = new App({ cols: () => 92, rows: () => 24, write() {} }, cwd, { providers: ['other'] }, [other, alias]);
+  t.after(() => app.dispose());
+  await app.init();
+  const press = name => app.handleKey({ name });
+  submit(app, '/settings');
+  for (const key of ['down', 'enter', 'down', 'enter', 'down', 'down']) press(key);
+  assert.match(screen(app), /› 测试可用性/);
+  assert.equal(requests.length, 0);
+  app.handleKey({ name: 'click', x: 5, y: 4 });
+  press('enter');
+  assert.match(screen(app), /测试中/);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].mode, 'ask');
+  assert.equal(requests[0].model, 'configured-model');
+  assert.equal(requests[0].reasoningEffort, 'high');
+  release.resolve();
+  await new Promise(setImmediate);
+  assert.match(screen(app), /测试失败[\s\S]*account not eligible/);
+  press('enter');
+  await new Promise(setImmediate);
+  assert.match(screen(app), /测试通过/);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(listRunIds(cwd), []);
+});
+
 test('official API setup masks credentials, selects DeepSeek immediately, and survives restart', async (t) => {
   const { existsSync, statSync } = await import('node:fs');
   const { buildRegistry } = await import('../dist/providers/index.js');

@@ -1,4 +1,5 @@
 import { atomicWrite } from './atomic-write.js';
+import { synthesisFormatter } from './synth.js';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -83,7 +84,7 @@ export function exportRun(cwd: string, run: RunRecord): void {
   const dir = runDir(cwd, run.id);
   atomicWrite(join(dir, 'question.md'), run.question + '\n');
   for (const r of run.results) atomicWrite(join(dir, `answer-${safeId.parse(r.targetId)}.md`), `${r.ok ? '' : `**${r.status}**: ${r.error ?? ''}\n\n`}${r.text}\n`);
-  if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), `${run.synthesis.result.text}\n`);
+  if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), synthesisFormatter(run)(run.synthesis.result.text) + '\n');
 }
 
 export function listRunIds(cwd: string): string[] {

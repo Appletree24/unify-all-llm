@@ -3,11 +3,13 @@ import { join } from 'node:path';
 import { parseConfig, readJson, type Config } from '../core/config.js';
 import { userField, writeSetting, type SettingField } from '../core/settings.js';
 import type { ModelTarget } from '../core/types.js';
+import type { ModelTests } from '../core/model-tests.js';
 import { targetModelIds } from '../providers/models.js';
 import { effortChoices } from '../providers/effort.js';
 import { Editor } from './editor.js';
 import type { Key } from './keys.js';
-import { Screen, rgb, truncate, textWidth } from './screen.js';
+import { Screen, rgb, truncate, textWidth, toCells } from './screen.js';
+import { wrap } from './markdown.js';
 
 type Field = SettingField;
 const gold = rgb(232, 196, 104);
@@ -23,7 +25,7 @@ interface SettingsState {
   mouse: boolean;
 }
 
-interface Row { label: string; value?: string; open(): void }
+interface Row { label: string; value?: string; detail?: string; open(): void }
 interface Page { title: string; rows(): Row[]; index: number }
 interface Input { title: string; hint: string; editor: Editor; save(value: string): void }
 
@@ -31,9 +33,11 @@ export class SettingsView {
   private pages: Page[];
   private input?: Input;
   private message = '';
+  private visible?: { page: Page; first: number; count: number };
 
   constructor(
     private cwd: string,
+    private tests: ModelTests,
     private state: () => SettingsState,
     private save: (field: Field, value: unknown, entry?: string) => void,
     private api: () => void,
@@ -78,6 +82,7 @@ export class SettingsView {
     const config = target.adapter.configuration;
     const model = target.model ?? (config?.type === 'openai' ? config.model : '默认');
     const choices = effortChoices(target);
+    const test = this.tests.state(target);
     return [
       {
         label: '模型 ID', value: model,
@@ -104,6 +109,11 @@ export class SettingsView {
             open: () => { this.save('reasoningEffort', level, id); this.pages.pop(); },
           })));
         },
+      },
+      {
+        label: '测试可用性', value: test?.status === 'failed' ? '测试失败' : test?.message,
+        detail: test?.status === 'failed' ? test.message : undefined,
+        open: () => { void this.tests.run(target, this.state().cfg.timeoutSec); },
       },
     ];
   }
@@ -175,6 +185,13 @@ export class SettingsView {
       if (k.name === 'down') page.index = (page.index + 1) % rows.length;
       if (k.name === 'up') page.index = (page.index + rows.length - 1) % rows.length;
       if (k.name === 'enter') rows[page.index]?.open();
+      if (k.name === 'click' && k.y !== undefined && this.visible?.page === page) {
+        const offset = k.y - 2;
+        if (offset >= 0 && offset < this.visible.count) {
+          page.index = this.visible.first + offset;
+          rows[page.index]?.open();
+        }
+      }
     } catch (err) { this.message = err instanceof Error ? err.message : String(err); }
   }
 
@@ -193,10 +210,17 @@ export class SettingsView {
       const rows = page.rows();
       const room = s.rows - 6;
       const first = Math.max(0, page.index - room + 1);
+      this.visible = { page, first, count: Math.min(room, rows.length - first) };
       rows.slice(first, first + room).forEach((r, i) => {
         const on = i + first === page.index;
         s.put(1, 2 + i, truncate(`${on ? '›' : ' '} ${r.label}${r.value ? '   ' + r.value : ''}`, s.cols - 2), on ? gold : '');
       });
+      const detail = rows[page.index]?.detail;
+      if (detail) {
+        const top = 3 + rows.length - first;
+        const lines = wrap(toCells(detail.replace(/\s+/g, ' ')), s.cols - 4);
+        lines.slice(0, Math.max(0, s.rows - top - 3)).forEach((line, i) => s.putCells(2, top + i, line));
+      }
     }
     s.put(1, s.rows - 3, this.message, gold);
     s.put(1, s.rows - 2, '项目设置保存到 ./unify.config.json；API 凭证与命令属于用户配置', dim);

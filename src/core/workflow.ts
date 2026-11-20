@@ -23,7 +23,7 @@ interface CommonOptions {
   config: Config;
   targets: ModelTarget[];
   signal?: AbortSignal;
-  onEvent?: (event: WorkflowEvent) => void;
+  onEvent?: (event: WorkflowEvent, record: RunRecord) => void;
 }
 export interface ComparisonOptions extends CommonOptions {
   question: string;
@@ -52,7 +52,7 @@ class Journal {
     if (opts.signal?.aborted) this.abort();
   }
   emit(event: WorkflowEvent): void {
-    try { this.opts.onEvent?.(event); }
+    try { this.opts.onEvent?.(event, this.record); }
     catch (err) {
       if ((this.record.observerErrors?.length ?? 0) < 20) (this.record.observerErrors ??= []).push(String(err));
     }

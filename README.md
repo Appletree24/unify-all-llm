@@ -83,6 +83,7 @@ npm run dist           # 打包安装程序到 desktop/release/
 输入 `/settings` 打开设置。方向键选择，Enter 保存，Esc 返回。常用设置写入当前项目的 `unify.config.json`，从下一次调用生效。官方 API 凭证、自定义端点和额度查询命令保存在用户目录。
 
 - **模型与思考强度**可逐个选择目标，从对应服务商的列表选择模型和思考档位。「默认」让底层服务或 CLI 决定强度。回答、决策、汇总和实施均使用实际调用目标的设置，重试回答沿用原轮的模型与强度。
+- 在模型设置中选择 **测试可用性**，会按已保存的配置单独向该目标发送一次简短提问。收到有效回答后显示耗时，失败时显示错误原因。
 - **回答、汇总与执行**设置默认回答目标、汇总模型、执行模型和决策模型。**并发与超时**设置并发数和各阶段超时。**高级配置**支持目标别名、自定义端点或命令、额度查询命令及禁用 Claude Code。
 - **显示思考过程**与**鼠标滚动**设置界面默认行为。`Ctrl+R` 和 `/mouse` 仍可在当前会话临时切换。
 
@@ -179,6 +180,7 @@ node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
 | Claude | 限定 Read/Glob/Grep/WebSearch/WebFetch 工具 | 是 |
 | Codex | CLI `read-only` sandbox | 是 |
 | Gemini | CLI `plan` approval mode | 是 |
+| Gemini Pro（Google AI 订阅） | Antigravity CLI `plan` 模式 | 否 |
 | 官方 API | 只发送 messages，不运行本地工具 | 否 |
 | OpenAI 端点 | 只发送 messages，不运行本地工具 | 否 |
 | 自定义命令 | 任意受信任命令，无内置隔离 | 否 |
@@ -186,6 +188,8 @@ node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
 Gemini 必须支持 `--approval-mode plan`。该模式允许写计划文件，且受本地策略影响，不能视为操作系统级只读沙箱。协议与模式参考 [headless](https://geminicli.com/docs/cli/headless/) 和 [plan mode](https://geminicli.com/docs/cli/plan-mode/)。不支持的 CLI 版本会报错，不回退到权限更大的模式。
 
 所有回答目标收到相同的公共问题与历史；CLI 仍可能加载自己的系统提示、项目文件、工具和设置。运行记录保存 Unify 传入的输入及已声明配置，不能复现外部 CLI 内部的完整模型上下文。因此，这适合多模型协作；单凭结果不能做严格的等算力模型评测。
+
+个人 Google AI Pro 订阅使用 `gemini-pro`。首次在终端运行 `agy`，用订阅对应的 Google 账号登录。打开 Unify 后输入 `/models gemini-pro`，即可在同一对话里连续追问。桌面端可以在模型选择器里选择 Gemini Pro。可用型号用 `agy models` 查看，通过 `models.gemini-pro` 指定。[Google 登录指南](https://antigravity.google/docs/cli/install/)
 
 ## 交互与重试
 

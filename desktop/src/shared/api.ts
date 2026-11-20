@@ -1,6 +1,7 @@
 // The contract between the Electron main process and the renderer. Types only.
 import type { Config, ReasoningEffort } from '../../../src/core/config.js';
 import type { RunRecord } from '../../../src/core/store.js';
+import type { ModelTestState } from '../../../src/core/model-tests.js';
 import type { TargetQuota } from '../../../src/quota/types.js';
 
 export type { Config, ReasoningEffort, RunRecord, TargetQuota };
@@ -18,6 +19,7 @@ export interface TargetInfo {
   reasoningEffort?: ReasoningEffort;
   /** undefined while detection is still running. */
   installed?: boolean;
+  test?: ModelTestState;
   exec: boolean;
   askPolicy: string;
   models: string[];
@@ -113,6 +115,7 @@ export interface UnifyApi {
   exec(turnId: string, from: string | undefined, executor: string): Promise<{ turnId: string; sessionId: string }>;
   quota(force?: boolean): Promise<TargetQuota[]>;
   settings(): Promise<SettingsInfo>;
+  testTarget(id: string): Promise<void>;
   setSetting(key: keyof Config, value: unknown, entry?: string): Promise<WorkspaceInfo>;
   saveApi(id: string, model: string, apiKey?: string): Promise<WorkspaceInfo>;
   memoryUrl(): Promise<string>;

@@ -30,6 +30,13 @@ if (process.argv.includes('--version')) {
     emit({ type: 'error', severity: 'warning', message: 'advisory' });
     emit({ type: 'message', role: 'assistant', content: answer });
     if (scenario !== 'truncate') emit({ type: 'result', status: 'success', stats: { input_tokens: 3, output_tokens: 5 } });
+  } else if (name === 'agy') {
+    const { event, message } = JSON.parse(prompt);
+    if (event !== 'user' || typeof message.content !== 'string') throw new Error('invalid stdin');
+    const text = message.content.includes('CHAT_TWO') && message.content.includes('CHAT_ONE') ? 'remembered' : answer;
+    emit({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: text } });
+    if (scenario === 'signed-out') emit({ event: 'result', result: { status: 'ERROR', error: 'authentication required' } });
+    else if (scenario !== 'truncate') emit({ event: 'result', result: { status: 'SUCCESS', response: text, usage: { input_tokens: 3, output_tokens: 5 } } });
   }
   if (scenario === 'late-failure') process.exitCode = 2;
 }

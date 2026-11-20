@@ -220,20 +220,32 @@ export function SettingsPage({ ws, onChange, notify }: { ws: WorkspaceInfo; onCh
         {info.apis.map((api) => <ApiRow key={api.id} api={api} notify={notify} onSaved={(next) => { onChange(next); void load(); }} />)}
       </Section>
 
-      <Section title="模型与思考强度" note="「默认」让底层服务或 CLI 决定思考强度。">
+      <Section title="模型与思考强度" note="「默认」让底层服务或 CLI 决定思考强度。测试会按已保存的配置发送一次简短提问。">
         {ws.targets.map((t) => (
-          <Row key={t.id} label={<span className="target-label" style={{ '--h': hue(t.id) } as CSSProperties}><i className="dot" />{t.label}<code>{t.id}</code></span>}
-            hint={t.installed === false ? '未检测到' : t.exec ? '可回答 · 可实施' : '只回答'}>
-            <select value={t.modelOverride ?? ''} onChange={(e) => void save('models', e.target.value || undefined, t.id)}>
-              <option value="">继承配置{t.model && !t.modelOverride ? `（${t.model}）` : ''}</option>
-              {t.models.map((m) => <option key={m} value={m}>{m}</option>)}
-            </select>
-            <select value={t.reasoningEffort ?? 'default'} disabled={!t.efforts.length} title={t.efforts.length ? '' : '此模型或接口未提供可配置的思考档位'}
-              onChange={(e) => void save('reasoningEffort', e.target.value, t.id)}>
-              <option value="default">{t.efforts.length ? '默认强度' : '不支持'}</option>
-              {t.efforts.map((x) => <option key={x} value={x}>{x}</option>)}
-            </select>
-          </Row>
+          <div key={t.id} className="model-setting">
+            <Row label={<span className="target-label" style={{ '--h': hue(t.id) } as CSSProperties}><i className="dot" />{t.label}<code>{t.id}</code></span>}
+              hint={t.installed === false ? '未检测到' : t.exec ? '可回答 · 可实施' : '只回答'}>
+              <select value={t.modelOverride ?? ''} onChange={(e) => void save('models', e.target.value || undefined, t.id)}>
+                <option value="">继承配置{t.model && !t.modelOverride ? `（${t.model}）` : ''}</option>
+                {t.models.map((m) => <option key={m} value={m}>{m}</option>)}
+              </select>
+              <select value={t.reasoningEffort ?? 'default'} disabled={!t.efforts.length} title={t.efforts.length ? '' : '此模型或接口未提供可配置的思考档位'}
+                onChange={(e) => void save('reasoningEffort', e.target.value, t.id)}>
+                <option value="default">{t.efforts.length ? '默认强度' : '不支持'}</option>
+                {t.efforts.map((x) => <option key={x} value={x}>{x}</option>)}
+              </select>
+              <button className="btn" disabled={t.test?.status === 'testing' || !!ws.configError}
+                aria-label={`测试 ${t.label}（${t.id}）可用性`}
+                onClick={() => void unify.testTarget(t.id).catch(err => notify(errText(err), 'err'))}>
+                {t.test?.status === 'testing' ? <><Spinner />测试中…</> : '测试可用性'}
+              </button>
+            </Row>
+            {t.test && t.test.status !== 'testing' && (
+              <p role="status" className={t.test.status === 'passed' ? 'ok-text' : 'err-text'}>
+                {t.test.status === 'failed' && '测试失败 · '}{t.test.message}
+              </p>
+            )}
+          </div>
         ))}
       </Section>
 

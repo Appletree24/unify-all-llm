@@ -11,6 +11,8 @@ import { startMemoryServer, type MemoryServer } from '../memory/server.js';
 import { buildRegistry } from '../providers/index.js';
 import { readTargetQuotas } from '../quota/index.js';
 import { defaultTargetIds, detectTargets } from '../core/targets.js';
+import { ModelTests } from '../core/model-tests.js';
+import { displaySynthesisEvents } from '../ui/synthesis.js';
 import { COMMANDS, complete, listFiles, type Completion } from './complete.js';
 import { readApiProfile, saveApiProfile, type ApiProfile, type OfficialApi } from '../providers/official.js';
 import { SettingsView, writeSetting } from './settings.js';
@@ -54,7 +56,6 @@ interface Pane {
   status: 'run' | 'ok' | 'err' | 'cancelled' | 'timed_out';
   error?: string;
   tool?: string;
-  note?: string;
   start: number;
   end?: number;
   scroll: number;
@@ -131,6 +132,7 @@ export class App {
   private mouseOn = true;
   private manualModels = false;
   private sessionSynth?: string;
+  private readonly modelTests: ModelTests;
 
   constructor(
     private io: TuiIO,
@@ -138,7 +140,7 @@ export class App {
     private cfg: Config,
     private all: ModelTarget[],
     private memoryCtx: MemoryContext = defaultContext(cwd),
-  ) {}
+  ) { this.modelTests = new ModelTests(cwd, () => this.requestRender()); }
 
   // ── lifecycle ────────────────────────────────────────────────────────────
   async init(open?: 'memory'): Promise<void> {
@@ -178,7 +180,7 @@ export class App {
     if (this.ticker) clearInterval(this.ticker);
     this.ctl?.abort();
     this.detecting.abort();
-    await this.active?.done.catch(() => undefined);
+    await Promise.all([this.active?.done.catch(() => undefined), this.modelTests.reset()]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 
@@ -265,9 +267,6 @@ export class App {
       const pane = ev.scope === 'answer' ? this.panes.find((p) => p.id === `a:${ev.targetId}`) : ev.scope === 'synthesis' ? this.synth : ev.scope === 'exec' ? this.exec : undefined;
       if (pane) this.apply(pane, ev.event);
     } else if (ev.type === 'notice') this.say(ev.message);
-    else if (ev.type === 'end' && this.synth && this.lastRun?.synthesis) {
-      this.synth.note = Object.entries(this.lastRun.synthesis.labels).map(([label, id]) => `${label}=${this.adapter(id)?.label ?? id}`).join('  ');
-    }
     this.requestRender();
   }
 
@@ -291,7 +290,7 @@ export class App {
         cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
         previous, manualSelection: this.manualModels, signal: this.ctl.signal,
         retry: retryIds && previous ? { record: previous, targetIds: retryIds } : undefined,
-        onEvent: (ev) => this.workflowEvent(ev),
+        onEvent: displaySynthesisEvents((ev) => this.workflowEvent(ev)),
       });
       this.lastRun = this.active.record;
       this.addUsage(await this.active.done);
@@ -425,6 +424,7 @@ export class App {
     const registry = buildRegistry(this.cfg, other => other.id === api.id ? profile : readApiProfile(other));
     const updated = Object.values(registry).filter(t => t.adapter.id === api.id);
     saveApiProfile(api, profile);
+    void this.modelTests.reset();
     this.all = [...this.all.filter(t => t.adapter.id !== api.id), ...updated];
     for (const t of updated) this.installed.set(t.id, true);
     this.selected = [api.id];
@@ -437,6 +437,7 @@ export class App {
 
   private applySetting(field: keyof Config, value: unknown, entry?: string): void {
     const { cfg, targets } = writeSetting(this.cwd, field, value, entry);
+    void this.modelTests.reset();
     if (field === 'synthesizer' || !targets.some(t => t.id === this.sessionSynth)) this.sessionSynth = undefined;
     if (this.sessionSynth) cfg.synthesizer = this.sessionSynth;
     this.cfg = cfg;
@@ -474,7 +475,7 @@ export class App {
       if (arg) return this.say('请单独输入 /settings', YELLOW);
       if (this.busy) return this.say('请等待本轮结束后修改设置', YELLOW);
       this.settings = new SettingsView(
-        this.cwd,
+        this.cwd, this.modelTests,
         () => ({ cfg: this.cfg, targets: this.all, selected: this.selected, showReasoning: this.showReasoning, mouse: this.mouseOn }),
         (field, value, entry) => this.applySetting(field, value, entry),
         () => {
@@ -1141,10 +1142,8 @@ export class App {
     const pos = p.maxScroll ? ` ${Math.min(lines.length, p.scroll + innerH)}/${lines.length} ` : '';
     const footEnd = right - 1 - textWidth(pos);
     const available = Math.max(1, footEnd - x - 4);
-    const quotaWidth = p.note ? Math.max(12, Math.floor(available / 2)) : available;
-    const quota = this.quota?.summary(p.targetId, quotaWidth) ?? '余量查询中…';
-    const end = s.put(x + 2, footY, ` ${quota} `, DIM, footEnd);
-    if (p.note && end + 4 < footEnd) s.put(end, footY, truncate(p.note, footEnd - end - 1) + ' ', DIM, footEnd);
+    const quota = this.quota?.summary(p.targetId, available) ?? '余量查询中…';
+    s.put(x + 2, footY, ` ${quota} `, DIM, footEnd);
     if (pos) s.put(footEnd, footY, pos, DIM, right - 1);
   }
 }

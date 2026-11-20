@@ -16,7 +16,7 @@ function environment(t) {
   const home = join(cwd, 'home');
   mkdirSync(bin);
   mkdirSync(join(home, '.unify'), { recursive: true });
-  for (const name of ['claude', 'codex', 'gemini']) {
+  for (const name of ['claude', 'codex', 'gemini', 'agy']) {
     const path = join(bin, name);
     writeFileSync(path, `#!${process.execPath}\nimport ${JSON.stringify(model)};\n`);
     chmodSync(path, 0o755);
@@ -87,6 +87,30 @@ test('fixture CLI adapters require their terminal and a successful process exit'
       const log = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').map(JSON.parse);
       assert.ok(log.some((l) => l.args.includes('plan')));
     }
+  }
+});
+
+test('Gemini Pro chats through agy and follows up using the selected Unify conversation', { skip: process.platform === 'win32' }, async (t) => {
+  const opts = environment(t);
+  const ask = ['ask', '--models', 'gemini-pro', '--json'];
+  const first = await invoke([...ask, 'CHAT_ONE'], opts);
+  assert.equal(first.code, 0, first.stderr);
+  const second = await invoke([...ask, '-c', 'CHAT_TWO'], opts);
+  assert.equal(second.code, 0, second.stderr);
+  const [result] = loadRun(opts.cwd).results;
+  assert.equal(result.text, 'remembered');
+  assert.deepEqual(result.usage, { inputTokens: 3, outputTokens: 5 });
+  const calls = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').map(JSON.parse)
+    .filter((c) => c.name === 'agy' && !c.args.includes('--version'));
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.deepEqual(call.args, ['--mode', 'plan', '--disable-slash-commands', '--input-format', 'stream-json',
+      '--output-format', 'stream-json', '--model', result.model]);
+  }
+  for (const [scenario, message] of [['signed-out', 'authentication required'], ['truncate', '缺少协议终态']]) {
+    opts.env.UNIFY_TEST_SCENARIO = scenario;
+    assert.equal((await invoke([...ask, 'Q'], opts)).code, 1);
+    assert.ok(loadRun(opts.cwd).results[0].error.includes(message));
   }
 });
 

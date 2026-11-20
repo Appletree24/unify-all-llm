@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { synthesisFormatter } from '../../../src/core/synth.js';
 import type { ExecPreview, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { Icon, Markdown, Spinner, hue, isActive, kilo, quotaSummary, seconds, statusText, useTicker } from './ui.js';
@@ -41,9 +42,9 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
 
   const [thinkOpen, setThinkOpen] = useState(showReasoning);
   const waiting = running && !result.text && !result.reasoning;
-  const labels = kind === 'synthesis' && record.synthesis
-    ? Object.entries(record.synthesis.labels).map(([l, id]) => `${l} = ${record.targets.find((t) => t.id === id)?.label ?? id}`).join(' · ')
-    : '';
+  const format = kind === 'synthesis' ? synthesisFormatter(record) : undefined;
+  const text = format?.(result.text) ?? result.text;
+  const reasoning = format?.(result.reasoning) ?? result.reasoning;
 
   return (
     <article className={`card ${kind} ${result.status}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
@@ -58,15 +59,14 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
           {running ? seconds(elapsed) : `${statusText[result.status]}${result.durationMs ? ` · ${seconds(result.durationMs)}` : ''}`}
         </span>
       </header>
-      {labels && <div className="labels">{labels}</div>}
       <div
         className="body" ref={body}
         onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; }}
       >
         {result.reasoning && (
           <details className="think" open={thinkOpen || (running && !result.text && showReasoning)} onToggle={(e) => setThinkOpen((e.target as HTMLDetailsElement).open)}>
-            <summary>思考过程<span>{kilo(result.reasoning.length)} 字</span></summary>
-            <div className="think-text">{result.reasoning}</div>
+            <summary>思考过程<span>{kilo(reasoning.length)} 字</span></summary>
+            <div className="think-text">{reasoning}</div>
           </details>
         )}
         {activity && activity.length > 0 && (
@@ -79,7 +79,7 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
         {waiting ? (
           <div className="skeleton"><i /><i /><i /></div>
         ) : result.text ? (
-          <Markdown text={result.text} />
+          <Markdown text={text} />
         ) : !running && !result.error ? <p className="empty">没有输出</p> : null}
         {result.error && <div className="error"><Icon name="alert" size={14} /><span>{result.error}</span></div>}
       </div>
@@ -91,7 +91,7 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
           {running && kind === 'answer' && record.status === 'answering' && (
             <button title="取消这个模型，其余继续" onClick={() => actions.cancelTarget(record.id, result.targetId)}><Icon name="x" /></button>
           )}
-          {result.text && <button title="复制" onClick={() => void unify.copy(result.text)}><Icon name="copy" /></button>}
+          {text && <button title="复制" onClick={() => void unify.copy(text)}><Icon name="copy" /></button>}
           {kind === 'answer' && !running && !turnRunning && (
             <button title="只重新调用这个模型" onClick={() => actions.retry(record.id, [result.targetId])}><Icon name="retry" /></button>
           )}

@@ -81,6 +81,7 @@ const api: UnifyApi = {
   async exec(turnId, from, executor) { return need().exec(turnId, from, executor); },
   async quota(force) { return need().quota(force); },
   async settings() { return need().settings(); },
+  async testTarget(id) { return need().testTarget(id); },
   async setSetting(key, value, entry) { return need().setSetting(key, value, entry); },
   async saveApi(id, model, apiKey) { return need().saveApi(id, model, apiKey); },
   async memoryUrl() { return need().memoryUrl(); },

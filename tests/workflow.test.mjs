@@ -6,6 +6,8 @@ import { startComparison, startExecution, selectPlan, chooseExecutor } from '../
 import { listRunIds, loadRun, newRunId } from '../dist/core/store.js';
 import { parseConfig } from '../dist/core/config.js';
 import { buildRegistry } from '../dist/providers/index.js';
+import { synthesisFormatter } from '../dist/core/synth.js';
+import { displaySynthesisEvents } from '../dist/ui/synthesis.js';
 import { aborted, deferred, target, workspace } from './helpers.mjs';
 
 test('unique records, full public history, decision and synthesis input snapshots', async (t) => {
@@ -32,6 +34,45 @@ test('unique records, full public history, decision and synthesis input snapshot
   }
   assert.deepEqual(previous.results.map((r) => r.text), ['a-answer', 'b-answer']);
   assert.equal(new Set(Array.from({ length: 1000 }, newRunId)).size, 1000);
+});
+
+test('blind synthesis resolves shuffled references only for readers, including split streaming references', async (t) => {
+  const cwd = workspace(t);
+  const answer = (text) => async function* () { yield { type: 'done', text }; };
+  const first = { ...target('fast', answer('选红色')), model: 'model-one' };
+  const second = target('deep', answer('选蓝色'));
+  second.adapter.configuration = { type: 'openai', model: 'model-two', baseUrl: 'https://example.test' };
+  let raw;
+  const judge = target('judge', async function* ({ prompt }) {
+    assert.doesNotMatch(prompt, /fast|deep|model-one|model-two/);
+    const red = /<answer id="([^"]+)">\n选红色/.exec(prompt)[1];
+    const blue = /<answer id="([^"]+)">\n选蓝色/.exec(prompt)[1];
+    raw = `单元格 A1。**${red}** 与${blue}不同。首选${red}`;
+    for (const type of ['reasoning', 'delta']) for (const text of raw) yield { type, text };
+    yield { type: 'done', text: raw };
+  });
+  const events = [];
+  const run = await startComparison({
+    cwd, question: '颜色？', targets: [first, second, judge], selected: ['fast', 'deep'], config: { synthesizer: 'judge' },
+    onEvent: displaySynthesisEvents((ev) => { if (ev.type === 'provider' && ev.scope === 'synthesis') events.push(ev.event); }),
+  }).done;
+  assert.equal(run.status, 'completed');
+  const expected = '单元格 A1。**model-one** 与model-two不同。首选model-one';
+  for (const type of ['reasoning', 'delta', 'done']) {
+    assert.equal(events.filter((ev) => ev.type === type).map((ev) => ev.text).join(''), expected);
+  }
+  assert.equal(events.map((ev) => ev.text).join(''), expected.repeat(3));
+  assert.equal(readFileSync(join(cwd, '.unify', 'runs', run.id, 'synthesis.md'), 'utf8'), expected + '\n');
+  assert.equal(loadRun(cwd, run.id).synthesis.result.text, raw);
+  assert.equal(selectPlan(run).text, raw);
+});
+
+test('historical synthesis resolves only whole labels and distinguishes targets sharing a model', () => {
+  const format = synthesisFormatter({
+    targets: [{ id: 'fast', model: 'shared' }, { id: 'deep', model: 'shared' }, { id: 'cli', label: 'Codex' }],
+    synthesis: { labels: { A1: 'fast', A2: 'deep', A10: 'cli', B: 'legacy' } },
+  });
+  assert.equal(format('A1和A2 / A10、B；A11 XA1 A1_x'), 'shared（fast）和shared（deep） / Codex、legacy；A11 XA1 A1_x');
 });
 
 test('cancelled comparisons persist successful and partial answers and bind execution to that turn', async (t) => {

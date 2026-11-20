@@ -128,7 +128,6 @@ kbd { font: 11px var(--sans); color: var(--faint); margin-left: auto; }
 .status.running { color: hsl(var(--h) var(--dot-s) var(--dot-l)); }
 .status.failed, .status.timed_out { color: var(--err); }
 .status.cancelled, .status.interrupted { color: var(--warn); }
-.labels { font-size: 12px; color: var(--faint); padding: 0 14px 6px 46px; }
 .card .body { padding: 2px 16px 14px; max-height: 560px; overflow-y: auto; user-select: text; flex: 1; }
 .card.synthesis .body { max-height: none; }
 .card.exec .body { max-height: 680px; }
@@ -303,6 +302,9 @@ button.link:hover { text-decoration: underline; text-underline-offset: 3px; }
 .page select:focus, .page input:focus, .json-field textarea:focus, .modal select:focus { border-color: var(--accent); }
 .page select:disabled { opacity: .5; }
 .set-control select { max-width: 230px; }
+.model-setting .set-row, .model-setting .set-control { flex-wrap: wrap; }
+.model-setting .set-control { max-width: 100%; }
+.model-setting p { margin: 0; padding: 0 16px 10px; font-size: 12.5px; overflow-wrap: anywhere; user-select: text; }
 input.num { width: 110px; text-align: right; font-variant-numeric: tabular-nums; }
 .checks { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 10px 16px 12px; }
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }

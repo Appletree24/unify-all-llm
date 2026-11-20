@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { loadConfig, parseConfig, timeoutMillis } from './core/config.js';
 import { latestComparison, listRunIds, loadRun, type RunRecord } from './core/store.js';
+import { synthesisFormatter } from './core/synth.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent } from './core/workflow.js';
 import { buildRegistry } from './providers/index.js';
 import { detectTargets } from './core/targets.js';
@@ -12,6 +13,7 @@ import { startMemoryServer } from './memory/server.js';
 import { runTui } from './tui/app.js';
 import { formatQuota, QUOTA_REFRESH_MS, readTargetQuotas } from './quota/index.js';
 import { FanOutView, bold, dim, header, red, secs, streamEvent } from './ui/term.js';
+import { displaySynthesisEvents } from './ui/synthesis.js';
 
 const HELP = `unify — 同时提问多个模型，再汇总与实施
 
@@ -130,7 +132,7 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
       manualSelection: !!values.models, synthesize: !values['no-synth'],
       previous: values.continue ? latestComparison(cwd) : undefined,
       retry: original ? { record: original, targetIds: values.target?.split(',').map((s) => s.trim()) ?? original.targets.filter((t) => !original.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id) } : undefined,
-      signal: abort.signal, onEvent: (event) => view.event(event),
+      signal: abort.signal, onEvent: values.json ? view.event : displaySynthesisEvents(view.event),
     });
     const run = await handle.done;
     return run.results.some((r) => r.ok) ? 0 : 1;
@@ -226,7 +228,8 @@ function show(run: RunRecord): void {
   process.stdout.write(`${bold(run.id)} · ${run.status}\n\n${run.question}\n`);
   for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : [])]) {
     header(`${r.targetId} (${r.provider}${r.model ? ` / ${r.model}` : ''})`, `${r.status} · ${secs(r.durationMs)}`);
-    process.stdout.write(r.text + '\n');
+    const text = r === run.synthesis?.result ? synthesisFormatter(run)(r.text) : r.text;
+    process.stdout.write(text + '\n');
     if (r.error) process.stdout.write(red(r.error) + '\n');
   }
   if (run.error) process.stdout.write(red(run.error) + '\n');
