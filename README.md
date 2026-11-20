@@ -23,6 +23,27 @@ node dist/cli.js exec --with codex
 
 `exec` 会显示来源记录、方案目标、执行模型和目录，确认后才开始实施。非交互环境需要 `--yes`。单模型回答可以直接实施；多个回答没有成功汇总时，用 `--from <目标id>` 指定方案。实施不会由 Unify 自动提交或推送。
 
+## 桌面端
+
+`desktop/` 是基于 Electron 的桌面应用，与 CLI、TUI 共用 `src/core` 的同一套流程：决策、并排回答、匿名汇总、实施、记录和配置都由同样的代码处理，记录也写进同一个 `.unify/runs/`，三种界面可以互相查看。
+
+- **对话**：问题同时发给所选模型，每个模型一列实时流式输出，可展开思考过程、放大阅读、复制、单独取消或重试某个模型。多个回答成功后在下方显示汇总。同一对话里继续提问会带上之前的上下文。
+- **实施**：在一轮结束后选择「实施方案…」或某个回答上的实施按钮，确认来源与执行模型后才开始，执行过程中的工具调用逐条显示。
+- **侧栏**：按时间分组的对话记录、套餐额度、记忆管理（内嵌 `unify memory` 网页界面）和设置（官方 API 接入、模型与思考强度、汇总/执行/决策模型、并发与超时、高级 JSON 配置）。
+- **项目**：标题栏切换项目文件夹，配置按项目读取。快捷键 `Ctrl/⌘+N` 新对话，`Ctrl/⌘+,` 设置，`Ctrl/⌘+B` 侧栏，`Esc` 停止当前轮。
+
+桌面端需要 Node.js 22.12+（Electron 安装脚本的要求），并且先在仓库根目录安装依赖：
+
+```sh
+npm ci                 # 仓库根目录
+cd desktop
+npm install
+npm start              # 构建并打开窗口
+npm run dist           # 打包安装程序到 desktop/release/
+```
+
+主进程由 esbuild 直接打包 `../src` 的 TypeScript 源码，不依赖根目录的 `dist/`。窗口在沙箱中运行，渲染进程只能通过预加载脚本调用主进程中列出的方法；模型输出的 Markdown 在渲染前经过清理，链接一律在系统浏览器中打开。退出时会取消所有进行中的调用并等待记录保存。从 macOS Dock 或 Linux 启动器打开时，会读取登录 shell 的 `PATH`，以便找到 npm、Homebrew 安装的模型 CLI。
+
 ## 模型配置
 
 用户配置放在 `~/.unify/config.json`，项目配置放在 `./unify.config.json`。项目覆盖用户配置，`models`、`targets` 和 `reasoningEffort` 按键合并。以下两个例外固定生效：
@@ -333,7 +354,7 @@ node dist/cli.js ask "问题" --models fast,deep --json
 ## 代码结构与扩展
 
 ```text
-CLI / TUI
+CLI / TUI / desktop（Electron 主进程）
     └── core/workflow       决策、问答、汇总、实施、上下文与来源
           ├── core/store    记录校验、原子保存、旧格式读取
           ├── core/synth    纯提示构造与匿名化

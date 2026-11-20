@@ -1,0 +1,43 @@
+{
+  "name": "unify-desktop",
+  "productName": "Unify",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Unify 桌面端：并排比较多个模型的回答，汇总后实施。",
+  "author": "Unify",
+  "main": "dist/main.mjs",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "node ../node_modules/typescript/bin/tsc -p .",
+    "start": "node build.mjs && electron .",
+    "dev": "node build.mjs --watch",
+    "dist": "node build.mjs --production && electron-builder"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "dompurify": "3.4.17",
+    "electron": "45.2.3",
+    "electron-builder": "26.18.1",
+    "esbuild": "0.28.2",
+    "highlight.js": "11.12.0",
+    "marked": "18.1.3",
+    "react": "19.2.9",
+    "react-dom": "19.2.9"
+  },
+  "build": {
+    "appId": "dev.unify.desktop",
+    "productName": "Unify",
+    "directories": { "output": "release" },
+    "files": ["dist/**/*", "package.json"],
+    "extraResources": [{ "from": "../assets/memory.html", "to": "assets/memory.html" }],
+    "asar": true,
+    "win": { "target": ["nsis"] },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true },
+    "mac": { "target": ["dmg"], "category": "public.app-category.developer-tools" },
+    "linux": { "target": ["AppImage"], "category": "Development" }
+  }
+}

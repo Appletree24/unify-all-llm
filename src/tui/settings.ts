@@ -1,43 +1,19 @@
-import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { atomicWrite } from '../core/atomic-write.js';
-import { mergeConfig, parseConfig, readJson, type Config } from '../core/config.js';
+import { join } from 'node:path';
+import { parseConfig, readJson, type Config } from '../core/config.js';
+import { userField, writeSetting, type SettingField } from '../core/settings.js';
 import type { ModelTarget } from '../core/types.js';
-import { buildRegistry } from '../providers/index.js';
 import { targetModelIds } from '../providers/models.js';
 import { effortChoices } from '../providers/effort.js';
 import { Editor } from './editor.js';
 import type { Key } from './keys.js';
 import { Screen, rgb, truncate, textWidth } from './screen.js';
 
-type Field = keyof Config;
-const userField = (field: Field) => field === 'custom' || field === 'quotaCommands';
+type Field = SettingField;
 const gold = rgb(232, 196, 104);
 const dim = rgb(120, 125, 135);
 
-/** Read the current layers before each edit; validate the merged registry before replacing the file. */
-export function writeSetting(cwd: string, key: Field, value: unknown, entry?: string) {
-  const userPath = join(homedir(), '.unify', 'config.json');
-  const projectPath = join(cwd, 'unify.config.json');
-  const user = parseConfig(readJson(userPath) ?? {}, userPath);
-  const project = parseConfig(readJson(projectPath) ?? {}, projectPath);
-  const global = userField(key);
-  const original = global ? user : project;
-  if (entry !== undefined) {
-    const map = { ...(original[key] as Record<string, unknown>), [entry]: value };
-    if (value === undefined) delete map[entry];
-    value = Object.keys(map).length ? map : undefined;
-  }
-  if (key === 'disableClaude' && user.disableClaude && value === false) throw new Error('Claude Code 已在 ~/.unify/config.json 中禁用');
-  const next = parseConfig({ ...original, [key]: value });
-  const cfg = global ? mergeConfig(next, project) : mergeConfig(user, next);
-  const targets = Object.values(buildRegistry(cfg));
-  const path = global ? userPath : projectPath;
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  atomicWrite(path, JSON.stringify(next, null, 2) + '\n');
-  return { cfg, targets };
-}
+export { writeSetting };
 
 interface SettingsState {
   cfg: Config;
