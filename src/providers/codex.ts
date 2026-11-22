@@ -40,7 +40,8 @@ export const codex: ProviderAdapter = {
     const args = ['exec', '--json', '--skip-git-repo-check'];
     if (req.mode === 'ask') args.push('--sandbox', 'read-only', '--ephemeral');
     else args.push('--sandbox', 'workspace-write');
-    if (req.reasoningEffort) args.push('-c', `model_reasoning_effort="${req.reasoningEffort}"`);
+    // Codex treats bare effort names as strings; they can pass through Windows cmd shims unchanged.
+    if (req.reasoningEffort) args.push('-c', `model_reasoning_effort=${req.reasoningEffort}`);
     if (req.model) args.push('-m', req.model);
     args.push('-'); // prompt from stdin
 

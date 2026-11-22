@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { loadRun, listRunIds } from '../dist/core/store.js';
@@ -17,16 +17,24 @@ function environment(t) {
   mkdirSync(bin);
   mkdirSync(join(home, '.unify'), { recursive: true });
   for (const name of ['claude', 'codex', 'gemini', 'agy']) {
-    const path = join(bin, name);
-    writeFileSync(path, `#!${process.execPath}\nimport ${JSON.stringify(model)};\n`);
-    chmodSync(path, 0o755);
+    if (process.platform === 'win32') {
+      writeFileSync(join(bin, `${name}.mjs`), `import ${JSON.stringify(model)};\n`);
+      writeFileSync(join(bin, `${name}.cmd`), `@echo off\r\n"${process.execPath}" "%~dp0${name}.mjs" %*\r\n`);
+    } else {
+      const path = join(bin, name);
+      writeFileSync(path, `#!${process.execPath}\nimport ${JSON.stringify(model)};\n`);
+      chmodSync(path, 0o755);
+    }
   }
   writeFileSync(join(home, '.unify', 'config.json'), '{"disableClaude":true}');
   writeFileSync(join(cwd, 'unify.config.json'), JSON.stringify({
     providers: ['fast', 'deep'], synthesizer: 'fast',
     targets: { fast: { provider: 'codex', model: 'fast' }, deep: { provider: 'codex', model: 'deep' } },
   }));
-  return { cwd, env: { ...process.env, HOME: home, PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, UNIFY_TEST_LOG: join(cwd, 'calls.jsonl') } };
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.toLowerCase() === 'path') delete env[key];
+  const searchPath = process.platform === 'win32' ? [bin, dirname(process.execPath)] : [bin, dirname(process.execPath), '/usr/bin', '/bin'];
+  return { cwd, env: { ...env, HOME: home, USERPROFILE: home, PATH: searchPath.join(delimiter), UNIFY_TEST_LOG: join(cwd, 'calls.jsonl') } };
 }
 
 async function invoke(args, opts, onOutput) {
@@ -38,7 +46,7 @@ async function invoke(args, opts, onOutput) {
   return { code, stdout, stderr };
 }
 
-test('CLI JSONL separates target, provider and call identities; continue and retry read records', { skip: process.platform === 'win32' }, async (t) => {
+test('CLI JSONL separates target, provider and call identities; continue and retry read records', async (t) => {
   const opts = environment(t);
   const path = join(opts.cwd, 'unify.config.json');
   const config = JSON.parse(readFileSync(path));
@@ -66,8 +74,8 @@ test('CLI JSONL separates target, provider and call identities; continue and ret
   assert.equal(loadRun(opts.cwd).retryOf, current.id);
   const log = readFileSync(opts.env.UNIFY_TEST_LOG, 'utf8').trim().split('\n').map(JSON.parse);
   const invocations = log.filter(l => l.args.includes('exec'));
-  assert.ok(invocations.filter(l => l.args.includes('fast')).every(l => l.args.includes('model_reasoning_effort="low"')));
-  assert.ok(invocations.at(-1).args.includes('model_reasoning_effort="high"'));
+  assert.ok(invocations.filter(l => l.args.includes('fast')).every(l => l.args.includes('model_reasoning_effort=low')));
+  assert.ok(invocations.at(-1).args.includes('model_reasoning_effort=high'));
   assert.equal(loadRun(opts.cwd).results[0].reasoningEffort, 'high');
   assert.ok(log.every((l) => l.name !== 'claude'), 'disabled Claude must never execute, including --version');
 });

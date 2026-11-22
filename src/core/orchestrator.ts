@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { collectMemoryReport } from '../memory/report.js';
 import { appendToolUse, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
 
 export interface RunOptions {
@@ -46,9 +47,10 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
     try {
       if (ctl.signal.aborted) return;
       if (opts.mode === 'exec' && !target.adapter.capabilities.exec) throw new Error(`${target.label} 不支持实施`);
-      for await (const ev of target.adapter.run({
+      const events = target.adapter.run({
         prompt: opts.prompt, cwd: opts.cwd, mode: opts.mode, model: target.model, reasoningEffort: target.reasoningEffort, signal: ctl.signal,
-      })) {
+      });
+      for await (const ev of collectMemoryReport(events, res.runId, opts.prompt)) {
         if (stopped || ctl.signal.aborted) break;
         if (terminal) throw new Error('模型在终态后继续发送事件');
         if (ev.type === 'done' || ev.type === 'error') {
@@ -56,6 +58,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
           if (ev.type === 'done') {
             res.text = ev.text || res.text;
             res.usage = ev.usage;
+            if (ev.memoryReferences?.length) res.memoryReferences = ev.memoryReferences;
           }
         } else {
           if (ev.type === 'delta') res.text += ev.text;
@@ -88,7 +91,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
     opts.signal?.removeEventListener('abort', onAbort);
   }
   res.durationMs = Date.now() - started;
-  emit(res.ok ? { type: 'done', text: res.text, usage: res.usage } : {
+  emit(res.ok ? { type: 'done', text: res.text, usage: res.usage, ...(res.memoryReferences && { memoryReferences: res.memoryReferences }) } : {
     type: 'error', message: res.error ?? '模型执行失败',
     status: res.status === 'cancelled' || res.status === 'timed_out' ? res.status : 'failed',
   });

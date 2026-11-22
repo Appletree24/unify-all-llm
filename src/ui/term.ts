@@ -1,4 +1,5 @@
 import type { ProviderEvent } from '../core/types.js';
+import { formatMemoryReferences } from '../memory/report.js';
 
 const tty = process.stdout.isTTY === true;
 const paint = (code: string) => (s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -69,7 +70,7 @@ export class FanOutView {
       s.status = 'ok';
       this.clear();
       header(this.labels[id], secs(Date.now() - s.start));
-      process.stdout.write(ev.text.trim() + '\n');
+      process.stdout.write(ev.text.trim() + formatMemoryReferences(ev.memoryReferences) + '\n');
     } else if (ev.type === 'error') {
       s.status = 'err';
       this.clear();
@@ -85,5 +86,5 @@ export function streamEvent(ev: ProviderEvent, showReasoning: boolean): void {
   else if (ev.type === 'reasoning' && showReasoning) process.stdout.write(dim(ev.text));
   else if (ev.type === 'tool') process.stdout.write(dim(`\n  ⚙ ${ev.name}${ev.detail ? ` ${ev.detail}` : ''}\n`));
   else if (ev.type === 'error') process.stdout.write(red(`\n失败: ${ev.message}\n`));
-  else if (ev.type === 'done') process.stdout.write('\n');
+  else if (ev.type === 'done') process.stdout.write(formatMemoryReferences(ev.memoryReferences) + '\n');
 }

@@ -10,6 +10,40 @@ import { extractFinalPlan, synthesisFormatter } from '../dist/core/synth.js';
 import { displaySynthesisEvents } from '../dist/ui/synthesis.js';
 import { aborted, deferred, target, workspace } from './helpers.mjs';
 
+test('memory references stay with the reporting call, survive reload and are excluded from later prompts', async (t) => {
+  const cwd = workspace(t);
+  const ref = { source: 'AGENTS.md:8', content: 'TEST_PREFERENCE', effect: '选择了离线方案' };
+  const reports = target('reports', async function* ({ prompt }) {
+    const tag = prompt.match(/<unify-memory-[\w-]+>$/)[0];
+    const text = '使用离线方案。\n' + tag + '\n' + JSON.stringify([ref]);
+    for (const ch of text) yield { type: 'delta', text: ch };
+    yield { type: 'done', text };
+  }, { askPolicy: 'read-tools', exec: true });
+  const plain = target('plain', async function* ({ prompt }) {
+    assert.doesNotMatch(prompt, /TEST_PREFERENCE/);
+    yield { type: 'done', text: '普通回答' };
+  });
+  let streamed = '';
+  const run = await startComparison({
+    cwd, question: '选择方案', targets: [reports, plain], selected: ['reports', 'plain'],
+    config: { synthesizer: 'plain' },
+    onEvent(ev) {
+      if (ev.type === 'provider' && ev.targetId === 'reports' && ev.event.type === 'delta') streamed += ev.event.text;
+    },
+  }).done;
+  assert.equal(run.status, 'completed');
+  assert.equal(streamed, '使用离线方案。');
+  const saved = loadRun(cwd, run.id);
+  assert.equal(saved.results[0].text, streamed);
+  assert.deepEqual(saved.calls[0].result.memoryReferences, [ref]);
+  assert.deepEqual(saved.results[0].memoryReferences, [ref]);
+  assert.equal(saved.results[1].memoryReferences, undefined);
+  assert.equal(saved.synthesis.result.memoryReferences, undefined);
+  assert.doesNotMatch(historyAfter(saved, undefined, 'reports').at(-1).answer, /TEST_PREFERENCE/);
+  const md = readFileSync(join(cwd, '.unify', 'runs', saved.id, 'answer-reports.md'), 'utf8');
+  assert.match(md, /记忆依据（模型自报）[\s\S]*AGENTS\.md:8[\s\S]*TEST_PREFERENCE[\s\S]*选择了离线方案/);
+});
+
 test('unique records, full public history, decision and synthesis input snapshots', async (t) => {
   const cwd = workspace(t);
   const requests = [];

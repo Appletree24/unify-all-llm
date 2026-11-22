@@ -71,6 +71,16 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
         className="body" ref={body}
         onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; }}
       >
+        {!!result.memoryReferences?.length && (
+          <details className="think">
+            <summary>记忆依据<span>{result.memoryReferences.length} 条 · 模型自报</span></summary>
+            <dl className="memory-references">
+              {result.memoryReferences.map((ref, i) => (
+                <div key={i}><dt>{ref.source}</dt><dd>{ref.content}</dd><dd>影响：{ref.effect}</dd></div>
+              ))}
+            </dl>
+          </details>
+        )}
         {result.reasoning && (
           <details className="think" open={thinkOpen || (running && !result.text && showReasoning)} onToggle={(e) => setThinkOpen((e.target as HTMLDetailsElement).open)}>
             <summary>思考过程<span>{kilo(reasoning.length)} 字</span></summary>

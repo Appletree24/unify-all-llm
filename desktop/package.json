@@ -17,11 +17,12 @@
     "dist": "node build.mjs --production && electron-builder"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.7",
     "dompurify": "3.4.17",
     "electron": "45.2.3",
-    "electron-builder": "26.18.1",
+    "electron-builder": "^25.1.0",
     "esbuild": "0.28.2",
     "highlight.js": "11.12.0",
     "marked": "18.1.3",
@@ -31,13 +32,40 @@
   "build": {
     "appId": "dev.unify.desktop",
     "productName": "Unify",
-    "directories": { "output": "release" },
-    "files": ["dist/**/*", "package.json"],
-    "extraResources": [{ "from": "../assets/memory.html", "to": "assets/memory.html" }],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../assets/memory.html",
+        "to": "assets/memory.html"
+      }
+    ],
     "asar": true,
-    "win": { "target": ["nsis"] },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true },
-    "mac": { "target": ["dmg"], "category": "public.app-category.developer-tools" },
-    "linux": { "target": ["AppImage"], "category": "Development" }
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development"
+    }
   }
 }

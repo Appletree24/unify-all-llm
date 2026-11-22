@@ -1,7 +1,7 @@
 import { appendFileSync } from 'node:fs';
 import { basename } from 'node:path';
 
-const name = basename(process.argv[1]).replace(/\.cmd$/, '');
+const name = basename(process.argv[1]).replace(/\.(?:cmd|mjs)$/, '');
 if (process.env.UNIFY_TEST_LOG) appendFileSync(process.env.UNIFY_TEST_LOG, JSON.stringify({ name, args: process.argv.slice(2) }) + '\n');
 if (process.argv.includes('--version')) {
   process.stdout.write('fixture-1.0\n');

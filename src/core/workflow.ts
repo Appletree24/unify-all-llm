@@ -10,6 +10,7 @@ import { createRun, exportRun, historyAfter, latestExecutionFor, newRunId, saveR
 import { anonymize, buildConversationPrompt, buildExecPrompt, buildSynthesisPrompt, extractFinalPlan, synthesisFormatter } from './synth.js';
 import { appendToolUse, snapshotTarget, type ModelTarget, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
 import { defaultTargetIds, detectTargets } from './targets.js';
+import { requestMemoryReport } from '../memory/report.js';
 
 type Scope = CallRecord['scope'];
 export type WorkflowEvent =
@@ -73,6 +74,9 @@ class Journal {
   }
   prepare(target: ModelTarget, scope: Scope, prompt: string, timeoutMs: number): CallRecord {
     const id = randomUUID();
+    if (scope !== 'decision' && target.adapter.capabilities.askPolicy !== 'text-only') {
+      prompt = requestMemoryReport(prompt, id);
+    }
     const call: CallRecord = {
       id, scope, target: snapshotTarget(target),
       input: { prompt, cwd: this.opts.cwd, mode: scope === 'exec' ? 'exec' : 'ask', timeoutMs },
@@ -88,7 +92,7 @@ class Journal {
     if (event.type === 'delta') call.result.text += event.text;
     else if (event.type === 'reasoning') call.result.reasoning += event.text;
     else if (event.type === 'tool') appendToolUse(call.result, event);
-    else if (event.type === 'done') Object.assign(call.result, { text: event.text, status: 'succeeded', ok: true, usage: event.usage });
+    else if (event.type === 'done') Object.assign(call.result, { text: event.text, status: 'succeeded', ok: true, usage: event.usage, memoryReferences: event.memoryReferences });
     else if (event.type === 'error') Object.assign(call.result, { error: event.message, status: event.status ?? 'failed', ok: false });
     this.checkpoint(event.type === 'done' || event.type === 'error');
     this.emit({ type: 'provider', turnId: this.record.id, callId: call.id, targetId: call.target.id, scope: call.scope, event });
@@ -228,13 +232,13 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     }
     journal.stage('answering', targets);
     const timeoutMs = timeoutMillis(opts.config.timeoutSec ?? 600);
-    const prompts = new Map(targets.map((t) => [
-      t.id,
-      shared.text && t.adapter.capabilities.askPolicy === 'text-only'
+    const calls = new Map(targets.map((t) => {
+      const prompt = shared.text && t.adapter.capabilities.askPolicy === 'text-only'
         ? attachContextToPrompt(record.input.prompt, shared.text)
-        : record.input.prompt,
-    ]));
-    const calls = new Map(targets.map((t) => [t.id, journal.prepare(t, 'answer', prompts.get(t.id)!, timeoutMs)]));
+        : record.input.prompt;
+      return [t.id, journal.prepare(t, 'answer', prompt, timeoutMs)];
+    }));
+    const prompts = new Map([...calls].map(([id, call]) => [id, call.input.prompt]));
     record.results = targets.map((t) => calls.get(t.id)!.result);
     journal.checkpoint();
     journal.assertWritable();

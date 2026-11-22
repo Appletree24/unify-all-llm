@@ -384,3 +384,7 @@ input.num { width: 110px; text-align: right; font-variant-numeric: tabular-nums;
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
 @keyframes toast { from { opacity: 0; transform: translate(-50%, 6px); } }
 @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
+.memory-references { margin: .5em 0; overflow-wrap: anywhere; }
+.memory-references dt { font-weight: 600; }
+.memory-references dd { margin: .2em 0; }
+.memory-references > div + div { margin-top: .7em; }

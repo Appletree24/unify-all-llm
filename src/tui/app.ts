@@ -6,6 +6,7 @@ import { loadConfig, type Config, type RunRecord } from '../core/store.js';
 import type { ModelTarget, ProviderEvent } from '../core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
 import { defaultContext } from '../memory/scan.js';
+import { formatMemoryReferences } from '../memory/report.js';
 import type { MemoryContext } from '../memory/types.js';
 import { startMemoryServer, type MemoryServer } from '../memory/server.js';
 import { buildRegistry } from '../providers/index.js';
@@ -245,6 +246,7 @@ export class App {
       p.end = Date.now();
       p.tool = undefined;
       if (p.kind !== 'exec' && ev.text) p.text = ev.text; // the final answer, without tool-use chatter
+      p.text += formatMemoryReferences(ev.memoryReferences);
       if (p.kind === 'answer' && p.follow) {
         // A finished answer is read from its beginning, not its tail.
         p.follow = false;

@@ -1,4 +1,5 @@
 import { atomicWrite } from './atomic-write.js';
+import { formatMemoryReferences } from '../memory/report.js';
 import { extractFinalPlan, synthesisFormatter } from './synth.js';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync } from 'node:fs';
@@ -21,6 +22,7 @@ const resultSchema = z.object({
   ok: z.boolean(), text: z.string(), reasoning: z.string(), error: z.string().optional(), durationMs: z.number().nonnegative(),
   usage: z.object({ inputTokens: z.number().optional(), outputTokens: z.number().optional() }).optional(),
   tools: z.array(toolUseSchema).optional(),
+  memoryReferences: z.array(z.object({ source: z.string(), content: z.string(), effect: z.string() })).optional(),
   observerErrors: z.array(z.string()).optional(),
 }).refine((r) => r.ok === (r.status === 'succeeded'), 'ok 与 status 不一致');
 const historySchema = z.array(z.object({ turnId: safeId, question: z.string(), answer: z.string() }));
@@ -91,8 +93,8 @@ export function saveRun(cwd: string, run: RunRecord): string {
 export function exportRun(cwd: string, run: RunRecord): void {
   const dir = runDir(cwd, run.id);
   atomicWrite(join(dir, 'question.md'), run.question + '\n');
-  for (const r of run.results) atomicWrite(join(dir, `answer-${safeId.parse(r.targetId)}.md`), `${r.ok ? '' : `**${r.status}**: ${r.error ?? ''}\n\n`}${r.text}\n`);
-  if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), synthesisFormatter(run)(run.synthesis.result.text) + '\n');
+  for (const r of run.results) atomicWrite(join(dir, `answer-${safeId.parse(r.targetId)}.md`), `${r.ok ? '' : `**${r.status}**: ${r.error ?? ''}\n\n`}${r.text}${formatMemoryReferences(r.memoryReferences)}\n`);
+  if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), synthesisFormatter(run)(run.synthesis.result.text) + formatMemoryReferences(run.synthesis.result.memoryReferences) + '\n');
 }
 
 export function listRunIds(cwd: string): string[] {

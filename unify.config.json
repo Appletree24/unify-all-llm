@@ -2,8 +2,12 @@
   "showReasoning": true,
   "disableClaude": true,
   "synthesizer": "deepseek",
+  "reasoningEffort": {
+    "codex": "high"
+  },
   "models": {
     "gemini-pro": "gemini-4-neon-medium",
-    "deepseek": "deepseek-flash"
+    "deepseek": "deepseek-flash",
+    "codex": "gpt-6.2-sol"
   }
 }

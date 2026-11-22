@@ -1,5 +1,6 @@
 import type { CustomProviderConfig, ReasoningEffort } from './config.js';
 import type { QuotaReader } from '../quota/types.js';
+import type { MemoryReference } from '../memory/report.js';
 
 /** ask requests an answer using the provider's declared policy; exec permits edits. */
 export type RunMode = 'ask' | 'exec';
@@ -29,7 +30,7 @@ export type ProviderEvent =
   | { type: 'reasoning'; text: string }
   | { type: 'delta'; text: string }
   | { type: 'tool'; name: string; detail?: string }
-  | { type: 'done'; text: string; usage?: Usage }
+  | { type: 'done'; text: string; usage?: Usage; memoryReferences?: MemoryReference[] }
   | { type: 'error'; message: string; status?: 'failed' | 'cancelled' | 'timed_out' };
 
 export interface Capabilities {
@@ -98,6 +99,7 @@ export interface RunResult {
   durationMs: number;
   usage?: Usage;
   tools?: ToolUse[];
+  memoryReferences?: MemoryReference[];
   /** Display failures never change the provider's outcome. */
   observerErrors?: string[];
 }
