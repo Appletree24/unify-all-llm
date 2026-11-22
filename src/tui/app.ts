@@ -132,6 +132,7 @@ export class App {
   private mouseOn = true;
   private manualModels = false;
   private sessionSynth?: string;
+  private continueFrom?: string;
   private readonly modelTests: ModelTests;
 
   constructor(
@@ -273,6 +274,8 @@ export class App {
   private async ask(question: string, retryIds?: string[]): Promise<void> {
     if (!this.selected.length) return this.say('没有可用的模型，输入 /settings 接入官方 API，或检查 CLI 登录状态', RED);
     const previous = this.lastRun;
+    const continueFrom = retryIds ? undefined : this.continueFrom;
+    this.continueFrom = undefined;
     this.begin();
     this.ctl = new AbortController();
     this.question = question;
@@ -288,7 +291,7 @@ export class App {
     try {
       this.active = startComparison({
         cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
-        previous, manualSelection: this.manualModels, signal: this.ctl.signal,
+        previous, continueFrom, manualSelection: this.manualModels, signal: this.ctl.signal,
         retry: retryIds && previous ? { record: previous, targetIds: retryIds } : undefined,
         onEvent: displaySynthesisEvents((ev) => this.workflowEvent(ev)),
       });
@@ -413,6 +416,7 @@ export class App {
     this.panes = [];
     this.synth = this.exec = undefined;
     this.lastRun = undefined;
+    this.continueFrom = undefined;
     this.question = '';
     this.turn = 0;
     this.focus = 'input';
@@ -488,6 +492,19 @@ export class App {
       );
     }
     else if (name === 'exec') this.startExec(arg || undefined);
+    else if (name === 'use') {
+      if (!this.lastRun) return this.say('还没有可沿用的上一轮回答', YELLOW);
+      if (!arg) {
+        this.continueFrom = undefined;
+        return this.say('下轮追问将恢复默认上下文');
+      }
+      const ok = arg === 'synthesis'
+        ? !!(this.lastRun.synthesis?.result.ok && this.lastRun.synthesis.result.text.trim())
+        : this.lastRun.results.some((r) => r.targetId === arg && r.ok && r.text.trim());
+      if (!ok) return this.say(`上一轮中没有来自 "${arg}" 的可用回答`, RED);
+      this.continueFrom = arg;
+      this.say(`下轮追问将沿用「${arg}」的回答（输入 /use 重置）`, GOLD);
+    }
     else if (name === 'cancel') {
       if (!this.busy) return this.say('没有正在运行的请求');
       if (!arg) return this.interrupt();
@@ -706,6 +723,13 @@ export class App {
     } else if (k.name === 'end' || ch === 'G') p.follow = true;
     else if (k.name === 'enter' || ch === 'z') this.zoomId = this.zoomId ? undefined : p.id;
     else if (ch === 'y') this.copy();
+    else if (ch === 'u' && (p.kind === 'answer' || p.kind === 'synth')) {
+      if (p.status !== 'ok' || !p.text.trim()) return this.say('该回答尚未完成，无法作为追问上下文', YELLOW);
+      this.continueFrom = p.kind === 'synth' ? 'synthesis' : p.targetId;
+      this.zoomId = undefined;
+      this.focus = 'input';
+      this.say(`下轮追问将沿用「${p.title}」的回答（输入 /use 重置）`, GOLD);
+    }
     else if (k.name === 'esc' || ch === 'i') {
       if (this.zoomId) this.zoomId = undefined;
       else this.focus = 'input';
@@ -860,6 +884,7 @@ export class App {
   private drawHeader(s: Screen): void {
     let x = s.put(1, 0, '✦ unify', `1;${GOLD}`) + 2;
     for (const a of this.all) {
+      if (this.installed.get(a.id) === false) continue;
       const known = this.installed.has(a.id);
       const on = this.selected.includes(a.id);
       // The decider does not answer; it is shown as the diamond that routes the others.
@@ -922,9 +947,11 @@ export class App {
     if (chars.length === 0) {
       const hint = this.busy
         ? '继续输入会排队，本轮结束后发送…'
-        : this.turn === 0
-          ? '问点什么…  / 命令 · @ 引用文件'
-          : '继续追问，或输入 /exec 让模型按方案动手';
+        : this.continueFrom
+          ? `沿用「${this.continueFrom}」继续追问…（输入 /use 重置）`
+          : this.turn === 0
+            ? '问点什么…  / 命令 · @ 引用文件'
+            : '继续追问，或输入 /exec 让模型按方案动手';
       s.put(2, y + 1, truncate(hint, inner), DIM);
     }
     if (active) this.cursor = { x: 2 + cx, y: y + 1 + (cy - first) };
@@ -948,7 +975,7 @@ export class App {
         ? this.panes.length
           ? ['Tab 切换面板', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+R 思考', 'Ctrl+N 新对话', '/help 帮助']
           : ['Enter 发送', 'Shift+Enter/Ctrl+J 换行', '/quota 套餐余量', '/ 命令', '@ 文件', '/help 帮助']
-        : ['↑↓/滚轮 滚动', 'Enter 放大', 'y 复制', 'Ctrl+E 按此回答实施', 'Esc 返回'];
+        : ['↑↓/滚轮 滚动', 'Enter 放大', 'u 沿此继续', 'y 复制', 'Ctrl+E 按此实施', 'Esc 返回'];
     let x = 1;
     for (const h of hints) {
       if (x + textWidth(h) + 3 > s.cols) break;
@@ -1046,8 +1073,9 @@ export class App {
   }
 
   private drawWelcome(s: Screen, y: number, h: number): void {
-    const n = this.all.length;
-    const nameW = Math.min(Math.max(1, ...this.all.map((a) => textWidth(a.label))), Math.floor(s.cols / 3));
+    const targets = this.all.filter((a) => this.installed.get(a.id) !== false);
+    const n = targets.length;
+    const nameW = Math.min(Math.max(1, ...targets.map((a) => textWidth(a.label))), Math.floor(s.cols / 3));
     const mid = Math.floor((n - 1) / 2);
     const showDiagram = s.cols - nameW >= 48;
     const quotaOffset = 2 + nameW + (showDiagram ? 18 : 2);
@@ -1056,25 +1084,24 @@ export class App {
     const quotaW = blockW - quotaOffset;
     const blockH = n + 4;
     let row = y + Math.max(0, Math.floor((h - blockH) / 2));
-    for (const [i, a] of this.all.entries()) {
+    for (const [i, a] of targets.entries()) {
       if (row >= y + h) break;
       const on = this.selected.includes(a.id);
       const known = this.installed.has(a.id);
       const color = on ? this.colorOf(a.id) : BORDER;
-      const tag = known && !this.installed.get(a.id) ? (a.adapter.configuration?.type === 'openai' ? '缺少密钥' : '未安装') : a.id === this.cfg.decider ? '决策' : '';
-      const tagStyle = tag === '决策' ? GOLD : DIM;
+      const tag = a.id === this.cfg.decider ? '决策' : '';
       s.put(x0, row, !known ? SPIN[this.frame % 10] : on ? '●' : '○', color);
       s.put(x0 + 2, row, truncate(a.label, nameW), on ? `1;${color}` : DIM);
       if (showDiagram) {
         const joint = n === 1 ? '─' : i === mid ? (i === 0 ? '┬' : i === n - 1 ? '┴' : '┼') : i === 0 ? '╮' : i === n - 1 ? '╯' : '┤';
         const x = s.put(x0 + 3 + nameW, row, '──' + joint, color === BORDER ? BORDER : DIM);
         if (i === mid) s.put(s.put(x, row, '──▶ ', DIM), row, '✦ 最优解', `1;${GOLD}`);
-        else if (tag) s.put(x + 1, row, tag, tagStyle);
+        else if (tag) s.put(x + 1, row, tag, GOLD);
       }
       const summary = this.quota?.summary(a.id, quotaW) ?? '余量查询中…';
       const end = s.put(x0 + quotaOffset, row, truncate(summary, quotaW), DIM);
       if ((!showDiagram || i === mid) && tag && end + 2 + textWidth(tag) <= x0 + blockW) {
-        s.put(end + 2, row, tag, tagStyle);
+        s.put(end + 2, row, tag, GOLD);
       }
       row++;
     }

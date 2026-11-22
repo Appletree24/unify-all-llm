@@ -208,6 +208,7 @@ node dist/cli.js quota --json     # 输出 JSON，配合 --watch 时每行一轮
 | Codex | 当前 CLI 账号返回的用量窗口、剩余百分比和重置时间 |
 | Claude Code | 当前订阅返回的用量窗口、剩余百分比和重置时间，需要支持额度查询的 CLI 版本 |
 | Gemini CLI | 使用当前 Google 登录的有效访问令牌读取 Code Assist 各模型配额。令牌过期时打开 Gemini CLI 刷新登录；加密凭证、API key 和 Vertex AI 可通过自定义额度命令接入 |
+| Gemini Pro（Antigravity CLI） | 使用已登录的 `agy` 1.1.11 或更新版本查询各模型组的套餐剩余额度和重置时间 |
 | DeepSeek 官方 API | 当前 API Key 对应账户按币种显示的可用余额 |
 | 自定义命令和 OpenAI 兼容网关 | 通过用户配置的 `quotaCommands` 读取该服务的额度 |
 
@@ -234,7 +235,7 @@ node dist/cli.js quota --json     # 输出 JSON，配合 --watch 时每行一轮
 TUI 支持并排阅读、思考过程切换、复制、滚动和放大，输入区的操作习惯与 Codex、Pi 等终端工具一致：
 
 - **命令补全**：输入 `/` 弹出命令列表，继续输入过滤，`↑↓` 选择，`Tab` 补全，`Enter` 补全并执行；`/models`、`/synth`、`/exec`、`/retry`、`/cancel` 的参数会补全目标 id。
-- **文件引用**：输入 `@` 模糊搜索项目文件（`git ls-files`，非 Git 目录则有界遍历），选中后以 `@路径` 写入问题。它只是文本引用，由各模型 CLI 自己决定是否读取；只发送 messages 的 HTTP 目标读不到文件内容。
+- **文件引用**：输入 `@` 模糊搜索项目文件（`git ls-files`，非 Git 目录则有界遍历），选中后以 `@路径` 写入问题。本地 CLI 可直接查阅仓库；对于只发送 messages 的纯文本 HTTP 目标（及纯文本汇总目标），Unify 会自动读取当前项目内显式 `@` 引用的文本文件（自动跳过二进制、越界路径并做有界截断）一并附带，拉齐上下文质量。
 - **多行编辑**：`Shift+Enter`、`Alt+Enter` 或 `Ctrl+J` 换行；`Ctrl+A/E` 行首行尾，`Alt+←/→`（或 `Ctrl+←/→`）按词移动，`Ctrl+W` 删词，`Ctrl+U/K` 删到行首/行尾。`↑↓` 先在多行内移动，到首末行再翻阅历史，未发送的草稿会保留。`Shift+Enter` 需要终端支持 kitty 键盘协议或 xterm modifyOtherKeys。在 tmux 中还需允许转发扩展按键，可运行 `tmux set -s extended-keys on`。如果终端无法发送 `Shift+Enter`，可以用 `Ctrl+J`。
 - **排队发送**：生成过程中可以继续输入并发送，消息排在输入框上方，本轮结束后依次发出。
 - **中断与退出**：`Esc` 或 `Ctrl+C` 中断当前整轮，排队的消息放回输入框。空闲时 `Ctrl+C` 先清空输入，输入为空时连按两次退出；`Ctrl+D`、`/exit`、`/quit` 直接退出。退出会等待已启动调用清理并保存记录。
@@ -252,6 +253,7 @@ TUI 支持并排阅读、思考过程切换、复制、滚动和放大，输入�
 | `/retry` | 重试所有失败、取消或尚未开始的目标 |
 | `Tab` 后 `Ctrl+E` | 按聚焦回答实施，需确认 |
 | `/exec [目标]` | 使用汇总或唯一成功答案实施 |
+| `/use [目标]` | 下轮追问沿用指定目标的回答（不带参数恢复默认；聚焦回答面板时按 `u` 也可切换） |
 | `/new` | 开始独立会话 |
 | `/copy` | 复制当前结果 |
 | `/help` | 快捷键与命令一览 |

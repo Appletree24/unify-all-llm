@@ -1,5 +1,5 @@
 import { atomicWrite } from './atomic-write.js';
-import { synthesisFormatter } from './synth.js';
+import { extractFinalPlan, synthesisFormatter } from './synth.js';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -14,16 +14,21 @@ const capabilities = z.object({
   exec: z.boolean(),
 });
 const targetSchema = z.object({ id: safeId, label: z.string(), provider: safeId, model: z.string().optional(), reasoningEffort: effortSchema.optional(), capabilities, configuration: customSchema.optional() });
+const toolUseSchema = z.object({ name: z.string(), detail: z.string().optional() });
 const resultSchema = z.object({
   runId: safeId, targetId: safeId, provider: safeId, model: z.string().optional(), reasoningEffort: effortSchema.optional(),
   status: z.enum(['running', 'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted']),
   ok: z.boolean(), text: z.string(), reasoning: z.string(), error: z.string().optional(), durationMs: z.number().nonnegative(),
   usage: z.object({ inputTokens: z.number().optional(), outputTokens: z.number().optional() }).optional(),
+  tools: z.array(toolUseSchema).optional(),
   observerErrors: z.array(z.string()).optional(),
 }).refine((r) => r.ok === (r.status === 'succeeded'), 'ok 与 status 不一致');
 const historySchema = z.array(z.object({ turnId: safeId, question: z.string(), answer: z.string() }));
 const inputSchema = z.object({ prompt: z.string(), cwd: z.string(), history: historySchema });
-const sourceSchema = z.object({ turnId: safeId, runId: safeId, targetId: safeId, scope: z.enum(['answer', 'synthesis']) });
+const sourceSchema = z.object({
+  turnId: safeId, runId: safeId, targetId: safeId, scope: z.enum(['answer', 'synthesis']),
+  planText: z.string().optional(),
+});
 const recordSchema = z.object({
   schemaVersion: z.literal(2), kind: z.enum(['comparison', 'execution']), id: safeId, sessionId: safeId,
   parentTurnId: safeId.optional(), retryOf: safeId.optional(), createdAt: z.string(), updatedAt: z.string(),
@@ -37,7 +42,10 @@ const recordSchema = z.object({
     result: resultSchema,
   })),
   decision: z.object({ providers: z.array(safeId), synthesize: z.boolean(), reason: z.string().optional() }).optional(),
-  synthesis: z.object({ provider: safeId, labels: z.record(z.string(), safeId), result: resultSchema }).optional(),
+  synthesis: z.object({
+    provider: safeId, labels: z.record(z.string(), safeId), result: resultSchema,
+    preferredProvider: safeId.optional(), fallback: z.boolean().optional(), alsoAnswered: z.boolean().optional(),
+  }).optional(),
   planSource: sourceSchema.optional(),
   observerErrors: z.array(z.string()).optional(),
 });
@@ -142,7 +150,80 @@ export function latestComparison(cwd: string): RunRecord {
   throw new Error('没有可继续的问答记录');
 }
 
-export function historyAfter(run: RunRecord): HistoryEntry[] {
-  const best = run.synthesis?.result.ok ? run.synthesis.result : run.results.find((r) => r.ok && r.text.trim());
+/** Find the latest non-cancelled execution that adopted a plan from this comparison turn. */
+export function latestExecutionFor(cwd: string, comparison: RunRecord): RunRecord | undefined {
+  if (comparison.kind !== 'comparison') return undefined;
+  const ids = listRunIds(cwd);
+  const idx = ids.indexOf(comparison.id);
+  if (idx < 0) return undefined;
+  let latest: RunRecord | undefined;
+  for (let i = ids.length - 1; i > idx; i--) {
+    let run: RunRecord;
+    try { run = loadRun(cwd, ids[i]); } catch { continue; }
+    if (run.kind !== 'execution' || run.sessionId !== comparison.sessionId || run.planSource?.turnId !== comparison.id) continue;
+    if (run.status === 'cancelled' || run.results[0]?.status === 'cancelled') continue;
+    if (run.results[0]?.ok) return run;
+    latest ??= run;
+  }
+  return latest;
+}
+
+function sourceDisplayName(source: PlanSource, comparison?: RunRecord): string {
+  const target = comparison?.targets.find((t) => t.id === source.targetId);
+  const config = target?.configuration;
+  const name = target?.model ?? (config?.type === 'openai' ? config.model : undefined) ?? target?.label ?? source.targetId;
+  return source.scope === 'synthesis' ? `汇总（${name}）` : name;
+}
+
+function resolveChosenPlan(comparison: RunRecord, source: PlanSource): string | undefined {
+  if (source.planText?.trim()) return source.planText.trim();
+  if (source.scope === 'synthesis' && comparison.synthesis?.result.ok && comparison.synthesis.result.text.trim()) {
+    return synthesisFormatter(comparison)(extractFinalPlan(comparison.synthesis.result.text));
+  }
+  const match = comparison.results.find((r) => (r.runId === source.runId || r.targetId === source.targetId) && r.ok && r.text.trim());
+  return match?.text.trim();
+}
+
+function formatExecutedAnswer(planText: string | undefined, execution: RunRecord, comparison?: RunRecord): string | undefined {
+  const execResult = execution.results[0];
+  const execOk = !!execResult?.ok && !!execResult.text.trim();
+  const srcLabel = execution.planSource ? sourceDisplayName(execution.planSource, comparison) : undefined;
+  const execLabel = execution.targets[0]?.label ?? execResult?.targetId ?? '执行模型';
+  if (planText) {
+    const header = srcLabel ? `[已采纳方案：${srcLabel}]\n` : '';
+    const outcome = execOk ? `\n\n[已由 ${execLabel} 实施]\n${execResult.text.trim()}` : '';
+    return `${header}${planText}${outcome}`;
+  }
+  return execOk ? execResult.text.trim() : undefined;
+}
+
+export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, fromTargetId?: string): HistoryEntry[] {
+  if (run.kind === 'execution') {
+    const answer = formatExecutedAnswer(run.planSource?.planText?.trim(), run);
+    return [...run.input.history, ...(answer ? [{ turnId: run.planSource?.turnId ?? run.id, question: run.question, answer }] : [])];
+  }
+  if (fromTargetId) {
+    if (fromTargetId === 'synthesis') {
+      if (run.synthesis?.result.ok && run.synthesis.result.text.trim()) {
+        return [...run.input.history, { turnId: run.id, question: run.question, answer: synthesisFormatter(run)(run.synthesis.result.text) }];
+      }
+    } else {
+      const picked = run.results.find((r) => r.targetId === fromTargetId && r.ok && r.text.trim());
+      if (picked) {
+        const label = sourceDisplayName({ turnId: run.id, runId: picked.runId, targetId: picked.targetId, scope: 'answer' }, run);
+        return [...run.input.history, { turnId: run.id, question: run.question, answer: `[已选定回答：${label}]\n${picked.text.trim()}` }];
+      }
+    }
+  }
+  if (followUpExecution?.kind === 'execution' && followUpExecution.planSource?.turnId === run.id) {
+    const planText = resolveChosenPlan(run, followUpExecution.planSource);
+    const answer = formatExecutedAnswer(planText, followUpExecution, run);
+    if (answer) return [...run.input.history, { turnId: run.id, question: run.question, answer }];
+  }
+  if (run.synthesis?.result.ok && run.synthesis.result.text.trim()) {
+    const answer = synthesisFormatter(run)(run.synthesis.result.text);
+    return [...run.input.history, { turnId: run.id, question: run.question, answer }];
+  }
+  const best = run.results.find((r) => r.ok && r.text.trim());
   return [...run.input.history, ...(best ? [{ turnId: run.id, question: run.question, answer: best.text }] : [])];
 }

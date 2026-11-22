@@ -1,5 +1,9 @@
 {
   "showReasoning": true,
   "disableClaude": true,
-  "synthesizer": "deepseek"
+  "synthesizer": "deepseek",
+  "models": {
+    "gemini-pro": "gemini-4-neon-medium",
+    "deepseek": "deepseek-flash"
+  }
 }

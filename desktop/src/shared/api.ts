@@ -3,8 +3,9 @@ import type { Config, ReasoningEffort } from '../../../src/core/config.js';
 import type { RunRecord } from '../../../src/core/store.js';
 import type { ModelTestState } from '../../../src/core/model-tests.js';
 import type { TargetQuota } from '../../../src/quota/types.js';
+import type { QuotaNotice } from '../../../src/quota/reminders.js';
 
-export type { Config, ReasoningEffort, RunRecord, TargetQuota };
+export type { Config, QuotaNotice, ReasoningEffort, RunRecord, TargetQuota };
 export type RunResultRecord = RunRecord['results'][number];
 export type CallRecord = RunRecord['calls'][number];
 
@@ -58,6 +59,8 @@ export interface AskRequest {
   synthesizer?: string;
   /** Continue this session's latest comparison; omit to start a new one. */
   sessionId?: string;
+  /** Optional targetId (or 'synthesis') from the previous turn to carry into follow-up history. */
+  continueFrom?: string;
 }
 
 export interface ExecPreview {
@@ -98,6 +101,9 @@ export type Push =
   | { type: 'activity'; turnId: string; runId: string; name: string; detail?: string }
   | { type: 'notice'; turnId: string; message: string }
   | { type: 'end'; turnId: string; sessionId: string; status: RunRecord['status'] }
+  | { type: 'quota'; cwd: string; quotas: TargetQuota[] }
+  | { type: 'quota-notice'; notice: QuotaNotice }
+  | { type: 'open-quota' }
   | { type: 'workspace'; info: WorkspaceInfo };
 
 export interface UnifyApi {

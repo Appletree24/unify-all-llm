@@ -9,6 +9,21 @@ export interface Usage {
   outputTokens?: number;
 }
 
+export interface ToolUse {
+  name: string;
+  detail?: string;
+}
+
+const MAX_TOOL_RECORDS = 200;
+const MAX_TOOL_DETAIL = 500;
+
+export function appendToolUse(result: RunResult, tool: ToolUse): void {
+  const list = (result.tools ??= []);
+  if (list.length >= MAX_TOOL_RECORDS) return;
+  const detail = tool.detail?.trim();
+  list.push({ name: tool.name, ...(detail ? { detail: detail.slice(0, MAX_TOOL_DETAIL) } : {}) });
+}
+
 /** The single event vocabulary every provider is translated into. */
 export type ProviderEvent =
   | { type: 'reasoning'; text: string }
@@ -82,6 +97,7 @@ export interface RunResult {
   error?: string;
   durationMs: number;
   usage?: Usage;
+  tools?: ToolUse[];
   /** Display failures never change the provider's outcome. */
   observerErrors?: string[];
 }

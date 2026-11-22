@@ -5,6 +5,8 @@ import { listRunIds, loadRun } from '../dist/core/store.js';
 import { QUOTA_REFRESH_MS } from '../dist/quota/index.js';
 import { aborted, deferred, target, workspace } from './helpers.mjs';
 
+const homeEnv = process.platform === 'win32' ? 'USERPROFILE' : 'HOME';
+
 function submit(app, text) {
   app.handleKey({ name: 'paste', text });
   app.handleKey({ name: 'enter' });
@@ -98,18 +100,21 @@ test('welcome rows and answer panes show each model’s quota and update without
   let percentage = 74, balance = 0;
   const a = target('alpha', async function* () { yield { type: 'done', text: 'answer one' }; });
   const b = target('beta', async function* () { yield { type: 'done', text: 'answer two' }; });
+  const unavailable = target('unavailable', async function* () { assert.fail('Unavailable model was called'); });
+  unavailable.adapter.detect = async () => ({ installed: false });
   a.adapter.readQuota = async () => ({ status: 'ok', limits: [
     { label: '5 小时', remaining: percentage, unit: '%', resetsAt: '2027-01-01T00:00:00Z' },
   ] });
   b.adapter.readQuota = async () => ({ status: 'ok', limits: [{ label: '账户余额', remaining: balance, unit: 'CNY' }] });
   let cols = 140;
-  const app = new App({ cols: () => cols, rows: () => 36, write() {} }, workspace(t), { providers: ['alpha', 'beta'] }, [a, b]);
+  const app = new App({ cols: () => cols, rows: () => 36, write() {} }, workspace(t), { providers: ['alpha', 'beta'] }, [a, b, unavailable]);
   t.after(() => app.dispose());
   await app.init();
   await new Promise(setImmediate);
   const welcome = screen(app);
   assert.match(welcome, /ALPHA[^\n]*74%/);
   assert.match(welcome, /BETA[^\n]*0 CNY/);
+  assert.doesNotMatch(welcome, /UNAVAILABLE|未安装|缺少密钥/);
   submit(app, 'compare');
   await app.waitForIdle();
   await new Promise(setImmediate);
@@ -311,8 +316,8 @@ test('official API setup masks credentials, selects DeepSeek immediately, and su
   const { buildRegistry } = await import('../dist/providers/index.js');
   const cwd = workspace(t);
   const home = workspace(t);
-  const saved = { HOME: process.env.HOME, DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY };
-  process.env.HOME = home;
+  const saved = { [homeEnv]: process.env[homeEnv], DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY };
+  process.env[homeEnv] = home;
   delete process.env.DEEPSEEK_API_KEY;
   t.after(() => {
     for (const [k, v] of Object.entries(saved)) {
@@ -402,11 +407,11 @@ test('official API setup enables a separate OpenAI target using an environment k
   const { buildRegistry } = await import('../dist/providers/index.js');
   const { readFileSync } = await import('node:fs');
   const home = workspace(t);
-  const savedHome = process.env.HOME, savedKey = process.env.OPENAI_API_KEY;
-  process.env.HOME = home;
+  const savedHome = process.env[homeEnv], savedKey = process.env.OPENAI_API_KEY;
+  process.env[homeEnv] = home;
   process.env.OPENAI_API_KEY = 'env-key';
   t.after(() => {
-    process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env[homeEnv]; else process.env[homeEnv] = savedHome;
     if (savedKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = savedKey;
   });
   const app = new App({ cols: () => 90, rows: () => 24, write() {} }, workspace(t), {}, []);

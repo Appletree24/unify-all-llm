@@ -14,7 +14,7 @@ import { effortChoices } from '../../../src/providers/effort.js';
 import { buildRegistry } from '../../../src/providers/index.js';
 import { targetModelIds, modelIds } from '../../../src/providers/models.js';
 import { officialApis, readApiProfile, saveApiProfile } from '../../../src/providers/official.js';
-import { readTargetQuotas, type TargetQuota } from '../../../src/quota/index.js';
+import { QUOTA_REFRESH_MS, readTargetQuotas, type TargetQuota } from '../../../src/quota/index.js';
 import type { AskRequest, ExecPreview, Push, SessionSummary, SettingsInfo, TargetInfo, WorkspaceInfo } from '../shared/api.js';
 
 const ACTIVE = new Set<RunRecord['status']>(['created', 'deciding', 'answering', 'synthesizing']);
@@ -44,13 +44,17 @@ export class Workspace {
   private readonly handles = new Map<string, WorkflowHandle>();
   private readonly runCache = new Map<string, { mtime: number; run: RunRecord }>();
   private quotaCache?: { at: number; value: Promise<TargetQuota[]> };
+  private quotaRun?: AbortController;
+  private readonly quotaTimer: NodeJS.Timeout;
+  private disposed = false;
   private memory?: Promise<MemoryServer>;
   private readonly modelTests: ModelTests;
 
-  constructor(readonly cwd: string, private readonly push: (p: Push) => void) {
+  constructor(readonly cwd: string, private readonly push: (p: Push) => void, private readonly onQuota: (quotas: TargetQuota[]) => void) {
     this.modelTests = new ModelTests(cwd, () => this.pushInfo());
     this.reload();
     void gitBranch(cwd).then((b) => { this.branch = b; this.pushInfo(); });
+    this.quotaTimer = setInterval(() => this.refreshQuota(), QUOTA_REFRESH_MS);
   }
 
   /** Re-read both config layers; an invalid file is reported instead of crashing the window. */
@@ -65,7 +69,7 @@ export class Workspace {
       this.cfg = {};
       try { this.targets = Object.values(buildRegistry({})); } catch { this.targets = []; }
     }
-    this.quotaCache = undefined;
+    this.invalidateQuota();
     if (redetect) this.detect();
   }
 
@@ -184,8 +188,8 @@ export class Workspace {
     void handle.done.catch(() => undefined).then(() => {
       flush();
       this.handles.delete(record.id);
-      this.quotaCache = undefined;
       this.push({ type: 'end', turnId: record.id, sessionId: record.sessionId, status: record.status });
+      this.refreshQuota(true);
     });
     return { turnId: record.id, sessionId: record.sessionId };
   }
@@ -202,7 +206,7 @@ export class Workspace {
     const config = req.synthesizer ? parseConfig({ ...this.cfg, synthesizer: req.synthesizer }) : this.cfg;
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected,
-      manualSelection: req.manual, synthesize: req.synthesize, previous, onEvent,
+      manualSelection: req.manual, synthesize: req.synthesize, previous, continueFrom: req.continueFrom, onEvent,
     }));
   }
 
@@ -259,13 +263,34 @@ export class Workspace {
 
   // ── quota, settings, memory ────────────────────────────────────────────
 
-  quota(force = false): Promise<TargetQuota[]> {
-    if (force || !this.quotaCache || Date.now() - this.quotaCache.at > QUOTA_TTL_MS) {
-      const value = readTargetQuotas(this.targets, this.cwd);
-      this.quotaCache = { at: Date.now(), value };
-      value.catch(() => { if (this.quotaCache?.value === value) this.quotaCache = undefined; });
-    }
-    return this.quotaCache.value;
+  private refreshQuota(force = false): void {
+    if (!this.disposed) void this.quota(force).catch(() => undefined);
+  }
+
+  private invalidateQuota(): void {
+    this.quotaRun?.abort();
+    this.quotaRun = undefined;
+    this.quotaCache = undefined;
+  }
+
+  async quota(force = false): Promise<TargetQuota[]> {
+    if (this.disposed) throw new Error('项目已关闭');
+    const cached = this.quotaCache;
+    if (cached && (this.quotaRun || (!force && Date.now() - cached.at <= QUOTA_TTL_MS))) return cached.value;
+    const ctl = this.quotaRun = new AbortController();
+    const value = readTargetQuotas(this.targets, this.cwd, ctl.signal).then((quotas) => {
+      ctl.signal.throwIfAborted();
+      this.push({ type: 'quota', cwd: this.cwd, quotas });
+      this.onQuota(quotas);
+      return quotas;
+    }).catch((err: unknown) => {
+      if (this.quotaCache?.value === value) this.quotaCache = undefined;
+      throw err;
+    }).finally(() => {
+      if (this.quotaRun === ctl) this.quotaRun = undefined;
+    });
+    this.quotaCache = { at: Date.now(), value };
+    return value;
   }
 
   async testTarget(id: string): Promise<void> {
@@ -309,6 +334,7 @@ export class Workspace {
     if (!key && !process.env[api.apiKeyEnv]) throw new Error('请输入 API Key');
     saveApiProfile(api, { model, ...(key ? { apiKey: key } : {}) });
     this.reload();
+    this.refreshQuota();
     return this.info();
   }
 
@@ -323,10 +349,14 @@ export class Workspace {
 
   /** Cancel everything and wait for cleanup and the final record writes. */
   async dispose(): Promise<void> {
+    this.disposed = true;
+    clearInterval(this.quotaTimer);
+    const quota = this.quotaCache?.value.catch(() => undefined);
+    this.invalidateQuota();
     this.detectCtl.abort();
     const pending = [...this.handles.values()];
     for (const h of pending) h.cancel();
-    await Promise.all([this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined))]);
+    await Promise.all([quota, this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined))]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 }

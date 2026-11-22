@@ -1,4 +1,5 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { QUOTA_LOW_PERCENT, QUOTA_RESET_NOTICE_MINUTES } from '../../../src/quota/reminders.js';
 import type { ApiInfo, Config, SettingsInfo, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { Icon, Spinner, Switch, ago, hue, until } from './ui.js';
@@ -42,7 +43,7 @@ export function QuotaPage({ quota, loading, refresh }: { quota?: TargetQuota[]; 
       <header className="page-head">
         <div>
           <h1>套餐额度</h1>
-          <p className="lede">各模型账户的剩余额度。同一服务商下的别名共用一次查询，每分钟自动刷新。</p>
+          <p className="lede">每分钟检查。额度重置前 {QUOTA_RESET_NOTICE_MINUTES} 分钟仍有剩余，或余量降至 {QUOTA_LOW_PERCENT}% 时提醒。</p>
         </div>
         <button className="btn" onClick={refresh} disabled={loading}>{loading ? <Spinner /> : <Icon name="retry" />}刷新</button>
       </header>
@@ -167,7 +168,7 @@ function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceI
           e.preventDefault();
           setBusy(true);
           try {
-            onSaved(await unify.saveApi(api.id, model.trim(), key.trim() || undefined));
+            onSaved(await unify.saveApi(api.id, model, key.trim() || undefined));
             setKey('');
             setOpen(false);
             notify(`已接入 ${api.label} · ${model}`, 'ok');
@@ -175,15 +176,16 @@ function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceI
           setBusy(false);
         }}>
           <label>模型
-            <input list={`models-${api.id}`} value={model} onChange={(e) => setModel(e.target.value)} spellCheck={false} />
-            <datalist id={`models-${api.id}`}>{api.models.map((m) => <option key={m} value={m} />)}</datalist>
+            <select value={model} onChange={(e) => setModel(e.target.value)}>
+              {api.models.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
           </label>
           <label>API Key
             <input type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" spellCheck={false}
               placeholder={api.hasKey ? '留空沿用已保存的密钥' : api.envKey ? `留空使用 ${api.apiKeyEnv}` : '粘贴密钥'} />
           </label>
           <p className="set-note">密钥以明文保存在 ~/.unify/api/{api.id}.json（POSIX 权限 0600）。{api.baseUrl}</p>
-          <div className="json-acts"><button className="btn primary" disabled={busy || !model.trim()}>保存</button></div>
+          <div className="json-acts"><button className="btn primary" disabled={busy || !model}>保存</button></div>
         </form>
       )}
     </div>

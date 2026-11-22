@@ -1,14 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { ExecPreview, Push, RunRecord, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
+import type { ExecPreview, Push, QuotaNotice, RunRecord, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
-import { Card, Composer, ExecDialog, Turn, type Activity, type ComposerState, type TurnActions } from './Thread.js';
+import { Card, Composer, ExecDialog, Turn, type Activity, type ComposerState, type FollowUpChoice, type TurnActions } from './Thread.js';
 import { Icon, Spinner, hue, isActive } from './ui.js';
 
 type View = 'chat' | 'quota' | 'memory' | 'settings';
 interface Toast { id: number; msg: string; kind: 'ok' | 'err' | 'info' }
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
-const QUOTA_MS = 60_000;
 
 function dayGroup(iso: string): string {
   const d = new Date(iso);
@@ -26,17 +25,21 @@ export function App() {
   const [records, setRecords] = useState<Record<string, RunRecord>>({});
   const [activity, setActivity] = useState<Record<string, Activity[]>>({});
   const [notices, setNotices] = useState<Record<string, string[]>>({});
-  const [view, setView] = useState<View>('chat');
+  const [view, setView] = useState<View>(() => new URLSearchParams(window.location.search).get('view') === 'quota' ? 'quota' : 'chat');
   const [quota, setQuota] = useState<TargetQuota[]>();
   const [quotaLoading, setQuotaLoading] = useState(false);
+  const [quotaNotice, setQuotaNotice] = useState<QuotaNotice>();
   const [toast, setToast] = useState<Toast>();
   const [execPreview, setExecPreview] = useState<ExecPreview>();
   const [zoom, setZoom] = useState<{ turnId: string; runId: string }>();
+  const [followUp, setFollowUp] = useState<FollowUpChoice>();
   const [composer, setComposer] = useState<ComposerState>({ selected: [], manual: false, synth: '' });
   const [sidebar, setSidebar] = useState(true);
   const [menu, setMenu] = useState(false);
   const [recent, setRecent] = useState<string[]>([]);
   const cwd = ws?.cwd;
+  const activeCwd = useRef(cwd);
+  useLayoutEffect(() => { activeCwd.current = cwd; }, [cwd]);
 
   const notify = useCallback((msg: string, kind: Toast['kind'] = 'info') => setToast({ id: Date.now(), msg, kind }), []);
   useEffect(() => {
@@ -47,9 +50,16 @@ export function App() {
 
   const refreshSessions = useCallback(() => { unify.sessions().then(setSessions, () => undefined); }, []);
   const refreshQuota = useCallback((force = false) => {
+    const requestedCwd = activeCwd.current;
     setQuotaLoading(true);
-    unify.quota(force).then(setQuota, () => undefined).finally(() => setQuotaLoading(false));
+    unify.quota(force).then((quotas) => {
+      if (requestedCwd === activeCwd.current) setQuota(quotas);
+    }, () => undefined).finally(() => {
+      if (requestedCwd === activeCwd.current) setQuotaLoading(false);
+    });
   }, []);
+
+  const openQuota = useCallback(() => { setQuotaNotice(undefined); setView('quota'); }, []);
 
   // ── bootstrap and pushes ────────────────────────────────────────────────
   useEffect(() => {
@@ -60,31 +70,35 @@ export function App() {
       else if (p.type === 'activity') setActivity((a) => ({ ...a, [p.runId]: [...(a[p.runId] ?? []), { name: p.name, detail: p.detail }] }));
       else if (p.type === 'notice') setNotices((n) => ({ ...n, [p.turnId]: [...(n[p.turnId] ?? []), p.message] }));
       else if (p.type === 'workspace') setWs((w) => (w && w.cwd === p.info.cwd ? p.info : w));
-      else if (p.type === 'end') { refreshSessions(); refreshQuota(); }
+      else if (p.type === 'end') refreshSessions();
+      else if (p.type === 'quota' && p.cwd === activeCwd.current) setQuota(p.quotas);
+      else if (p.type === 'quota-notice') setQuotaNotice(p.notice);
+      else if (p.type === 'open-quota') openQuota();
     });
-  }, [refreshSessions, refreshQuota]);
+  }, [refreshSessions, openQuota]);
 
   // A different project starts from a clean slate.
   useEffect(() => {
     setCurrent(null);
+    setFollowUp(undefined);
     setRecords({});
     setActivity({});
     setNotices({});
     setQuota(undefined);
+    setQuotaLoading(false);
     setComposer({ selected: [], manual: false, synth: '' });
     if (!cwd) return;
     refreshSessions();
     refreshQuota();
-    const t = setInterval(() => refreshQuota(), QUOTA_MS);
-    return () => clearInterval(t);
   }, [cwd, refreshSessions, refreshQuota]);
 
   // Follow the configured defaults until the user picks targets by hand.
   useEffect(() => {
     if (!ws) return;
     setComposer((c) => {
-      const valid = c.selected.filter((id) => ws.targets.some((t) => t.id === id && t.installed !== false));
-      return c.manual ? { ...c, selected: valid } : { ...c, selected: ws.defaults };
+      const selected = (c.manual ? c.selected : ws.defaults).filter((id) => ws.targets.some((t) => t.id === id && t.installed !== false));
+      const synth = ws.targets.some((t) => t.id === c.synth && t.installed === false) ? '' : c.synth;
+      return { ...c, selected, synth };
     });
   }, [ws]);
 
@@ -100,6 +114,7 @@ export function App() {
 
   const openSession = useCallback(async (id: string | null) => {
     setCurrent(id);
+    setFollowUp(undefined);
     setView('chat');
     setZoom(undefined);
     if (!id) return;
@@ -119,6 +134,8 @@ export function App() {
     [records, current],
   );
   const busy = turns.some(isActive);
+  const latestComparisonId = useMemo(() => turns.filter((r) => r.kind === 'comparison').at(-1)?.id, [turns]);
+  const activeFollowUp = followUp && followUp.turnId === latestComparisonId ? followUp : undefined;
   const liveSessions = useMemo(() => new Set(Object.values(records).filter(isActive).map((r) => r.sessionId)), [records]);
   const quotaMap = useMemo(() => new Map((quota ?? []).map((q) => [q.targetId, q])), [quota]);
   const grouped = useMemo(() => {
@@ -138,7 +155,9 @@ export function App() {
         question, selected: composer.selected, manual: composer.manual,
         synthesize: composer.synth !== 'off', synthesizer: composer.synth && composer.synth !== 'off' ? composer.synth : undefined,
         sessionId: current ?? undefined,
+        continueFrom: activeFollowUp?.targetId,
       });
+      setFollowUp(undefined);
       setCurrent(ids.sessionId);
       refreshSessions();
       return true;
@@ -153,6 +172,7 @@ export function App() {
     },
     cancel: (turnId) => { void unify.cancel(turnId); },
     cancelTarget: (turnId, targetId) => { void unify.cancelTarget(turnId, targetId); },
+    followUp: (choice) => setFollowUp(choice),
   };
   const cancelCurrent = () => { for (const t of turns) if (isActive(t)) void unify.cancel(t.id); };
 
@@ -231,7 +251,7 @@ export function App() {
             ))}
           </nav>
           <nav className="side-nav">
-            <button className={view === 'quota' ? 'on' : ''} onClick={() => setView('quota')}><Icon name="gauge" />额度</button>
+            <button className={view === 'quota' ? 'on' : ''} onClick={openQuota}><Icon name="gauge" />额度</button>
             <button className={view === 'memory' ? 'on' : ''} onClick={() => setView('memory')}><Icon name="layers" />记忆</button>
             <button className={view === 'settings' ? 'on' : ''} onClick={() => setView('settings')}><Icon name="sliders" />设置<kbd>Ctrl ,</kbd></button>
           </nav>
@@ -254,7 +274,8 @@ export function App() {
                       {selectedLabels.length
                         ? <>问题会同时发给 {selectedLabels.map((t, i) => <span key={t.id} className="hero-target" style={{ '--h': hue(t.id) } as React.CSSProperties}>{i > 0 && '、'}<i className="dot" />{t.label}</span>)}，回答并排显示，再匿名汇总。</>
                         : ws.targets.some((t) => t.installed === undefined) ? '正在检测可用的模型…'
-                        : <>没有可用的模型。<button className="link" onClick={() => setView('settings')}>在设置中接入官方 API</button>，或安装并登录 Codex、Gemini、Claude Code 等 CLI。</>}
+                        : ws.targets.some((t) => t.installed) ? '从下方选择要提问的模型。'
+                        : <button className="link" onClick={() => setView('settings')}>在设置中接入模型</button>}
                     </p>
                     <ul className="tips">
                       <li><b>并排</b>每个模型一列，实时流式输出；点 <Icon name="expand" size={12} /> 放大阅读。</li>
@@ -263,12 +284,16 @@ export function App() {
                     </ul>
                   </div>
                 ) : turns.map((r) => (
-                  <Turn key={r.id} record={r} notices={notices[r.id] ?? []} activity={activity} showReasoning={ws.showReasoning} actions={actions} />
+                  <Turn
+                    key={r.id} record={r} notices={notices[r.id] ?? []} activity={activity} showReasoning={ws.showReasoning} actions={actions}
+                    isLatestComparison={r.id === latestComparisonId} followUp={activeFollowUp}
+                  />
                 ))}
               </div>
               <Composer
                 ws={ws} quota={quotaMap} busy={busy} state={composer} setState={setComposer}
                 onSend={send} onCancel={cancelCurrent} autoFocusKey={`${ws.cwd}:${current}`}
+                followUp={activeFollowUp} onClearFollowUp={() => setFollowUp(undefined)}
               />
             </>
           )}
@@ -290,6 +315,16 @@ export function App() {
         />
       )}
       {toast && <div key={toast.id} className={`toast ${toast.kind}`} role="status">{toast.msg}</div>}
+      {quotaNotice && (
+        <aside className="quota-notice" aria-label="套餐额度提醒">
+          <div className="quota-notice-content" role="status">
+            <header><Icon name="gauge" /><strong>{quotaNotice.title}</strong></header>
+            <ul>{quotaNotice.lines.map((line, index) => <li key={index}>{line}</li>)}</ul>
+          </div>
+          <button className="quota-notice-close" type="button" aria-label="关闭额度提醒" onClick={() => setQuotaNotice(undefined)}><Icon name="x" size={14} /></button>
+          <button className="btn" type="button" onClick={openQuota}>查看额度</button>
+        </aside>
+      )}
     </div>
   );
 }

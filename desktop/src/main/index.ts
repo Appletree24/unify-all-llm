@@ -1,9 +1,11 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, screen, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, Notification, screen, shell } from 'electron';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Method, Push, Reply, UnifyApi } from '../shared/api.js';
-import { adoptLoginShellPath } from './env.js';
+import { atomicWrite } from '../../../src/core/atomic-write.js';
+import { collectQuotaReminders, type QuotaReminderHistory } from '../../../src/quota/reminders.js';
+import type { Method, Push, QuotaNotice, Reply, TargetQuota, UnifyApi } from '../shared/api.js';
+import { prepareProviderPath } from './env.js';
 import { Workspace } from './workspace.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -12,20 +14,25 @@ const statePath = () => join(app.getPath('userData'), 'state.json');
 interface State {
   recent: string[];
   bounds?: { x: number; y: number; width: number; height: number; maximized?: boolean };
+  quotaReminders: QuotaReminderHistory;
 }
 
 function readState(): State {
   try {
     const s = JSON.parse(readFileSync(statePath(), 'utf8'));
-    return { recent: Array.isArray(s.recent) ? s.recent.filter((p: unknown) => typeof p === 'string') : [], bounds: s.bounds };
-  } catch { return { recent: [] }; }
+    const reminders = s.quotaReminders;
+    return {
+      recent: Array.isArray(s.recent) ? s.recent.filter((p: unknown) => typeof p === 'string') : [], bounds: s.bounds,
+      quotaReminders: reminders && typeof reminders === 'object' && !Array.isArray(reminders) ? reminders : {},
+    };
+  } catch { return { recent: [], quotaReminders: {} }; }
 }
 
 function writeState(state: State): void {
   try {
     mkdirSync(dirname(statePath()), { recursive: true });
-    writeFileSync(statePath(), JSON.stringify(state, null, 2));
-  } catch { /* Window state is a convenience only. */ }
+    atomicWrite(statePath(), JSON.stringify(state, null, 2));
+  } catch { /* Keep the current state in memory when it can't be written. */ }
 }
 
 const isDir = (p: string) => { try { return statSync(p).isDirectory(); } catch { return false; } };
@@ -34,8 +41,42 @@ let state: State;
 let win: BrowserWindow | undefined;
 let workspace: Workspace | undefined;
 let quitting = false;
+let pendingQuotaNotice: QuotaNotice | undefined;
+let activeQuotaNotification: Notification | undefined;
 
 const push = (p: Push) => { if (win && !win.isDestroyed()) win.webContents.send('unify:push', p); };
+
+function openQuotaPage(): void {
+  pendingQuotaNotice = undefined;
+  if (!win || win.isDestroyed()) { createWindow('quota'); return; }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  push({ type: 'open-quota' });
+}
+
+function monitorQuota(quotas: TargetQuota[]): void {
+  const { notice, history, changed } = collectQuotaReminders(quotas, state.quotaReminders);
+  state.quotaReminders = history;
+  if (changed) writeState(state);
+  if (!notice) return;
+
+  if (!win || win.isDestroyed() || win.webContents.isLoadingMainFrame()) pendingQuotaNotice = notice;
+  else push({ type: 'quota-notice', notice });
+  if (win?.isFocused() || !Notification.isSupported()) return;
+
+  const lines = notice.lines.slice(0, 3);
+  if (notice.lines.length > lines.length) lines.push(`另有 ${notice.lines.length - lines.length} 项，点击查看额度`);
+  try {
+    activeQuotaNotification?.close();
+    const notification = activeQuotaNotification = new Notification({ title: notice.title, body: lines.join('\n') });
+    const release = () => { if (activeQuotaNotification === notification) activeQuotaNotification = undefined; };
+    notification.once('close', release);
+    notification.once('failed', release);
+    notification.once('click', openQuotaPage);
+    notification.show();
+  } catch { /* The same message is available in the app. */ }
+}
 
 const palette = () => nativeTheme.shouldUseDarkColors
   ? { bg: '#0e0f11', symbol: '#c9cbd1' }
@@ -47,7 +88,7 @@ function openWorkspace(dir: string): Workspace {
   if (workspace?.cwd === cwd) return workspace;
   if (workspace?.busy) throw new Error('当前项目还有请求在进行，请先取消或等待完成');
   void workspace?.dispose();
-  workspace = new Workspace(cwd, push);
+  workspace = new Workspace(cwd, push, monitorQuota);
   state.recent = [cwd, ...state.recent.filter((p) => p !== cwd)].slice(0, 12);
   writeState(state);
   return workspace;
@@ -60,7 +101,13 @@ const need = (): Workspace => {
 
 const api: UnifyApi = {
   async platform() { return process.platform; },
-  async workspace() { return workspace?.info() ?? null; },
+  async workspace() {
+    if (pendingQuotaNotice) {
+      push({ type: 'quota-notice', notice: pendingQuotaNotice });
+      pendingQuotaNotice = undefined;
+    }
+    return workspace?.info() ?? null;
+  },
   async openWorkspace(dir) {
     let target = dir;
     if (!target) {
@@ -118,7 +165,7 @@ function visibleBounds(b: State['bounds']) {
   return visible ? b : undefined;
 }
 
-function createWindow(): void {
+function createWindow(view?: 'quota'): void {
   const bounds = visibleBounds(state.bounds);
   const { bg, symbol } = palette();
   win = new BrowserWindow({
@@ -157,7 +204,7 @@ function createWindow(): void {
   win.on('close', () => { saveBounds(); writeState(state); });
   win.on('closed', () => { win = undefined; });
 
-  void win.loadFile(join(here, 'renderer', 'index.html'));
+  void win.loadFile(join(here, 'renderer', 'index.html'), view ? { query: { view } } : undefined);
 }
 
 nativeTheme.on('updated', () => {
@@ -170,6 +217,7 @@ nativeTheme.on('updated', () => {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
+  if (process.platform === 'win32') app.setAppUserModelId(app.isPackaged ? 'dev.unify.desktop' : process.execPath);
   app.on('second-instance', () => {
     if (!win) return;
     if (win.isMinimized()) win.restore();
@@ -190,7 +238,7 @@ if (!app.requestSingleInstanceLock()) {
 
   void app.whenReady().then(async () => {
     state = readState();
-    await adoptLoginShellPath();
+    await prepareProviderPath();
     const fromArgs = process.argv.slice(app.isPackaged ? 1 : 2).find((a) => !a.startsWith('-') && isDir(a));
     const initial = process.env.UNIFY_CWD ?? fromArgs ?? state.recent.find(isDir);
     if (initial) { try { openWorkspace(initial); } catch { /* fall back to the welcome screen */ } }

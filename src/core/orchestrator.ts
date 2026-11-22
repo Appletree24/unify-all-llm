@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ModelTarget, ProviderEvent, RunMode, RunResult } from './types.js';
+import { appendToolUse, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
 
 export interface RunOptions {
   prompt: string;
@@ -60,6 +60,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
         } else {
           if (ev.type === 'delta') res.text += ev.text;
           if (ev.type === 'reasoning') res.reasoning += ev.text;
+          if (ev.type === 'tool') appendToolUse(res, ev);
           emit(ev);
         }
       }
@@ -99,6 +100,7 @@ export async function fanOut(
   targets: ModelTarget[],
   opts: RunOptions & {
     concurrency: number;
+    prompts?: ReadonlyMap<string, string>;
     targetSignals?: ReadonlyMap<string, AbortSignal>;
     runIds?: ReadonlyMap<string, string>;
     onResult?: (result: RunResult) => void;
@@ -120,7 +122,12 @@ export async function fanOut(
         if (s.aborted) abort();
       }
       try {
-        results[i] = await runOne(target, { ...opts, runId: opts.runIds?.get(target.id), signal: ctl.signal });
+        results[i] = await runOne(target, {
+          ...opts,
+          prompt: opts.prompts?.get(target.id) ?? opts.prompt,
+          runId: opts.runIds?.get(target.id),
+          signal: ctl.signal,
+        });
         opts.onResult?.(results[i]);
       } finally {
         for (const s of signals) s.removeEventListener('abort', abort);

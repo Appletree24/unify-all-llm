@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { synthesisFormatter } from '../../../src/core/synth.js';
 import type { ExecPreview, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
@@ -10,18 +10,25 @@ type CardKind = 'answer' | 'synthesis' | 'exec';
 /** When each call was first seen running, for elapsed-time labels. */
 const firstSeen = new Map<string, number>();
 
+export interface FollowUpChoice {
+  turnId: string;
+  targetId: string;
+  label: string;
+}
+
 export interface TurnActions {
   zoom(turnId: string, runId: string): void;
   exec(turnId: string, from?: string): void;
   retry(turnId: string, targetIds?: string[]): void;
   cancel(turnId: string): void;
   cancelTarget(turnId: string, targetId: string): void;
+  followUp?(choice?: FollowUpChoice): void;
 }
 
 // ── a single model's output ───────────────────────────────────────────────
-export function Card({ record, result, kind, showReasoning, activity, actions, zoomed }: {
+export function Card({ record, result, kind, showReasoning, activity, actions, zoomed, canFollowUp, followUpSelected }: {
   record: RunRecord; result: RunResultRecord; kind: CardKind; showReasoning: boolean;
-  activity?: Activity[]; actions: TurnActions; zoomed?: boolean;
+  activity?: Activity[]; actions: TurnActions; zoomed?: boolean; canFollowUp?: boolean; followUpSelected?: boolean;
 }) {
   const running = result.status === 'running';
   const now = useTicker(running);
@@ -45,6 +52,7 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
   const format = kind === 'synthesis' ? synthesisFormatter(record) : undefined;
   const text = format?.(result.text) ?? result.text;
   const reasoning = format?.(result.reasoning) ?? result.reasoning;
+  const tools = activity?.length ? activity : result.tools;
 
   return (
     <article className={`card ${kind} ${result.status}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
@@ -69,9 +77,9 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
             <div className="think-text">{reasoning}</div>
           </details>
         )}
-        {activity && activity.length > 0 && (
+        {tools && tools.length > 0 && (
           <ul className="tools">
-            {activity.slice(-40).map((a, i) => (
+            {tools.slice(-40).map((a, i) => (
               <li key={i}><Icon name="chevron" size={12} /><b>{a.name}</b>{a.detail && <span>{a.detail}</span>}</li>
             ))}
           </ul>
@@ -95,6 +103,15 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
           {kind === 'answer' && !running && !turnRunning && (
             <button title="只重新调用这个模型" onClick={() => actions.retry(record.id, [result.targetId])}><Icon name="retry" /></button>
           )}
+          {kind === 'answer' && result.ok && !turnRunning && canFollowUp && actions.followUp && (
+            <button
+              className={followUpSelected ? 'on' : undefined}
+              title={followUpSelected ? '已选为下轮追问上下文（再次点击恢复默认）' : '下轮追问沿用这个回答'}
+              onClick={() => actions.followUp!(followUpSelected ? undefined : { turnId: record.id, targetId: result.targetId, label })}
+            >
+              <Icon name="check" />
+            </button>
+          )}
           {kind === 'answer' && result.ok && !turnRunning && (
             <button title="按这个回答实施" onClick={() => actions.exec(record.id, result.targetId)}><Icon name="run" /></button>
           )}
@@ -106,8 +123,9 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
 }
 
 // ── one round: question, answers, synthesis ───────────────────────────────
-export function Turn({ record, notices, activity, showReasoning, actions }: {
+export function Turn({ record, notices, activity, showReasoning, actions, isLatestComparison, followUp }: {
   record: RunRecord; notices: string[]; activity: Record<string, Activity[]>; showReasoning: boolean; actions: TurnActions;
+  isLatestComparison?: boolean; followUp?: FollowUpChoice;
 }) {
   const active = isActive(record);
   const time = new Date(record.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
@@ -150,7 +168,14 @@ export function Turn({ record, notices, activity, showReasoning, actions }: {
       {notices.length > 0 && <div className="notices">{notices.map((m, i) => <div key={i}>{m}</div>)}</div>}
       {answers.length > 0 && (
         <div className={`answers n${n}`}>
-          {answers.map((r) => <Card key={r.runId} record={record} result={r} kind="answer" showReasoning={showReasoning} activity={activity[r.runId]} actions={actions} />)}
+          {answers.map((r) => (
+            <Card
+              key={r.runId} record={record} result={r} kind="answer" showReasoning={showReasoning}
+              activity={activity[r.runId]} actions={actions}
+              canFollowUp={isLatestComparison}
+              followUpSelected={followUp?.turnId === record.id && followUp.targetId === r.targetId}
+            />
+          ))}
         </div>
       )}
       {record.synthesis && <Card record={record} result={record.synthesis.result} kind="synthesis" showReasoning={showReasoning} actions={actions} />}
@@ -173,10 +198,79 @@ export function Turn({ record, notices, activity, showReasoning, actions }: {
 // ── composer ──────────────────────────────────────────────────────────────
 export interface ComposerState { selected: string[]; manual: boolean; synth: string }
 
-export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, autoFocusKey }: {
+function SynthesisPicker({ targets, defaultId, value, onChange }: {
+  targets: WorkspaceInfo['targets']; defaultId?: string; value: string; onChange(value: string): void;
+}) {
+  const menuId = useId();
+  const trigger = useRef<HTMLButtonElement>(null);
+  const defaultTarget = targets.find((target) => target.id === defaultId);
+  const choices = [
+    { value: '', label: '默认', detail: defaultTarget?.label, icon: 'spark' },
+    ...targets.map((target) => ({ value: target.id, label: target.label, detail: target.model, icon: undefined })),
+    { value: 'off', label: '不汇总', detail: undefined, icon: 'x' },
+  ];
+  const selected = choices.find((choice) => choice.value === value) ?? choices[0];
+  const triggerLabel = selected.value === 'off' ? selected.label : `汇总 · ${selected.value === '' ? defaultTarget?.label ?? selected.label : selected.label}`;
+
+  return (
+    <div className="synth-picker">
+      <button
+        ref={trigger} type="button" className="synth-trigger" popoverTarget={menuId} aria-haspopup="menu"
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+          event.preventDefault();
+          event.currentTarget.click();
+        }}
+      >
+        <Icon name="spark" size={13} />
+        <span>{triggerLabel}</span>
+        <Icon name="chevron" size={12} />
+      </button>
+      <div
+        id={menuId} popover="auto" role="menu" className="synth-popover" aria-label="汇总模型"
+        onToggle={(event) => {
+          if (event.currentTarget.matches(':popover-open')) {
+            event.currentTarget.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus();
+          }
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Tab') { event.currentTarget.hidePopover(); return; }
+          if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')];
+          const index = items.findIndex((item) => item === document.activeElement);
+          const step = event.key === 'ArrowUp' ? -1 : 1;
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + step + items.length) % items.length;
+          items[next]?.focus();
+        }}
+      >
+        {choices.map((choice) => {
+          const checked = choice === selected;
+          return (
+            <button
+              key={choice.value} type="button" role="menuitemradio" aria-checked={checked} tabIndex={-1}
+              className="synth-item" onClick={(event) => {
+                onChange(choice.value);
+                event.currentTarget.closest<HTMLElement>('[popover]')?.hidePopover();
+                trigger.current?.focus();
+              }}
+            >
+              {choice.icon ? <Icon name={choice.icon} size={14} /> : <i className="dot" style={{ '--h': hue(choice.value) } as CSSProperties} />}
+              <span className="synth-item-label"><strong>{choice.label}</strong>{choice.detail && <small>{choice.detail}</small>}</span>
+              {checked && <Icon name="check" size={14} />}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp }: {
   ws: WorkspaceInfo; quota: Map<string, TargetQuota>; busy: boolean;
   state: ComposerState; setState: (s: ComposerState) => void;
   onSend(text: string): Promise<boolean>; onCancel(): void; autoFocusKey: string;
+  followUp?: FollowUpChoice; onClearFollowUp?: () => void;
 }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -193,7 +287,6 @@ export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, a
   useEffect(() => { area.current?.focus(); }, [autoFocusKey]);
 
   const usable = ws.targets.filter((t) => t.installed !== false);
-  const unusable = ws.targets.filter((t) => t.installed === false);
   const count = state.selected.length;
   const toggle = (id: string) => {
     const on = state.selected.includes(id);
@@ -215,10 +308,16 @@ export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, a
 
   return (
     <div className="composer-wrap">
+      {followUp && (
+        <div className="followup-bar">
+          <span><Icon name="check" size={12} />下轮追问将沿用「<b>{followUp.label}</b>」的回答</span>
+          <button type="button" onClick={onClearFollowUp} title="恢复默认上下文"><Icon name="x" size={12} /></button>
+        </div>
+      )}
       <div className={`composer${busy ? ' busy' : ''}`}>
         <textarea
           ref={area} value={text} rows={1} spellCheck={false}
-          placeholder={count ? `向 ${count} 个模型提问…` : '先在下方选择至少一个模型'}
+          placeholder={count ? `向 ${count} 个模型提问…` : usable.length ? '先在下方选择至少一个模型' : undefined}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); }
@@ -252,21 +351,9 @@ export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, a
                 </button>
               );
             })}
-            {unusable.length > 0 && (
-              <span className="chip-more" title={`未安装或未登录：${unusable.map((t) => t.label).join('、')}\n在设置中接入官方 API，或安装对应 CLI`}>
-                +{unusable.length} 不可用
-              </span>
-            )}
           </div>
-          <label className="synth-select" title="多个回答成功后，由一个模型匿名汇总">
-            <Icon name="spark" size={13} />
-            <select value={state.synth} onChange={(e) => setState({ ...state, synth: e.target.value })}>
-              <option value="">汇总 · {ws.synthesizer ? ws.targets.find((t) => t.id === ws.synthesizer)?.label ?? ws.synthesizer : '默认'}</option>
-              {ws.targets.filter((t) => t.installed !== false).map((t) => <option key={t.id} value={t.id}>汇总 · {t.label}</option>)}
-              <option value="off">不汇总</option>
-            </select>
-            <Icon name="chevron" size={12} />
-          </label>
+          <SynthesisPicker targets={usable} defaultId={ws.synthesizer} value={state.synth}
+            onChange={(synth) => setState({ ...state, synth })} />
           {busy ? (
             <button type="button" className="send stop" onClick={onCancel} title="停止 (Esc)"><Icon name="stop" /></button>
           ) : (

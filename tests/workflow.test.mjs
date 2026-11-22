@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { startComparison, startExecution, selectPlan, chooseExecutor } from '../dist/core/workflow.js';
-import { listRunIds, loadRun, newRunId } from '../dist/core/store.js';
+import { historyAfter, listRunIds, loadRun, newRunId } from '../dist/core/store.js';
 import { parseConfig } from '../dist/core/config.js';
 import { buildRegistry } from '../dist/providers/index.js';
-import { synthesisFormatter } from '../dist/core/synth.js';
+import { extractFinalPlan, synthesisFormatter } from '../dist/core/synth.js';
 import { displaySynthesisEvents } from '../dist/ui/synthesis.js';
 import { aborted, deferred, target, workspace } from './helpers.mjs';
 
@@ -45,8 +45,8 @@ test('blind synthesis resolves shuffled references only for readers, including s
   let raw;
   const judge = target('judge', async function* ({ prompt }) {
     assert.doesNotMatch(prompt, /fast|deep|model-one|model-two/);
-    const red = /<answer id="([^"]+)">\n选红色/.exec(prompt)[1];
-    const blue = /<answer id="([^"]+)">\n选蓝色/.exec(prompt)[1];
+    const red = /<answer id="([^"]+)"[^>]*>\n选红色/.exec(prompt)[1];
+    const blue = /<answer id="([^"]+)"[^>]*>\n选蓝色/.exec(prompt)[1];
     raw = `单元格 A1。**${red}** 与${blue}不同。首选${red}`;
     for (const type of ['reasoning', 'delta']) for (const text of raw) yield { type, text };
     yield { type: 'done', text: raw };
@@ -64,7 +64,10 @@ test('blind synthesis resolves shuffled references only for readers, including s
   assert.equal(events.map((ev) => ev.text).join(''), expected.repeat(3));
   assert.equal(readFileSync(join(cwd, '.unify', 'runs', run.id, 'synthesis.md'), 'utf8'), expected + '\n');
   assert.equal(loadRun(cwd, run.id).synthesis.result.text, raw);
-  assert.equal(selectPlan(run).text, raw);
+  assert.equal(selectPlan(run).text, expected);
+  assert.equal(historyAfter(run)[0].answer, expected);
+  assert.equal(run.synthesis.alsoAnswered, false);
+  assert.equal(run.synthesis.fallback, undefined);
 });
 
 test('historical synthesis resolves only whole labels and distinguishes targets sharing a model', () => {
@@ -254,4 +257,228 @@ test('custom target configuration survives persistence and supports an unchanged
   assert.equal(stored.calls[0].target.configuration.system, 'system');
   const retry = await startComparison({ cwd, config, targets, question: '', retry: { record: stored, targetIds: ['local'] } }).done;
   assert.equal(retry.status, 'completed');
+});
+
+test('extractFinalPlan and selectPlan isolate final answer, resolve references, and handle fences/fallback', async (t) => {
+  const withFence = [
+    '## 共识',
+    '一致观点',
+    '## 分歧',
+    '拒绝方案 X',
+    '```markdown',
+    '## 最终答案',
+    '这不是标题，在代码块里',
+    '```',
+    '## 最终答案',
+    '采用 [ref:1] 的做法。',
+    '### 步骤 1',
+    '修改 core.ts',
+    '## 附注',
+    '额外说明',
+  ].join('\n');
+  assert.equal(extractFinalPlan(withFence), '采用 [ref:1] 的做法。\n### 步骤 1\n修改 core.ts');
+  assert.equal(extractFinalPlan('没有标题的纯文本'), '没有标题的纯文本');
+
+  const cwd = workspace(t);
+  const a = { ...target('a', async function* () { yield { type: 'done', text: '方案 A 原文' }; }), model: 'alpha-model' };
+  const b = { ...target('b', async function* () { yield { type: 'done', text: '方案 B 原文' }; }), model: 'beta-model' };
+  const judge = target('judge', async function* ({ prompt }) {
+    const aRef = /<answer id="([^"]+)"[^>]*>\n方案 A 原文/.exec(prompt)[1];
+    const bRef = /<answer id="([^"]+)"[^>]*>\n方案 B 原文/.exec(prompt)[1];
+    yield {
+      type: 'done',
+      text: `## 共识\n无\n\n## 分歧\n${aRef} 与 ${bRef} 意见相反，否决 ${bRef}\n\n## 独有亮点\n无\n\n## 最终答案\n按 ${aRef} 执行。\n### 验证\n运行测试`,
+    };
+  });
+  const run = await startComparison({
+    cwd, question: '选哪个方案', targets: [a, b, judge], selected: ['a', 'b'], config: { synthesizer: 'judge' },
+  }).done;
+
+  const synthPlan = selectPlan(run);
+  assert.equal(synthPlan.text, '按 alpha-model 执行。\n### 验证\n运行测试');
+  assert.doesNotMatch(synthPlan.text, /\[ref:\d+\]|否决|分歧/);
+
+  const directPlan = selectPlan(run, 'b');
+  assert.equal(directPlan.text, '方案 B 原文');
+});
+
+test('follow-up conversation inherits executed plan choice instead of rejected synthesis, and ignores cancelled execs', async (t) => {
+  const cwd = workspace(t);
+  const prompts = [];
+  const a = target('a', async function* (req) {
+    prompts.push(['a', req.prompt]);
+    yield { type: 'done', text: 'PLAN_A_DETAILS' };
+  });
+  const b = target('b', async function* (req) {
+    prompts.push(['b', req.prompt]);
+    yield { type: 'done', text: 'PLAN_B_DETAILS' };
+  });
+  const judge = target('judge', async function* ({ prompt }) {
+    const aRef = /<answer id="([^"]+)"[^>]*>\nPLAN_A_DETAILS/.exec(prompt)?.[1] ?? '[ref:1]';
+    yield { type: 'done', text: `## 分歧\n分歧说明\n## 最终答案\n推荐 ${aRef} 的 PLAN_A_DETAILS` };
+  });
+  const executor = target('worker', async function* (req) {
+    if (req.prompt.includes('PLAN_A_DETAILS')) {
+      yield { type: 'delta', text: 'starting...' };
+      await aborted(req.signal);
+    }
+    yield { type: 'done', text: '已按 B 完成改动，测试通过' };
+  }, { askPolicy: 'sandbox-read-only', exec: true });
+
+  const turn1 = await startComparison({
+    cwd, question: '重构缓存', targets: [a, b, judge], selected: ['a', 'b'], config: { synthesizer: 'judge' },
+  }).done;
+
+  // Execute B successfully
+  const execB = await startExecution({ cwd, config: {}, targets: [executor], source: turn1, from: 'b', executor }).done;
+  assert.equal(execB.status, 'completed');
+  assert.equal(execB.planSource.planText, 'PLAN_B_DETAILS');
+
+  // Later start an accidental execution on synthesis and immediately cancel it — should not override execB
+  const cancelledHandle = startExecution({ cwd, config: {}, targets: [executor], source: turn1, executor });
+  cancelledHandle.cancel();
+  const cancelledExec = await cancelledHandle.done;
+  assert.equal(cancelledExec.status, 'cancelled');
+
+  // Follow-up question continuing from turn1 must inherit B's plan and execution outcome, not A's synthesis
+  prompts.length = 0;
+  const turn2 = await startComparison({
+    cwd, question: '下一步优化什么', targets: [a, b, judge], selected: ['a', 'b'],
+    config: { synthesizer: 'judge' }, previous: turn1,
+  }).done;
+
+  assert.equal(turn2.parentTurnId, execB.id);
+  assert.equal(turn2.input.history.length, 1);
+  assert.match(turn2.input.history[0].answer, /PLAN_B_DETAILS/);
+  assert.match(turn2.input.history[0].answer, /已按 B 完成改动/);
+  assert.doesNotMatch(turn2.input.history[0].answer, /PLAN_A_DETAILS|\[ref:\d+\]/);
+  for (const [, prompt] of prompts) {
+    assert.match(prompt, /PLAN_B_DETAILS/);
+    assert.doesNotMatch(prompt, /PLAN_A_DETAILS|\[ref:\d+\]/);
+  }
+});
+
+test('tool events persist on run results and synthesizer fallback prefers repo-reading targets with metadata', async (t) => {
+  const cwd = workspace(t);
+  const apiTarget = target('api', async function* () {
+    yield { type: 'done', text: 'api answer' };
+  }, { askPolicy: 'text-only', exec: false });
+  const cliTarget = target('cli', async function* (req) {
+    if (req.prompt.startsWith('你是一名严谨')) {
+      yield { type: 'tool', name: 'Read', detail: 'src/core/workflow.ts' };
+      yield { type: 'done', text: '## 最终答案\n核实后的结论' };
+      return;
+    }
+    yield { type: 'tool', name: 'Grep', detail: 'selectPlan' };
+    yield { type: 'tool', name: 'Read', detail: '  src/core/store.ts  ' };
+    yield { type: 'done', text: 'cli answer' };
+  }, { askPolicy: 'read-tools', exec: true });
+  const unavailableSynth = target('claude', async function* () {
+    assert.fail('unavailable synthesizer must not run');
+  });
+  unavailableSynth.adapter.detect = async () => ({ installed: false });
+
+  const notices = [];
+  const run = await startComparison({
+    cwd, question: '检查实现', targets: [apiTarget, cliTarget, unavailableSynth],
+    selected: ['api', 'cli'], config: { synthesizer: 'claude' },
+    onEvent: (ev) => { if (ev.type === 'notice') notices.push(ev.message); },
+  }).done;
+
+  const stored = loadRun(cwd, run.id);
+  assert.deepEqual(stored.results.find((r) => r.targetId === 'cli').tools, [
+    { name: 'Grep', detail: 'selectPlan' },
+    { name: 'Read', detail: 'src/core/store.ts' },
+  ]);
+  assert.equal(stored.results.find((r) => r.targetId === 'api').tools, undefined);
+  // Fallback skipped text-only apiTarget and chose repo-reading cliTarget
+  assert.equal(stored.synthesis.provider, 'cli');
+  assert.equal(stored.synthesis.preferredProvider, 'claude');
+  assert.equal(stored.synthesis.fallback, true);
+  assert.equal(stored.synthesis.alsoAnswered, true);
+  assert.deepEqual(stored.synthesis.result.tools, [{ name: 'Read', detail: 'src/core/workflow.ts' }]);
+  assert.ok(notices.some((m) => m.includes('已回退') && m.includes('同时参与了答题')));
+});
+
+test('text-only targets and synthesizer receive referenced @files safely and anonymous evidence metadata', async (t) => {
+  const cwd = workspace(t);
+  mkdirSync(join(cwd, 'src'), { recursive: true });
+  writeFileSync(join(cwd, 'src', 'app.ts'), 'export const MAGIC_CONST = 42;\n');
+  writeFileSync(join(cwd, 'bin.dat'), Buffer.from([0, 1, 2, 3]));
+  // File outside workspace must never be read via path traversal
+  writeFileSync(join(cwd, '..', 'outside-secret.txt'), 'TOP_SECRET');
+
+  let cliPrompt = '';
+  let apiPrompt = '';
+  let synthPrompt = '';
+  const cli = target('cli', async function* (req) {
+    cliPrompt = req.prompt;
+    yield { type: 'tool', name: 'Read', detail: 'src/app.ts' };
+    yield { type: 'done', text: 'CLI 实读结论' };
+  }, { askPolicy: 'read-tools', exec: true });
+  const api = target('api', async function* (req) {
+    apiPrompt = req.prompt;
+    yield { type: 'done', text: 'API 结合附带文件结论' };
+  }, { askPolicy: 'text-only', exec: false });
+  const synth = target('judge', async function* (req) {
+    synthPrompt = req.prompt;
+    yield { type: 'done', text: '## 最终答案\n综合结论' };
+  }, { askPolicy: 'text-only', exec: false });
+
+  const notices = [];
+  const run = await startComparison({
+    cwd,
+    question: '请检查 @src/app.ts 和 @bin.dat 以及 @../outside-secret.txt',
+    targets: [cli, api, synth],
+    selected: ['cli', 'api'],
+    config: { synthesizer: 'judge' },
+    onEvent: (ev) => { if (ev.type === 'notice') notices.push(ev.message); },
+  }).done;
+
+  assert.equal(run.status, 'completed');
+  // CLI already has workspace read access, so its prompt stays lean
+  assert.doesNotMatch(cliPrompt, /<attached_file/);
+  // text-only API receives the inlined text file, skips binary and traversal
+  assert.match(apiPrompt, /<attached_file path="src\/app\.ts">[\s\S]*MAGIC_CONST = 42/);
+  assert.doesNotMatch(apiPrompt, /<attached_file path="bin\.dat"|TOP_SECRET/);
+  // text-only synthesizer also receives the shared file and anonymous evidence attributes
+  assert.match(synthPrompt, /<attached_file path="src\/app\.ts">[\s\S]*MAGIC_CONST = 42/);
+  assert.match(synthPrompt, /evidence="可查阅本地仓库；实际调用：Read\(src\/app\.ts\)"/);
+  assert.match(synthPrompt, /evidence="纯文本对话（已附带提问引用的 1 个本地文件，未自行查阅仓库其他文件）"/);
+  assert.doesNotMatch(synthPrompt, /\bcli\b|\bapi\b/);
+  assert.ok(notices.some((m) => m.includes('src/app.ts')));
+});
+
+test('continueFrom lets follow-up turns inherit a specific answer and validates unknown targets', async (t) => {
+  const cwd = workspace(t);
+  let nextPrompt = '';
+  const a = target('a', async function* (req) {
+    nextPrompt = req.prompt;
+    yield { type: 'done', text: 'ANSWER_A_ONLY' };
+  });
+  const b = target('b', async function* () {
+    yield { type: 'done', text: 'ANSWER_B_CHOSEN' };
+  });
+  const judge = target('judge', async function* () {
+    yield { type: 'done', text: '## 最终答案\nSYNTH_PREFERS_A' };
+  });
+
+  const turn1 = await startComparison({
+    cwd, question: '第一问', targets: [a, b, judge], selected: ['a', 'b'], config: { synthesizer: 'judge' },
+  }).done;
+
+  assert.throws(
+    () => startComparison({ cwd, question: '无效沿用', targets: [a, b], selected: ['a'], config: {}, previous: turn1, continueFrom: 'missing' }),
+    /没有来自「missing」的可用回答/,
+  );
+
+  const turn2 = await startComparison({
+    cwd, question: '第二问', targets: [a, b], selected: ['a'], config: {}, previous: turn1, continueFrom: 'b',
+  }).done;
+
+  assert.equal(turn2.input.history.length, 1);
+  assert.match(turn2.input.history[0].answer, /ANSWER_B_CHOSEN/);
+  assert.doesNotMatch(turn2.input.history[0].answer, /SYNTH_PREFERS_A/);
+  assert.match(nextPrompt, /ANSWER_B_CHOSEN/);
+  assert.doesNotMatch(nextPrompt, /SYNTH_PREFERS_A/);
 });

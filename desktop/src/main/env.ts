@@ -1,14 +1,23 @@
 import { execFile } from 'node:child_process';
-import { delimiter } from 'node:path';
+import { existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 
-/**
- * Apps launched from the Dock or a desktop launcher on macOS/Linux get a minimal PATH,
- * so model CLIs installed via npm, Homebrew or nvm would look "not installed".
- * Borrow the PATH of the user's login shell once at startup. Windows GUI apps already
- * inherit the user's PATH.
- */
-export function adoptLoginShellPath(): Promise<void> {
-  if (process.platform === 'win32') return Promise.resolve();
+/** Make locally installed model CLIs discoverable before probing providers. */
+export function prepareProviderPath(): Promise<void> {
+  if (process.platform === 'win32') {
+    const { LOCALAPPDATA, PATH } = process.env;
+    if (LOCALAPPDATA) {
+      // A launcher started before agy was installed can inherit an older PATH.
+      const agyBin = join(LOCALAPPDATA, 'agy', 'bin');
+      const paths = PATH ? PATH.split(delimiter) : [];
+      if (existsSync(join(agyBin, 'agy.exe')) && !paths.some((entry) => entry.toLowerCase() === agyBin.toLowerCase())) {
+        process.env.PATH = [...paths, agyBin].join(delimiter);
+      }
+    }
+    return Promise.resolve();
+  }
+
+  // Desktop launchers on macOS and Linux can start with a shorter PATH than the login shell.
   const shell = process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/sh');
   const marker = '__UNIFY_PATH__';
   return new Promise((done) => {

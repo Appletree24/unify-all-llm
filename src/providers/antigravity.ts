@@ -1,5 +1,6 @@
 import { probeVersion, runJsonl } from '../core/proc.js';
 import type { ProviderAdapter } from '../core/types.js';
+import { readAntigravityQuota } from '../quota/antigravity.js';
 
 /** Google AI subscriptions authenticate through the independently installed agy CLI. */
 export const geminiPro: ProviderAdapter = {
@@ -8,6 +9,7 @@ export const geminiPro: ProviderAdapter = {
   defaultModel: 'gemini-4-neon-medium',
   autoSelect: false,
   capabilities: { askPolicy: 'provider-plan', exec: false },
+  readQuota: readAntigravityQuota,
   async detect(signal) {
     const version = await probeVersion('agy', signal);
     return { installed: !!version, version };

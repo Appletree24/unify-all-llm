@@ -33,6 +33,7 @@ ask 选项:
   -s, --synth id                 汇总目标
       --no-synth                跳过汇总
   -c, --continue                继续最近一次问答，保留公共对话历史
+      --from id                 配合 -c 使用：沿用上一轮中指定目标（或 synthesis）的回答
       --reasoning               显示汇总思考过程
       --json                    输出带 turnId/callId 的 JSONL 事件
       --timeout 秒              单次模型调用超时（默认 600）
@@ -111,10 +112,11 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
     args: argv, allowPositionals: true,
     options: {
       models: { type: 'string', short: 'm' }, synth: { type: 'string', short: 's' }, 'no-synth': { type: 'boolean' },
-      continue: { type: 'boolean', short: 'c' }, reasoning: { type: 'boolean' }, json: { type: 'boolean' },
+      continue: { type: 'boolean', short: 'c' }, from: { type: 'string' }, reasoning: { type: 'boolean' }, json: { type: 'boolean' },
       timeout: { type: 'string' }, concurrency: { type: 'string' }, target: { type: 'string' },
     },
   });
+  if (values.from && !values.continue) throw new Error('--from 需要与 -c/--continue 一起使用');
   const config = parseConfig({
     ...loadConfig(cwd),
     ...(values.synth ? { synthesizer: values.synth } : {}),
@@ -131,6 +133,7 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
       cwd, config, targets, question, selected: values.models?.split(',').map((s) => s.trim()),
       manualSelection: !!values.models, synthesize: !values['no-synth'],
       previous: values.continue ? latestComparison(cwd) : undefined,
+      continueFrom: values.continue ? values.from : undefined,
       retry: original ? { record: original, targetIds: values.target?.split(',').map((s) => s.trim()) ?? original.targets.filter((t) => !original.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id) } : undefined,
       signal: abort.signal, onEvent: values.json ? view.event : displaySynthesisEvents(view.event),
     });

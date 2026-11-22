@@ -3,11 +3,12 @@ import { hostname } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config.js';
 import { timeoutMillis } from './config.js';
+import { attachContextToPrompt, resolveSharedFileContext } from './context.js';
 import { buildDecisionPrompt, parseDecision } from './decider.js';
 import { fanOut, runOne } from './orchestrator.js';
-import { createRun, exportRun, historyAfter, newRunId, saveRun, type CallRecord, type PlanSource, type RunRecord } from './store.js';
-import { anonymize, buildConversationPrompt, buildExecPrompt, buildSynthesisPrompt } from './synth.js';
-import { snapshotTarget, type ModelTarget, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
+import { createRun, exportRun, historyAfter, latestExecutionFor, newRunId, saveRun, type CallRecord, type PlanSource, type RunRecord } from './store.js';
+import { anonymize, buildConversationPrompt, buildExecPrompt, buildSynthesisPrompt, extractFinalPlan, synthesisFormatter } from './synth.js';
+import { appendToolUse, snapshotTarget, type ModelTarget, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
 import { defaultTargetIds, detectTargets } from './targets.js';
 
 type Scope = CallRecord['scope'];
@@ -31,6 +32,7 @@ export interface ComparisonOptions extends CommonOptions {
   manualSelection?: boolean;
   synthesize?: boolean;
   previous?: RunRecord;
+  continueFrom?: string;
   retry?: { record: RunRecord; targetIds: string[] };
 }
 export interface WorkflowHandle {
@@ -85,15 +87,31 @@ class Journal {
   event(call: CallRecord, event: ProviderEvent): void {
     if (event.type === 'delta') call.result.text += event.text;
     else if (event.type === 'reasoning') call.result.reasoning += event.text;
+    else if (event.type === 'tool') appendToolUse(call.result, event);
     else if (event.type === 'done') Object.assign(call.result, { text: event.text, status: 'succeeded', ok: true, usage: event.usage });
     else if (event.type === 'error') Object.assign(call.result, { error: event.message, status: event.status ?? 'failed', ok: false });
     this.checkpoint(event.type === 'done' || event.type === 'error');
     this.emit({ type: 'provider', turnId: this.record.id, callId: call.id, targetId: call.target.id, scope: call.scope, event });
   }
-  async one(target: ModelTarget, scope: Scope, prompt: string, timeoutMs: number, labels: Record<string, string> = {}): Promise<CallRecord> {
+  async one(
+    target: ModelTarget,
+    scope: Scope,
+    prompt: string,
+    timeoutMs: number,
+    synthesisMeta?: { labels: Record<string, string>; preferredProvider?: string; fallback?: boolean; alsoAnswered?: boolean },
+  ): Promise<CallRecord> {
     const call = this.prepare(target, scope, prompt, timeoutMs);
     if (scope === 'exec') this.record.results.push(call.result);
-    if (scope === 'synthesis') this.record.synthesis = { provider: target.id, labels, result: call.result };
+    if (scope === 'synthesis') {
+      this.record.synthesis = {
+        provider: target.id,
+        labels: synthesisMeta?.labels ?? {},
+        result: call.result,
+        ...(synthesisMeta?.preferredProvider ? { preferredProvider: synthesisMeta.preferredProvider } : {}),
+        ...(synthesisMeta?.fallback !== undefined ? { fallback: synthesisMeta.fallback } : {}),
+        ...(synthesisMeta?.alsoAnswered !== undefined ? { alsoAnswered: synthesisMeta.alsoAnswered } : {}),
+      };
+    }
     this.checkpoint();
     this.assertWritable();
     this.begin(call);
@@ -127,12 +145,19 @@ class Journal {
   }
 }
 
-function initialRecord(opts: CommonOptions, question: string, previous?: RunRecord): RunRecord {
+function initialRecord(opts: CommonOptions, question: string, previous?: RunRecord, continueFrom?: string): RunRecord {
   const id = newRunId();
-  const history = previous ? historyAfter(previous) : [];
+  if (continueFrom && previous?.kind === 'comparison') {
+    const ok = continueFrom === 'synthesis'
+      ? !!(previous.synthesis?.result.ok && previous.synthesis.result.text.trim())
+      : previous.results.some((r) => r.targetId === continueFrom && r.ok && r.text.trim());
+    if (!ok) throw new Error(`上一轮中没有来自「${continueFrom}」的可用回答`);
+  }
+  const followUp = !continueFrom && previous?.kind === 'comparison' ? latestExecutionFor(opts.cwd, previous) : undefined;
+  const history = previous ? historyAfter(previous, followUp, continueFrom) : [];
   const now = new Date().toISOString();
   return {
-    schemaVersion: 2, kind: 'comparison', id, sessionId: previous?.sessionId ?? id, parentTurnId: previous?.id,
+    schemaVersion: 2, kind: 'comparison', id, sessionId: previous?.sessionId ?? id, parentTurnId: followUp?.id ?? previous?.id,
     createdAt: now, updatedAt: now, question, input: { cwd: opts.cwd, prompt: buildConversationPrompt(history, question), history },
     owner: { pid: process.pid, hostname: hostname() },
     targets: [], status: 'created', results: [], calls: [],
@@ -143,7 +168,7 @@ function initialRecord(opts: CommonOptions, question: string, previous?: RunReco
 export function startComparison(opts: ComparisonOptions): WorkflowHandle {
   const question = opts.retry?.record.question ?? opts.question.trim();
   if (!question) throw new Error('问题不能为空');
-  const record = initialRecord(opts, question, opts.previous);
+  const record = initialRecord(opts, question, opts.retry ? undefined : opts.previous, opts.retry ? undefined : opts.continueFrom);
   if (opts.retry) {
     if (opts.retry.record.kind !== 'comparison') throw new Error('实施记录不能自动重试');
     record.input = structuredClone(opts.retry.record.input);
@@ -194,15 +219,28 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     }
     if (journal.ctl.signal.aborted) return;
     record.targets = targets.map(snapshotTarget);
+    const hasTextOnly = targets.some((t) => t.adapter.capabilities.askPolicy === 'text-only')
+      || (synthesize && opts.targets.some((t) => t.id === (opts.config.synthesizer ?? 'claude') && t.adapter.capabilities.askPolicy === 'text-only'));
+    const shared = hasTextOnly ? resolveSharedFileContext(opts.cwd, record.question) : { text: '', files: [], skipped: [] };
+    if (shared.files.length) {
+      const skipNote = shared.skipped.length ? `（跳过 ${shared.skipped.length} 个）` : '';
+      journal.emit({ type: 'notice', turnId: record.id, message: `已为纯文本模型附带引用文件: ${shared.files.join('、')}${skipNote}` });
+    }
     journal.stage('answering', targets);
     const timeoutMs = timeoutMillis(opts.config.timeoutSec ?? 600);
-    const calls = new Map(targets.map((t) => [t.id, journal.prepare(t, 'answer', record.input.prompt, timeoutMs)]));
+    const prompts = new Map(targets.map((t) => [
+      t.id,
+      shared.text && t.adapter.capabilities.askPolicy === 'text-only'
+        ? attachContextToPrompt(record.input.prompt, shared.text)
+        : record.input.prompt,
+    ]));
+    const calls = new Map(targets.map((t) => [t.id, journal.prepare(t, 'answer', prompts.get(t.id)!, timeoutMs)]));
     record.results = targets.map((t) => calls.get(t.id)!.result);
     journal.checkpoint();
     journal.assertWritable();
     for (const call of calls.values()) journal.begin(call);
     await fanOut(targets, {
-      prompt: record.input.prompt, cwd: opts.cwd, mode: 'ask', timeoutMs, concurrency: opts.config.concurrency ?? 3,
+      prompt: record.input.prompt, prompts, cwd: opts.cwd, mode: 'ask', timeoutMs, concurrency: opts.config.concurrency ?? 3,
       signal: journal.ctl.signal, targetSignals: new Map([...controls].map(([id, c]) => [id, c.signal])),
       runIds: new Map([...calls].map(([id, c]) => [id, c.id])),
       onEvent: (id, event) => journal.event(calls.get(id)!, event),
@@ -210,14 +248,39 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     });
     journal.assertWritable();
     if (journal.ctl.signal.aborted) return;
-    const answers = anonymize(record.results);
+    const answers = anonymize(record.results, record.targets, shared.files);
     if (!synthesize || answers.length < 2) return;
-    const preferred = opts.targets.find((t) => t.id === (opts.config.synthesizer ?? 'claude'));
-    const synth = preferred && available.get(preferred.id) ? preferred : targets.find((t) => record.results.some((r) => r.targetId === t.id && r.ok))!;
-    if (synth !== preferred) journal.emit({ type: 'notice', turnId: record.id, message: `汇总使用 ${synth.label}` });
+    const preferredId = opts.config.synthesizer ?? 'claude';
+    const preferred = opts.targets.find((t) => t.id === preferredId);
+    const answeringIds = new Set(record.results.filter((r) => r.ok).map((r) => r.targetId));
+    const okTargets = targets.filter((t) => answeringIds.has(t.id));
+    const fallbackTarget = okTargets.find((t) => t.adapter.capabilities.askPolicy !== 'text-only') ?? okTargets[0]!;
+    const fallback = !(preferred && available.get(preferred.id));
+    const synth = fallback ? fallbackTarget : preferred!;
+    const alsoAnswered = answeringIds.has(synth.id);
+    if (fallback) {
+      journal.emit({
+        type: 'notice', turnId: record.id,
+        message: `汇总使用 ${synth.label}（${preferred?.label ?? preferredId} 不可用，已回退${alsoAnswered ? '；同时参与了答题' : ''}）`,
+      });
+    }
     journal.stage('synthesizing', [synth]);
     const labels = Object.fromEntries(answers.map((a) => [a.label, a.provider]));
-    await journal.one(synth, 'synthesis', buildSynthesisPrompt(record.input.prompt, answers), timeoutMs, labels);
+    const synthCanInspect = synth.adapter.capabilities.askPolicy !== 'text-only';
+    await journal.one(
+      synth,
+      'synthesis',
+      buildSynthesisPrompt(record.input.prompt, answers, {
+        canInspectWorkspace: synthCanInspect,
+        sharedContext: !synthCanInspect ? shared.text : undefined,
+      }),
+      timeoutMs,
+      {
+        labels,
+        ...(fallback ? { preferredProvider: preferredId, fallback: true } : {}),
+        alsoAnswered,
+      },
+    );
   }));
   return {
     record, done, cancel: () => journal.ctl.abort(),
@@ -239,9 +302,15 @@ export function selectPlan(record: RunRecord, targetId?: string): { source: Plan
   const result = targetId ? record.results.find((r) => r.targetId === targetId && r.ok) :
     record.synthesis?.result.ok ? record.synthesis.result : record.results.filter((r) => r.ok).length === 1 ? record.results.find((r) => r.ok) : undefined;
   if (!result?.text.trim()) throw new Error('没有可用方案，请用 --from 或聚焦面板明确选择一个成功回答');
+  const isSynthesis = result === record.synthesis?.result;
+  const text = isSynthesis ? synthesisFormatter(record)(extractFinalPlan(result.text)) : result.text;
   return {
-    source: { turnId: record.id, runId: result.runId, targetId: result.targetId, scope: result === record.synthesis?.result ? 'synthesis' : 'answer' },
-    question: record.question, text: result.text,
+    source: {
+      turnId: record.id, runId: result.runId, targetId: result.targetId,
+      scope: isSynthesis ? 'synthesis' : 'answer',
+      planText: text,
+    },
+    question: record.question, text,
   };
 }
 

@@ -11,13 +11,15 @@ export interface ProcOptions {
   cwd: string;
   stdin?: string;
   signal?: AbortSignal;
+  nativeExecutable?: boolean;
 }
 
 /** POSIX children own a process group; cancellation includes inherited-pipe descendants. */
 function start(cmd: string, args: string[], opts: ProcOptions, interactive = false) {
   opts.signal?.throwIfAborted();
-  if (isWin && ![cmd, ...args].every((a) => SAFE_ARG.test(a))) throw new Error('Windows shell 参数包含不支持的字符');
-  const child = spawn(cmd, args, { cwd: opts.cwd, shell: isWin, detached: !isWin, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const shell = isWin && !opts.nativeExecutable;
+  if (shell && ![cmd, ...args].every((a) => SAFE_ARG.test(a))) throw new Error('Windows shell 参数包含不支持的字符');
+  const child = spawn(cmd, args, { cwd: opts.cwd, shell, detached: !isWin, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   let stderr = '';
   let closed = false;
   let failure: Error | undefined;
@@ -129,7 +131,7 @@ export async function* runText(cmd: string, args: string[], opts: ProcOptions): 
   }
 }
 
-async function capture(cmd: string, args: string[], signal?: AbortSignal): Promise<string | undefined> {
+async function capture(cmd: string, args: string[], signal?: AbortSignal, options?: Pick<ProcOptions, 'nativeExecutable'>): Promise<string | undefined> {
   const ctl = new AbortController();
   const abort = () => ctl.abort();
   signal?.addEventListener('abort', abort, { once: true });
@@ -137,7 +139,7 @@ async function capture(cmd: string, args: string[], signal?: AbortSignal): Promi
   const timer = setTimeout(() => ctl.abort(), 15000);
   try {
     let out = '';
-    for await (const chunk of runText(cmd, args, { cwd: process.cwd(), signal: ctl.signal })) out = (out + chunk).slice(-4000);
+    for await (const chunk of runText(cmd, args, { ...options, cwd: process.cwd(), signal: ctl.signal })) out = (out + chunk).slice(-4000);
     return out.trim().split(/\r?\n/)[0] || undefined;
   } catch {
     return undefined; // Detection is advisory; execution reports transport failures.
@@ -147,5 +149,5 @@ async function capture(cmd: string, args: string[], signal?: AbortSignal): Promi
   }
 }
 
-export const probeVersion = (cmd: string, signal?: AbortSignal) => capture(cmd, ['--version'], signal);
+export const probeVersion = (cmd: string, signal?: AbortSignal, options?: Pick<ProcOptions, 'nativeExecutable'>) => capture(cmd, ['--version'], signal, options);
 export const commandExists = async (cmd: string, signal?: AbortSignal) => (await capture(isWin ? 'where' : 'which', [cmd], signal)) !== undefined;
