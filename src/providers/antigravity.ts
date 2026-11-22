@@ -1,4 +1,4 @@
-import { openJsonl, probeVersion, runJsonl } from '../core/proc.js';
+import { openJsonl, probeVersion } from '../core/proc.js';
 import type { InteractionOption, InteractionQuestion, ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
 import { readAntigravityQuota } from '../quota/antigravity.js';
 import type { BinaryTarget } from './codex.js';
@@ -121,73 +121,56 @@ export function createAntigravityAdapter(bin: BinaryTarget = DEFAULT_AGY_BIN): P
       const args = ['--mode', 'plan', '--disable-slash-commands', '--input-format', 'stream-json', '--output-format', 'stream-json'];
       if (req.model) args.push('--model', req.model);
 
-      if (req.interact) {
-        const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...args], {
-          cwd: req.cwd,
-          signal: req.signal,
-          nativeExecutable: bin.nativeExecutable,
-        });
-        session.send({ event: 'user', message: { content: req.prompt } });
-        try {
-          for await (const ev of session.events) {
-            if (await handleAgyInteraction(ev, req.interact, (v) => session.send(v))) continue;
-            if (ev.event === 'step_update') {
-              const step = ev.step_update;
-              if (step?.step_type === 'agent_response' && typeof step.text_delta === 'string') {
-                yield { type: 'delta', text: step.text_delta };
-              } else if (step?.step_type === 'tool' && step.tool_name && step.state === 'ACTIVE') {
-                yield { type: 'tool', name: String(step.tool_name) };
-              }
-            } else if (ev.event === 'result') {
-              const result = ev.result;
-              if (result?.status !== 'SUCCESS' || typeof result.response !== 'string') {
-                throw new Error(String(result?.error || 'Antigravity 未返回成功回答'));
-              }
-              yield {
-                type: 'done',
-                text: result.response,
-                usage: {
-                  inputTokens: result.usage?.input_tokens,
-                  outputTokens: result.usage?.output_tokens,
-                },
-              };
-              break;
-            }
-          }
-        } finally {
-          await session.close();
-        }
-        return;
-      }
-
-      const stdin = JSON.stringify({ event: 'user', message: { content: req.prompt } }) + '\n';
-      for await (const ev of runJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...args], {
+      const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...args], {
         cwd: req.cwd,
         signal: req.signal,
-        stdin,
         nativeExecutable: bin.nativeExecutable,
-      })) {
-        if (ev.event === 'step_update') {
-          const step = ev.step_update;
-          if (step?.step_type === 'agent_response' && typeof step.text_delta === 'string') {
-            yield { type: 'delta', text: step.text_delta };
-          } else if (step?.step_type === 'tool' && step.tool_name && step.state === 'ACTIVE') {
-            yield { type: 'tool', name: String(step.tool_name) };
+      });
+      const ask = (content: string) => session.send({ event: 'user', message: { content } });
+      const interact = req.interact;
+      let receivedText = false;
+      let askedForAnswer = false;
+      let finished = false;
+      try {
+        ask(req.prompt);
+        for await (const ev of session.events) {
+          if (finished) throw new Error('Antigravity 在结束后继续发送事件');
+          if (interact && await handleAgyInteraction(ev, interact, (value) => session.send(value))) continue;
+          if (ev.event === 'step_update') {
+            const step = ev.step_update;
+            if (step?.step_type === 'agent_response' && typeof step.text_delta === 'string') {
+              receivedText ||= !!step.text_delta.trim();
+              yield { type: 'delta', text: step.text_delta };
+            } else if (step?.step_type === 'tool' && step.tool_name && step.state === 'ACTIVE') {
+              yield { type: 'tool', name: String(step.tool_name) };
+            }
+          } else if (ev.event === 'result') {
+            const result = ev.result;
+            if (result?.status !== 'SUCCESS' || typeof result.response !== 'string') {
+              throw new Error(String(result?.error || 'Antigravity 未返回成功回答'));
+            }
+            const response = result.response.trim() ? result.response : '';
+            if (!response && !receivedText) {
+              if (askedForAnswer) throw new Error('Antigravity 补答后仍未返回回答正文');
+              askedForAnswer = true;
+              // Headless plan runs can end successfully after a denied tool call, without a response.
+              ask('上轮已经结束。请直接根据已取得的信息，在这条回复中给出原问题的答案或具体实施步骤。不要再次调用工具、写入文件或请求确认。');
+              continue;
+            }
+            finished = true;
+            session.endInput();
+            yield {
+              type: 'done',
+              text: response,
+              usage: {
+                inputTokens: result.usage?.input_tokens,
+                outputTokens: result.usage?.output_tokens,
+              },
+            };
           }
-        } else if (ev.event === 'result') {
-          const result = ev.result;
-          if (result?.status !== 'SUCCESS' || typeof result.response !== 'string') {
-            throw new Error(String(result?.error || 'Antigravity 未返回成功回答'));
-          }
-          yield {
-            type: 'done',
-            text: result.response,
-            usage: {
-              inputTokens: result.usage?.input_tokens,
-              outputTokens: result.usage?.output_tokens,
-            },
-          };
         }
+      } finally {
+        await session.close();
       }
     },
   };

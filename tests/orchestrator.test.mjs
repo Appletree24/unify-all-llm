@@ -9,6 +9,7 @@ test('only an explicit success plus clean transport completion succeeds', async 
     ['success', async function* () { yield { type: 'delta', text: 'part' }; yield { type: 'done', text: 'final' }; }, 'succeeded', 'final'],
     ['truncated', async function* () { yield { type: 'delta', text: 'part' }; }, 'failed', 'part'],
     ['empty', async function* () {}, 'failed', ''],
+    ['empty success', async function* () { yield { type: 'done', text: ' ' }; }, 'failed', ' '],
     ['late failure', async function* () { yield { type: 'done', text: 'part' }; throw new Error('exit 2'); }, 'failed', 'part'],
     ['duplicate terminal', async function* () { yield { type: 'done', text: 'part' }; yield { type: 'done', text: 'again' }; }, 'failed', 'part'],
     ['upstream failure', async function* () { yield { type: 'delta', text: 'part' }; yield { type: 'error', message: 'upstream' }; }, 'failed', 'part'],

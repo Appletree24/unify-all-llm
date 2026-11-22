@@ -337,6 +337,54 @@ process.stdout.write(JSON.stringify({ type: 'result', status: 'success', stats: 
     });
   });
 
+  it('Antigravity requests a single follow-up in the same session when tools finish without an answer', async () => {
+    await withTempDir(async (cwd) => {
+      const fixture = join(cwd, 'agy-empty-answer.mjs');
+      writeFileSync(fixture, `
+import assert from 'node:assert/strict';
+import { createInterface } from 'node:readline';
+const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+const send = (event) => process.stdout.write(JSON.stringify(event) + '\\n');
+let scenario;
+for await (const line of lines) {
+  const { message: { content } } = JSON.parse(line);
+  if (!scenario) {
+    scenario = content;
+    send({ event: 'step_update', step_update: { step_type: 'tool', state: 'ACTIVE', tool_name: 'read_file' } });
+    if (scenario === 'streamed') send({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'streamed answer' } });
+    send({ event: 'result', result: { status: 'SUCCESS', response: ' ' } });
+  } else {
+    assert.notEqual(scenario, 'streamed');
+    assert.match(content, /不要再次调用工具/);
+    const response = scenario === 'empty' ? '' : 'recovered answer';
+    send({ event: 'result', result: { status: 'SUCCESS', response, usage: { output_tokens: 21 } } });
+    if (scenario === 'late failure') process.exitCode = 2;
+  }
+}
+`);
+      const adapter = createAntigravityAdapter({ cmd: process.execPath, prefixArgs: [fixture], nativeExecutable: true });
+      const run = (prompt) => runOne({ id: adapter.id, adapter }, { cwd, mode: 'ask', prompt, timeoutMs: 5000 });
+
+      const recovered = await run('recover');
+      assert.equal(recovered.status, 'succeeded');
+      assert.equal(recovered.text, 'recovered answer');
+      assert.equal(recovered.usage.outputTokens, 21);
+      assert.deepEqual(recovered.tools.map((tool) => tool.name), ['read_file']);
+
+      const streamed = await run('streamed');
+      assert.equal(streamed.status, 'succeeded');
+      assert.equal(streamed.text, 'streamed answer');
+
+      const empty = await run('empty');
+      assert.equal(empty.status, 'failed');
+      assert.match(empty.error, /未返回回答正文/);
+
+      const failed = await run('late failure');
+      assert.equal(failed.status, 'failed');
+      assert.match(failed.error, /退出码 2/);
+    });
+  });
+
   it('Antigravity (agy) and custom interactive command bridge mid-turn interactions cleanly', async () => {
     await withTempDir(async (cwd) => {
       const agyFixture = join(cwd, 'agy-mock.mjs');

@@ -103,6 +103,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
       if (stopped || ctl.signal.aborted) return;
       if (!terminal) throw new Error('模型输出被截断：缺少协议终态');
       if (terminal.type === 'error') throw new Error(terminal.message);
+      if (opts.mode === 'ask' && !res.text.trim()) throw new Error('模型已结束，但没有返回回答正文');
       res.status = 'succeeded';
       res.ok = true;
     } catch (err) {

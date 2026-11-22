@@ -1,13 +1,15 @@
 import { appendFileSync } from 'node:fs';
 import { basename } from 'node:path';
+import { createInterface } from 'node:readline';
 
 const name = basename(process.argv[1]).replace(/\.(?:cmd|mjs)$/, '');
 if (process.env.UNIFY_TEST_LOG) appendFileSync(process.env.UNIFY_TEST_LOG, JSON.stringify({ name, args: process.argv.slice(2) }) + '\n');
 if (process.argv.includes('--version')) {
   process.stdout.write('fixture-1.0\n');
 } else {
-  let prompt = '';
-  for await (const chunk of process.stdin) prompt += chunk;
+  if (name !== 'agy') {
+    for await (const chunk of process.stdin) { /* Wait for the caller to finish writing. */ }
+  }
   const emit = (event) => process.stdout.write(JSON.stringify(event) + '\n');
   const scenario = process.env.UNIFY_TEST_SCENARIO;
   const modelFlag = process.argv.findIndex((a) => a === '-m' || a === '--model');
@@ -31,12 +33,19 @@ if (process.argv.includes('--version')) {
     emit({ type: 'message', role: 'assistant', content: answer });
     if (scenario !== 'truncate') emit({ type: 'result', status: 'success', stats: { input_tokens: 3, output_tokens: 5 } });
   } else if (name === 'agy') {
-    const { event, message } = JSON.parse(prompt);
-    if (event !== 'user' || typeof message.content !== 'string') throw new Error('invalid stdin');
-    const text = message.content.includes('CHAT_TWO') && message.content.includes('CHAT_ONE') ? 'remembered' : answer;
-    emit({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: text } });
-    if (scenario === 'signed-out') emit({ event: 'result', result: { status: 'ERROR', error: 'authentication required' } });
-    else if (scenario !== 'truncate') emit({ event: 'result', result: { status: 'SUCCESS', response: text, usage: { input_tokens: 3, output_tokens: 5 } } });
+    const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+    for await (const line of lines) {
+      const { event, message } = JSON.parse(line);
+      if (event !== 'user' || typeof message.content !== 'string') throw new Error('invalid stdin');
+      const text = message.content.includes('CHAT_TWO') && message.content.includes('CHAT_ONE') ? 'remembered' : answer;
+      emit({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: text } });
+      if (scenario === 'signed-out') emit({ event: 'result', result: { status: 'ERROR', error: 'authentication required' } });
+      else if (scenario !== 'truncate') emit({ event: 'result', result: { status: 'SUCCESS', response: text, usage: { input_tokens: 3, output_tokens: 5 } } });
+      if (scenario === 'signed-out' || scenario === 'truncate') {
+        process.stdin.destroy();
+        break;
+      }
+    }
   }
   if (scenario === 'late-failure') process.exitCode = 2;
 }

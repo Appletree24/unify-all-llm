@@ -203,7 +203,10 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
   record: RunRecord; result: RunResultRecord; kind: CardKind; showReasoning: boolean;
   activity?: Activity[]; interactions?: PendingInteractionItem[]; actions: TurnActions; zoomed?: boolean; canFollowUp?: boolean; followUpSelected?: boolean;
 }) {
-  const running = result.status === 'running';
+  const emptyAnswer = kind !== 'exec' && result.ok && !result.text.trim();
+  const status = emptyAnswer ? 'failed' : result.status;
+  const error = result.error ?? (emptyAnswer ? '模型已结束，但没有返回回答正文' : undefined);
+  const running = status === 'running';
   const needsInput = !!interactions?.length;
   const now = useTicker(running);
   if (running && !firstSeen.has(result.runId)) firstSeen.set(result.runId, Date.now());
@@ -229,16 +232,16 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
   const tools = activity?.length ? activity : result.tools;
 
   return (
-    <article className={`card ${kind} ${result.status}${needsInput ? ' needs-input' : ''}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
+    <article className={`card ${kind} ${status}${needsInput ? ' needs-input' : ''}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
       <header>
         {kind === 'synthesis' ? <span className="mark"><Icon name="spark" size={14} /></span> : kind === 'exec' ? <span className="mark"><Icon name="run" size={14} /></span> : <i className="dot" />}
         <div className="who">
           <b>{label}</b>
           {meta && <span className="model">{meta}</span>}
         </div>
-        <span className={`status ${needsInput ? 'waiting-input' : result.status}`}>
+        <span className={`status ${needsInput ? 'waiting-input' : status}`}>
           {needsInput ? <Icon name="alert" size={12} /> : running ? <Spinner /> : null}
-          {needsInput ? '等待交互' : running ? seconds(elapsed) : `${statusText[result.status]}${result.durationMs ? ` · ${seconds(result.durationMs)}` : ''}`}
+          {needsInput ? '等待交互' : running ? seconds(elapsed) : `${statusText[status]}${result.durationMs ? ` · ${seconds(result.durationMs)}` : ''}`}
         </span>
       </header>
       <div
@@ -282,11 +285,11 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
           <div className="skeleton"><i /><i /><i /></div>
         ) : result.text ? (
           <Markdown text={text} />
-        ) : !running && !result.error ? <p className="empty">没有输出</p> : null}
+        ) : !running && !error ? <p className="empty">没有输出</p> : null}
         {interactions && actions.respondInteraction && interactions.map((item) => (
           <InteractionPrompt key={item.request.id} item={item} onRespond={actions.respondInteraction!} />
         ))}
-        {result.error && <div className="error"><Icon name="alert" size={14} /><span>{result.error}</span></div>}
+        {error && <div className="error"><Icon name="alert" size={14} /><span>{error}</span></div>}
       </div>
       <footer>
         <span className="usage">
@@ -321,7 +324,7 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
           {kind === 'answer' && !running && !turnRunning && (
             <button title="只重新调用这个模型" onClick={() => actions.retry(record.id, [result.targetId])}><Icon name="retry" /></button>
           )}
-          {kind === 'answer' && result.ok && !turnRunning && canFollowUp && actions.followUp && (
+          {kind === 'answer' && result.ok && !emptyAnswer && !turnRunning && canFollowUp && actions.followUp && (
             <button
               className={followUpSelected ? 'on' : undefined}
               title={followUpSelected ? '已选为下轮追问上下文（再次点击恢复默认）' : '下轮追问沿用这个回答'}
@@ -330,7 +333,7 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
               <Icon name="check" />
             </button>
           )}
-          {kind === 'answer' && result.ok && !turnRunning && (
+          {kind === 'answer' && result.ok && !emptyAnswer && !turnRunning && (
             <button title="按这个回答实施" onClick={() => actions.exec(record.id, result.targetId)}><Icon name="run" /></button>
           )}
           <button title={zoomed ? '退出放大 (Esc)' : '放大阅读'} onClick={() => actions.zoom(record.id, zoomed ? '' : result.runId)}><Icon name={zoomed ? 'shrink' : 'expand'} /></button>
