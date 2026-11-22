@@ -16,7 +16,7 @@ export const customSchema = z.discriminatedUnion('type', [
     }, '需要不含凭证、查询参数或片段的 HTTP(S) URL'),
     model: text, apiKeyEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(), system: z.string().optional(),
   }),
-  z.strictObject({ type: z.literal('command'), label: text.optional(), command: text, args: z.array(z.string()).optional() }),
+  z.strictObject({ type: z.literal('command'), label: text.optional(), command: text, args: z.array(z.string()).optional(), interactive: z.boolean().optional() }),
 ]);
 const memorySchema = z.strictObject({
   projectSource: z.enum(['auto', 'AGENTS.md', 'CLAUDE.md', '.unify/memory.md', 'off']).optional(),

@@ -1,12 +1,13 @@
 // The contract between the Electron main process and the renderer. Types only.
 import type { Config, ReasoningEffort } from '../../../src/core/config.js';
+import type { InteractionOption, InteractionQuestion, InteractionRequest, InteractionResponse, PendingInteraction } from '../../../src/core/types.js';
 import type { RunRecord } from '../../../src/core/store.js';
 import type { ModelTestState } from '../../../src/core/model-tests.js';
 import type { TargetQuota } from '../../../src/quota/types.js';
 import type { QuotaNotice } from '../../../src/quota/reminders.js';
 import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult } from '../../../src/memory/distill.js';
 
-export type { Config, DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult, QuotaNotice, ReasoningEffort, RunRecord, TargetQuota };
+export type { Config, DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult, InteractionOption, InteractionQuestion, InteractionRequest, InteractionResponse, PendingInteraction, QuotaNotice, ReasoningEffort, RunRecord, TargetQuota };
 export type RunResultRecord = RunRecord['results'][number];
 export type CallRecord = RunRecord['calls'][number];
 
@@ -110,6 +111,8 @@ export interface SettingsInfo {
 export type Push =
   | { type: 'run'; record: RunRecord }
   | { type: 'activity'; turnId: string; runId: string; name: string; detail?: string }
+  | { type: 'interaction'; turnId: string; callId: string; scope: CallRecord['scope']; targetId: string; targetLabel: string; request: PendingInteraction }
+  | { type: 'interaction-resolved'; turnId: string; callId: string; interactionId: string }
   | { type: 'notice'; turnId: string; message: string }
   | { type: 'end'; turnId: string; sessionId: string; status: RunRecord['status'] }
   | { type: 'quota'; cwd: string; quotas: TargetQuota[] }
@@ -131,6 +134,7 @@ export interface UnifyApi {
   retry(turnId: string, targetIds?: string[]): Promise<{ turnId: string; sessionId: string }>;
   cancel(turnId: string): Promise<void>;
   cancelTarget(turnId: string, targetId: string): Promise<boolean>;
+  respondInteraction(turnId: string, interactionId: string, response: InteractionResponse): Promise<boolean>;
   previewExec(turnId: string, from?: string, executor?: string): Promise<ExecPreview>;
   exec(turnId: string, from: string | undefined, executor: string): Promise<{ turnId: string; sessionId: string }>;
   quota(force?: boolean): Promise<TargetQuota[]>;

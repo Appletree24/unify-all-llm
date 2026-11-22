@@ -17,7 +17,7 @@ import { buildRegistry } from '../../../src/providers/index.js';
 import { targetModelIds, modelIds } from '../../../src/providers/models.js';
 import { officialApis, readApiProfile, saveApiProfile } from '../../../src/providers/official.js';
 import { QUOTA_REFRESH_MS, readTargetQuotas, type TargetQuota } from '../../../src/quota/index.js';
-import { SESSION_TITLE_LIMIT, type AskRequest, type ExecPreview, type Push, type SessionChanges, type SessionSummary, type SettingsInfo, type TargetInfo, type WorkspaceInfo } from '../shared/api.js';
+import { SESSION_TITLE_LIMIT, type AskRequest, type ExecPreview, type InteractionResponse, type Push, type SessionChanges, type SessionSummary, type SettingsInfo, type TargetInfo, type WorkspaceInfo } from '../shared/api.js';
 
 const ACTIVE = new Set<RunRecord['status']>(['created', 'deciding', 'answering', 'synthesizing']);
 const SESSION_BUSY = '这个对话还有请求在进行，请等待完成或先取消';
@@ -255,6 +255,24 @@ export class Workspace {
         if (e.event.type === 'tool') this.push({ type: 'activity', turnId: e.turnId, runId: e.callId, name: e.event.name, detail: e.event.detail });
         if (e.event.type === 'done' || e.event.type === 'error') flush();
         else timer ??= setTimeout(flush, PUSH_INTERVAL_MS);
+      } else if (e.type === 'interaction') {
+        this.push({
+          type: 'interaction',
+          turnId: e.turnId,
+          callId: e.callId,
+          scope: e.scope,
+          targetId: e.targetId,
+          targetLabel: e.targetLabel,
+          request: e.request,
+        });
+        flush();
+      } else if (e.type === 'interaction-resolved') {
+        this.push({
+          type: 'interaction-resolved',
+          turnId: e.turnId,
+          callId: e.callId,
+          interactionId: e.interactionId,
+        });
       } else {
         if (e.type === 'notice') this.push({ type: 'notice', turnId: e.turnId, message: e.message });
         flush();
@@ -293,7 +311,7 @@ export class Workspace {
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected,
       manualSelection: req.manual, synthesize: req.synthesize, previous, continueFrom: req.continueFrom,
-      memoryUpdates: req.memoryUpdates, onEvent,
+      memoryUpdates: req.memoryUpdates, interactive: true, onEvent,
     }));
   }
 
@@ -307,7 +325,7 @@ export class Workspace {
     if (!ids.length) throw new Error('没有需要重试的目标');
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config: this.cfg, targets: this.targets, question: '',
-      retry: { record: original, targetIds: ids }, onEvent,
+      retry: { record: original, targetIds: ids }, interactive: true, onEvent,
     }));
   }
 
@@ -317,6 +335,10 @@ export class Workspace {
 
   cancelTarget(turnId: string, targetId: string): boolean {
     return this.handles.get(turnId)?.cancelTarget(targetId) ?? false;
+  }
+
+  respondInteraction(turnId: string, interactionId: string, response: InteractionResponse): boolean {
+    return this.handles.get(turnId)?.respondInteraction(interactionId, response) ?? false;
   }
 
   async previewExec(turnId: string, from?: string, executorId?: string): Promise<ExecPreview> {
@@ -347,7 +369,7 @@ export class Workspace {
     if (!source) throw new Error(`找不到记录 ${turnId}`);
     this.assertSessionIdle(source.sessionId);
     const executor = chooseExecutor(this.targets, executorId, this.installed);
-    return this.start((onEvent) => startExecution({ cwd: this.cwd, config: this.cfg, targets: this.targets, executor, source, from, onEvent }));
+    return this.start((onEvent) => startExecution({ cwd: this.cwd, config: this.cfg, targets: this.targets, executor, source, from, interactive: true, onEvent }));
   }
 
   // ── quota, settings, memory ────────────────────────────────────────────

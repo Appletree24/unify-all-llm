@@ -8,7 +8,7 @@ import { buildDecisionPrompt, parseDecision } from './decider.js';
 import { fanOut, runOne } from './orchestrator.js';
 import { createRun, exportRun, historyAfter, latestExecutionFor, newRunId, saveRun, type CallRecord, type PlanSource, type RunRecord } from './store.js';
 import { anonymize, buildApiMessages, buildConversationPrompt, buildExecPrompt, buildSynthesisInput, buildSynthesisInstructions, buildSynthesisPrompt, buildTurnUserContent, extractFinalPlan, synthesisFormatter } from './synth.js';
-import { appendToolUse, snapshotTarget, type ChatMessage, type ModelTarget, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
+import { appendToolUse, snapshotTarget, type ChatMessage, type InteractionHandler, type InteractionRequest, type InteractionResponse, type ModelTarget, type PendingInteraction, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
 import { defaultTargetIds, detectTargets } from './targets.js';
 import { memoryReportMarker, requestMemoryReport } from '../memory/report.js';
 import { canReceiveUserMemory, formatMemoryUpdateDelta, formatSharedMemoryPrompt, resolveSharedMemory, saveMemorySnapshots, type MemorySnapshot, type ResolvedSharedMemory } from '../memory/shared.js';
@@ -18,6 +18,8 @@ export type WorkflowEvent =
   | { type: 'stage'; turnId: string; stage: RunRecord['status']; targets: TargetSnapshot[] }
   | { type: 'call'; turnId: string; callId: string; scope: Scope; target: TargetSnapshot }
   | { type: 'provider'; turnId: string; callId: string; scope: Scope; targetId: string; event: ProviderEvent }
+  | { type: 'interaction'; turnId: string; callId: string; scope: Scope; targetId: string; targetLabel: string; request: PendingInteraction }
+  | { type: 'interaction-resolved'; turnId: string; callId: string; interactionId: string }
   | { type: 'notice'; turnId: string; message: string }
   | { type: 'end'; turnId: string; status: RunRecord['status'] };
 
@@ -26,6 +28,10 @@ interface CommonOptions {
   home?: string;
   config: Config;
   targets: ModelTarget[];
+  /** Enable bidirectional mid-turn approval/user-input events (used by Desktop & interactive TTY). */
+  interactive?: boolean;
+  /** Optional direct handler (used by interactive CLI TTY) instead of handle.respondInteraction(). */
+  onInteract?: (info: { turnId: string; callId: string; targetId: string; targetLabel: string; request: PendingInteraction }) => Promise<InteractionResponse>;
   signal?: AbortSignal;
   onEvent?: (event: WorkflowEvent, record: RunRecord) => void;
 }
@@ -45,6 +51,7 @@ export interface WorkflowHandle {
   done: Promise<RunRecord>;
   cancel(): void;
   cancelTarget(id: string): boolean;
+  respondInteraction(interactionId: string, response: InteractionResponse): boolean;
 }
 
 const REDACTED_USER_MEMORY_SYSTEM = '[user-memory-snapshot-redacted]';
@@ -94,11 +101,71 @@ class Journal {
   private writeError?: Error;
   private lastWrite = 0;
   private readonly liveMessages = new Map<string, ChatMessage[]>();
-  private readonly abort = () => this.ctl.abort();
+  private readonly pendingInteractions = new Map<string, { callId: string; resolve: (res: InteractionResponse) => void }>();
+  private readonly abort = () => {
+    this.cancelAllInteractions();
+    this.ctl.abort();
+  };
   constructor(readonly record: RunRecord, private opts: CommonOptions) {
     createRun(opts.cwd, record);
     opts.signal?.addEventListener('abort', this.abort, { once: true });
     if (opts.signal?.aborted) this.abort();
+  }
+  cancelAllInteractions(): void {
+    for (const [id, entry] of [...this.pendingInteractions.entries()]) {
+      this.pendingInteractions.delete(id);
+      entry.resolve({ cancelled: true });
+      this.emit({ type: 'interaction-resolved', turnId: this.record.id, callId: entry.callId, interactionId: id });
+    }
+  }
+  cancelInteractionsForCall(callId: string): void {
+    for (const [id, entry] of [...this.pendingInteractions.entries()]) {
+      if (entry.callId !== callId) continue;
+      this.pendingInteractions.delete(id);
+      entry.resolve({ cancelled: true });
+      this.emit({ type: 'interaction-resolved', turnId: this.record.id, callId, interactionId: id });
+    }
+  }
+  respondInteraction(interactionId: string, response: InteractionResponse): boolean {
+    const entry = this.pendingInteractions.get(interactionId);
+    if (!entry) return false;
+    this.pendingInteractions.delete(interactionId);
+    entry.resolve(response);
+    this.emit({ type: 'interaction-resolved', turnId: this.record.id, callId: entry.callId, interactionId });
+    return true;
+  }
+  interactorFor(call: CallRecord, targetSignal?: AbortSignal): InteractionHandler | undefined {
+    if (!this.opts.interactive && !this.opts.onInteract) return undefined;
+    return async (rawReq: InteractionRequest): Promise<InteractionResponse> => {
+      if (this.ctl.signal.aborted || targetSignal?.aborted) return { cancelled: true };
+      const request: PendingInteraction = { ...rawReq, id: rawReq.id ?? randomUUID() };
+      if (this.opts.onInteract) {
+        return this.opts.onInteract({
+          turnId: this.record.id, callId: call.id, targetId: call.target.id, targetLabel: call.target.label, request,
+        });
+      }
+      return await new Promise<InteractionResponse>((resolve) => {
+        const onAbort = () => {
+          if (!this.pendingInteractions.delete(request.id)) return;
+          resolve({ cancelled: true });
+          this.emit({ type: 'interaction-resolved', turnId: this.record.id, callId: call.id, interactionId: request.id });
+        };
+        const cleanup = () => {
+          this.ctl.signal.removeEventListener('abort', onAbort);
+          targetSignal?.removeEventListener('abort', onAbort);
+        };
+        this.pendingInteractions.set(request.id, {
+          callId: call.id,
+          resolve: (res) => { cleanup(); resolve(res); },
+        });
+        this.ctl.signal.addEventListener('abort', onAbort, { once: true });
+        targetSignal?.addEventListener('abort', onAbort, { once: true });
+        this.emit({
+          type: 'interaction', turnId: this.record.id, callId: call.id, scope: call.scope,
+          targetId: call.target.id, targetLabel: call.target.label, request,
+        });
+      });
+    };
   }
   emit(event: WorkflowEvent): void {
     try { this.opts.onEvent?.(event, this.record); }
@@ -195,6 +262,7 @@ class Journal {
       ...call.input,
       messages: this.messagesFor(call.id),
       memoryReportMarker: call.input.memoryReportMarker,
+      interact: this.interactorFor(call),
       runId: call.id, signal: this.ctl.signal, onEvent: (_id, event) => this.event(call, event),
     }));
     this.checkpoint();
@@ -214,6 +282,7 @@ class Journal {
       this.record.error = err instanceof Error ? err.message : String(err);
       throw err;
     } finally {
+      this.cancelAllInteractions();
       this.opts.signal?.removeEventListener('abort', this.abort);
       this.checkpoint();
       this.assertWritable();
@@ -408,17 +477,20 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     const prompts = new Map([...calls].map(([id, call]) => [id, call.input.prompt]));
     const messagesByTarget = new Map<string, ChatMessage[]>();
     const reportMarkers = new Map<string, string>();
+    const interactionsByTarget = new Map<string, InteractionHandler>();
     for (const [id, call] of calls) {
       const m = journal.messagesFor(call.id);
       if (m) messagesByTarget.set(id, m);
       if (call.input.memoryReportMarker) reportMarkers.set(id, call.input.memoryReportMarker);
+      const interactor = journal.interactorFor(call, controls.get(id)?.signal);
+      if (interactor) interactionsByTarget.set(id, interactor);
     }
     record.results = targets.map((t) => calls.get(t.id)!.result);
     journal.checkpoint();
     journal.assertWritable();
     for (const call of calls.values()) journal.begin(call);
     await fanOut(targets, {
-      prompt: record.input.prompt, prompts, messagesByTarget, reportMarkers, cwd: opts.cwd, mode: 'ask', timeoutMs, concurrency: opts.config.concurrency ?? 3,
+      prompt: record.input.prompt, prompts, messagesByTarget, reportMarkers, interactionsByTarget, cwd: opts.cwd, mode: 'ask', timeoutMs, concurrency: opts.config.concurrency ?? 3,
       signal: journal.ctl.signal, targetSignals: new Map([...controls].map(([id, c]) => [id, c.signal])),
       runIds: new Map([...calls].map(([id, c]) => [id, c.id])),
       onEvent: (id, event) => journal.event(calls.get(id)!, event),
@@ -505,15 +577,17 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     );
   }));
   return {
-    record, done, cancel: () => journal.ctl.abort(),
+    record, done, cancel: () => { journal.cancelAllInteractions(); journal.ctl.abort(); },
     cancelTarget(id) {
       if (record.status !== 'answering') return false;
       const c = controls.get(id);
       const result = record.results.find((r) => r.targetId === id);
       if (!c || result?.status !== 'running') return false;
+      journal.cancelInteractionsForCall(result.runId);
       c.abort();
       return true;
     },
+    respondInteraction: (interactionId, response) => journal.respondInteraction(interactionId, response),
   };
 }
 
@@ -560,5 +634,10 @@ export function startExecution(opts: CommonOptions & { source: RunRecord; from?:
     journal.stage('answering', [opts.executor]);
     await journal.one(opts.executor, 'exec', record.input.prompt, timeoutMillis(opts.config.execTimeoutSec ?? 3600));
   }));
-  return { record, done, cancel: () => journal.ctl.abort(), cancelTarget: () => false };
+  return {
+    record, done,
+    cancel: () => { journal.cancelAllInteractions(); journal.ctl.abort(); },
+    cancelTarget: () => false,
+    respondInteraction: (interactionId, response) => journal.respondInteraction(interactionId, response),
+  };
 }

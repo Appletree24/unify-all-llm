@@ -6,6 +6,7 @@ import { loadConfig, parseConfig, timeoutMillis } from './core/config.js';
 import { latestComparison, listRunIds, loadRun, type RunRecord } from './core/store.js';
 import { synthesisFormatter } from './core/synth.js';
 import { detectTargets } from './core/targets.js';
+import type { InteractionResponse, PendingInteraction } from './core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent } from './core/workflow.js';
 import { formatMemoryReferences } from './memory/report.js';
 import { defaultContext, effectiveContext, scanMemory } from './memory/scan.js';
@@ -108,7 +109,72 @@ function renderer(json: boolean, reasoning = false) {
             } else if (event.type === 'notice') process.stdout.write(dim(event.message) + '\n');
             else if (event.type === 'end') process.stdout.write(dim(`已保存: ${event.turnId} · ${event.status}`) + '\n');
         },
+        pause() { view?.stop(); },
+        resume() { view?.start(); },
         stop() { view?.stop(); },
+    };
+}
+
+/**
+ * Serialized TTY prompt handler so concurrent models never interleave terminal questions.
+ */
+function createCliInteractor(view: ReturnType<typeof renderer>, signal: AbortSignal) {
+    let queue: Promise<void> = Promise.resolve();
+    return (info: { targetLabel: string; request: PendingInteraction }): Promise<InteractionResponse> => {
+        const run = async (): Promise<InteractionResponse> => {
+            if (signal.aborted) return { cancelled: true };
+            view.pause();
+            const rl = createInterface({ input: process.stdin, output: process.stdout });
+            try {
+                const { request } = info;
+                process.stdout.write(`\n${bold(`[需要交互 · ${info.targetLabel}] ${request.title}`)}${request.tool ? dim(` (${request.tool})`) : ''}\n`);
+                if (request.detail) process.stdout.write(`${dim(request.detail)}\n`);
+
+                if (request.kind === 'approval') {
+                    const options = request.options?.length
+                        ? request.options
+                        : [{ id: 'accept', label: '允许' }, { id: 'decline', label: '拒绝' }];
+                    options.forEach((o, i) => process.stdout.write(`  ${i + 1}. ${o.label}${o.description ? dim(` — ${o.description}`) : ''}\n`));
+                    const ans = (await rl.question(`请选择 [1-${options.length}]（回车默认拒绝，q 中止）: `, { signal })).trim();
+                    if (!ans) return { optionId: options.find((o) => o.tone === 'danger')?.id ?? options[options.length - 1].id };
+                    if (ans.toLowerCase() === 'q') return { cancelled: true };
+                    const idx = Number(ans) - 1;
+                    if (Number.isInteger(idx) && idx >= 0 && idx < options.length) return { optionId: options[idx].id };
+                    const byId = options.find((o) => o.id.toLowerCase() === ans.toLowerCase());
+                    return { optionId: byId?.id ?? options[options.length - 1].id };
+                }
+
+                if (request.kind === 'question' && request.questions?.length) {
+                    const answers: Record<string, string[]> = {};
+                    for (const q of request.questions) {
+                        process.stdout.write(`\n${q.header ? `${bold(q.header)}: ` : ''}${q.question}\n`);
+                        if (q.options?.length) {
+                            q.options.forEach((o, i) => process.stdout.write(`  ${i + 1}. ${o.label}${o.description ? dim(` — ${o.description}`) : ''}\n`));
+                            const raw = (await rl.question(`输入编号${q.allowOther ? '或自定义回答' : ''}（留空跳过）: `, { signal })).trim();
+                            if (!raw) { answers[q.id] = []; continue; }
+                            const idx = Number(raw) - 1;
+                            if (Number.isInteger(idx) && idx >= 0 && idx < q.options.length) answers[q.id] = [q.options[idx].label];
+                            else answers[q.id] = [raw];
+                        } else {
+                            const raw = (await rl.question('请输入回答: ', { signal })).trim();
+                            answers[q.id] = raw ? [raw] : [];
+                        }
+                    }
+                    return { answers };
+                }
+
+                const text = await rl.question(`${request.placeholder || '请输入内容'}（留空取消）: `, { signal });
+                return text.trim() ? { text } : { cancelled: true };
+            } catch {
+                return { cancelled: true };
+            } finally {
+                rl.close();
+                if (!signal.aborted) view.resume();
+            }
+        };
+        const result = queue.then(run, run);
+        queue = result.then(() => undefined, () => undefined);
+        return result;
     };
 }
 
@@ -133,6 +199,8 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
     const question = original?.question ?? (positionals.join(' ') || await readStdin()).trim();
     if (abort.signal.aborted) return signalExit;
     const view = renderer(values.json === true, values.reasoning === true);
+    const canInteract = process.stdin.isTTY && process.stdout.isTTY && !values.json;
+    const onInteract = canInteract ? createCliInteractor(view, abort.signal) : undefined;
     try {
         const handle = startComparison({
             cwd, config, targets, question, selected: values.models?.split(',').map((s) => s.trim()),
@@ -140,6 +208,7 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
             previous: values.continue ? latestComparison(cwd) : undefined,
             continueFrom: values.continue ? values.from : undefined,
             retry: original ? { record: original, targetIds: values.target?.split(',').map((s) => s.trim()) ?? original.targets.filter((t) => !original.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id) } : undefined,
+            interactive: canInteract, onInteract,
             signal: abort.signal, onEvent: values.json ? view.event : displaySynthesisEvents(view.event),
         });
         const run = await handle.done;
@@ -169,8 +238,10 @@ async function cmdExec(argv: string[]): Promise<number> {
     }
     if (abort.signal.aborted) return signalExit;
     const view = renderer(false);
+    const canInteract = process.stdin.isTTY && process.stdout.isTTY;
+    const onInteract = canInteract ? createCliInteractor(view, abort.signal) : undefined;
     try {
-        const result = await startExecution({ cwd, config, targets, executor, source: run, from: values.from, signal: abort.signal, onEvent: (e) => view.event(e) }).done;
+        const result = await startExecution({ cwd, config, targets, executor, source: run, from: values.from, interactive: canInteract, onInteract, signal: abort.signal, onEvent: (e) => view.event(e) }).done;
         return result.results[0]?.ok ? 0 : 1;
     } finally { view.stop(); }
 }

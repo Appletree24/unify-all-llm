@@ -1,5 +1,5 @@
-import { commandExists, runText } from '../core/proc.js';
-import type { ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
+import { commandExists, openText, runText } from '../core/proc.js';
+import type { InteractionRequest, ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
 import { z } from 'zod';
 import type { CustomProviderConfig } from '../core/config.js';
 import { httpEffort } from './effort.js';
@@ -113,6 +113,8 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
   };
 }
 
+const INTERACT_PREFIX = '__UNIFY_INTERACT__:';
+
 function commandAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'command' }>): ProviderAdapter {
   return {
     id,
@@ -122,6 +124,48 @@ function commandAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'co
       return { installed: await commandExists(c.command, signal) };
     },
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
+      if (c.interactive && req.interact) {
+        const session = openText(c.command, c.args ?? [], { cwd: req.cwd, signal: req.signal });
+        session.write(req.prompt + '\n');
+        let acc = '';
+        let buf = '';
+        try {
+          for await (const chunk of session.chunks) {
+            buf += chunk;
+            let nl: number;
+            while ((nl = buf.indexOf('\n')) !== -1) {
+              const rawLine = buf.slice(0, nl);
+              buf = buf.slice(nl + 1);
+              const trimmed = rawLine.replace(/\r$/, '');
+              if (trimmed.startsWith(INTERACT_PREFIX)) {
+                const payload = JSON.parse(trimmed.slice(INTERACT_PREFIX.length)) as InteractionRequest;
+                const response = await req.interact(payload);
+                session.write(JSON.stringify(response) + '\n');
+              } else {
+                const line = rawLine + '\n';
+                acc += line;
+                yield { type: 'delta', text: line };
+              }
+            }
+          }
+          if (buf) {
+            const trimmed = buf.replace(/\r$/, '');
+            if (trimmed.startsWith(INTERACT_PREFIX)) {
+              const payload = JSON.parse(trimmed.slice(INTERACT_PREFIX.length)) as InteractionRequest;
+              const response = await req.interact(payload);
+              session.write(JSON.stringify(response) + '\n');
+            } else {
+              acc += buf;
+              yield { type: 'delta', text: buf };
+            }
+          }
+        } finally {
+          await session.close();
+        }
+        yield { type: 'done', text: acc.trim() };
+        return;
+      }
+
       let acc = '';
       for await (const chunk of runText(c.command, c.args ?? [], { cwd: req.cwd, stdin: req.prompt, signal: req.signal })) {
         acc += chunk;

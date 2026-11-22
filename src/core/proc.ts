@@ -104,6 +104,74 @@ export async function* runJsonl(cmd: string, args: string[], opts: ProcOptions):
   yield* readJsonl(start(cmd, args, opts));
 }
 
+export interface JsonlSession {
+  events: AsyncGenerator<Record<string, any>>;
+  send(value: object): void;
+  endInput(): void;
+  close(): Promise<void>;
+}
+
+/**
+ * Open a bidirectional JSONL process keeping stdin open for mid-turn requests,
+ * approvals, and user-input replies.
+ */
+export function openJsonl(cmd: string, args: string[], opts: ProcOptions): JsonlSession {
+  const proc = start(cmd, args, opts, true);
+  return {
+    events: readJsonl(proc),
+    send(value: object) {
+      if (!proc.child.stdin.destroyed && proc.child.stdin.writable) {
+        proc.child.stdin.write(JSON.stringify(value) + '\n');
+      }
+    },
+    endInput() {
+      if (!proc.child.stdin.destroyed && proc.child.stdin.writable) {
+        proc.child.stdin.end();
+      }
+    },
+    close() {
+      return proc.cleanup();
+    },
+  };
+}
+
+export interface TextSession {
+  chunks: AsyncGenerator<string>;
+  write(text: string): void;
+  endInput(): void;
+  close(): Promise<void>;
+}
+
+/** Open a bidirectional text process keeping stdin open for interactive custom commands. */
+export function openText(cmd: string, args: string[], opts: ProcOptions): TextSession {
+  const proc = start(cmd, args, opts, true);
+  async function* readChunks(): AsyncGenerator<string> {
+    try {
+      proc.child.stdout.setEncoding('utf8');
+      for await (const chunk of proc.child.stdout) yield String(chunk);
+      await proc.finish();
+    } finally {
+      await proc.cleanup();
+    }
+  }
+  return {
+    chunks: readChunks(),
+    write(text: string) {
+      if (!proc.child.stdin.destroyed && proc.child.stdin.writable) {
+        proc.child.stdin.write(text, 'utf8');
+      }
+    },
+    endInput() {
+      if (!proc.child.stdin.destroyed && proc.child.stdin.writable) {
+        proc.child.stdin.end();
+      }
+    },
+    close() {
+      return proc.cleanup();
+    },
+  };
+}
+
 /** Keep stdin open for a control request. The first matching reply ends the exchange. */
 export async function requestJsonl<T>(
   cmd: string, args: string[], opts: ProcOptions, request: object,

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { collectMemoryReport } from '../memory/report.js';
-import { appendToolUse, type ChatMessage, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
+import { appendToolUse, type ChatMessage, type InteractionHandler, type InteractionRequest, type InteractionResponse, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
 
 export interface RunOptions {
   prompt: string;
@@ -12,6 +12,7 @@ export interface RunOptions {
   cleanupMs?: number;
   runId?: string;
   signal?: AbortSignal;
+  interact?: InteractionHandler;
   onEvent?: (targetId: string, ev: ProviderEvent) => void;
 }
 
@@ -40,7 +41,34 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
   const onAbort = () => cancel('cancelled');
   opts.signal?.addEventListener('abort', onAbort, { once: true });
   if (opts.signal?.aborted) onAbort();
-  const timer = setTimeout(() => cancel('timed_out'), opts.timeoutMs);
+  let remainingMs = opts.timeoutMs;
+  let timerStarted = Date.now();
+  let timer: NodeJS.Timeout | undefined = setTimeout(() => cancel('timed_out'), remainingMs);
+  let waitingUsers = 0;
+  const pauseTimer = () => {
+    if (waitingUsers++ === 0 && timer) {
+      clearTimeout(timer);
+      timer = undefined;
+      remainingMs = Math.max(1000, remainingMs - (Date.now() - timerStarted));
+    }
+  };
+  const resumeTimer = () => {
+    if (waitingUsers > 0 && --waitingUsers === 0 && !stopped && !ctl.signal.aborted) {
+      timerStarted = Date.now();
+      timer = setTimeout(() => cancel('timed_out'), remainingMs);
+    }
+  };
+  const interact: InteractionHandler | undefined = opts.interact
+    ? async (request: InteractionRequest): Promise<InteractionResponse> => {
+      if (ctl.signal.aborted) return { cancelled: true };
+      pauseTimer();
+      try {
+        return await opts.interact!(request);
+      } finally {
+        resumeTimer();
+      }
+    }
+    : undefined;
   const emit = (ev: ProviderEvent) => {
     try { opts.onEvent?.(target.id, ev); }
     catch (err) { (res.observerErrors ??= []).push(message(err)); }
@@ -53,6 +81,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
         prompt: opts.prompt,
         ...(opts.messages ? { messages: opts.messages } : {}),
         cwd: opts.cwd, mode: opts.mode, model: target.model, reasoningEffort: target.reasoningEffort, signal: ctl.signal,
+        ...(interact ? { interact } : {}),
       });
       for await (const ev of collectMemoryReport(events, res.runId, opts.prompt, opts.memoryReportMarker)) {
         if (stopped || ctl.signal.aborted) break;
@@ -91,7 +120,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
     }
   } finally {
     stopped = true;
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     opts.signal?.removeEventListener('abort', onAbort);
   }
   res.durationMs = Date.now() - started;
@@ -110,6 +139,7 @@ export async function fanOut(
     prompts?: ReadonlyMap<string, string>;
     messagesByTarget?: ReadonlyMap<string, ChatMessage[]>;
     reportMarkers?: ReadonlyMap<string, string>;
+    interactionsByTarget?: ReadonlyMap<string, InteractionHandler>;
     targetSignals?: ReadonlyMap<string, AbortSignal>;
     runIds?: ReadonlyMap<string, string>;
     onResult?: (result: RunResult) => void;
@@ -136,6 +166,7 @@ export async function fanOut(
           prompt: opts.prompts?.get(target.id) ?? opts.prompt,
           messages: opts.messagesByTarget?.get(target.id) ?? opts.messages,
           memoryReportMarker: opts.reportMarkers?.get(target.id) ?? opts.memoryReportMarker,
+          interact: opts.interactionsByTarget?.get(target.id) ?? opts.interact,
           runId: opts.runIds?.get(target.id),
           signal: ctl.signal,
         });

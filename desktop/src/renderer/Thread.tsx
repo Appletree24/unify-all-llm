@@ -1,10 +1,17 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { synthesisFormatter } from '../../../src/core/synth.js';
-import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSourceRef, DuplicateCheckResult, ExecPreview, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
+import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSourceRef, DuplicateCheckResult, ExecPreview, InteractionResponse, PendingInteraction, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { Icon, Markdown, Spinner, hue, isActive, kilo, quotaSummary, seconds, statusText, useTicker } from './ui.js';
 
 export interface Activity { name: string; detail?: string }
+export interface PendingInteractionItem {
+  turnId: string;
+  callId: string;
+  targetId: string;
+  targetLabel: string;
+  request: PendingInteraction;
+}
 type CardKind = 'answer' | 'synthesis' | 'exec';
 
 /** When each call was first seen running, for elapsed-time labels. */
@@ -22,16 +29,182 @@ export interface TurnActions {
   retry(turnId: string, targetIds?: string[]): void;
   cancel(turnId: string): void;
   cancelTarget(turnId: string, targetId: string): void;
+  respondInteraction?(turnId: string, interactionId: string, response: InteractionResponse): void;
   followUp?(choice?: FollowUpChoice): void;
   distill?(source: DistillSourceRef): void;
 }
 
+function InteractionPrompt({ item, onRespond }: {
+  item: PendingInteractionItem;
+  onRespond: (turnId: string, interactionId: string, response: InteractionResponse) => void;
+}) {
+  const { request } = item;
+  const [submitting, setSubmitting] = useState(false);
+  const [inputText, setInputText] = useState('');
+  const [selected, setSelected] = useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {};
+    for (const q of request.questions ?? []) {
+      if (q.options?.length) init[q.id] = q.options[0].label;
+    }
+    return init;
+  });
+  const [custom, setCustom] = useState<Record<string, string>>({});
+
+  const submit = (response: InteractionResponse) => {
+    if (submitting) return;
+    setSubmitting(true);
+    onRespond(item.turnId, request.id, response);
+  };
+
+  if (request.kind === 'approval') {
+    const options = request.options?.length
+      ? request.options
+      : [
+          { id: 'accept', label: '允许', tone: 'primary' as const },
+          { id: 'decline', label: '拒绝', tone: 'danger' as const },
+        ];
+    return (
+      <div className="interact-box" data-interaction-id={request.id} role="region" aria-label={request.title}>
+        <div className="interact-head">
+          <span className="interact-badge"><Icon name="alert" size={12} />需要确认</span>
+          {request.tool && <span className="interact-tool">{request.tool}</span>}
+        </div>
+        <div className="interact-title">{request.title}</div>
+        {request.detail && <pre className="interact-detail">{request.detail}</pre>}
+        <div className="interact-actions">
+          {options.map((opt) => (
+            <button
+              key={opt.id}
+              type="button"
+              disabled={submitting}
+              className={`interact-btn${opt.tone ? ` ${opt.tone}` : ''}`}
+              title={opt.description}
+              onClick={() => submit({ optionId: opt.id })}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (request.kind === 'question' && request.questions?.length) {
+    const submitQuestions = () => {
+      const answers: Record<string, string[]> = {};
+      for (const q of request.questions!) {
+        const customVal = (custom[q.id] ?? '').trim();
+        const picked = selected[q.id];
+        if (customVal) answers[q.id] = [customVal];
+        else if (picked) answers[q.id] = [picked];
+        else answers[q.id] = [];
+      }
+      submit({ answers });
+    };
+    return (
+      <div className="interact-box" data-interaction-id={request.id} role="region" aria-label={request.title}>
+        <div className="interact-head">
+          <span className="interact-badge"><Icon name="alert" size={12} />等待回答</span>
+          {request.tool && <span className="interact-tool">{request.tool}</span>}
+        </div>
+        <div className="interact-title">{request.title}</div>
+        {request.detail && <pre className="interact-detail">{request.detail}</pre>}
+        <div className="interact-questions">
+          {request.questions.map((q) => {
+            const hasOpts = !!q.options?.length;
+            const picked = selected[q.id];
+            const customVal = custom[q.id] ?? '';
+            return (
+              <div key={q.id} className="interact-q">
+                {q.header && <div className="interact-q-head">{q.header}</div>}
+                <div className="interact-q-text">{q.question}</div>
+                {hasOpts && (
+                  <div className="interact-opts">
+                    {q.options!.map((o) => {
+                      const on = !customVal.trim() && picked === o.label;
+                      return (
+                        <button
+                          key={o.label}
+                          type="button"
+                          disabled={submitting}
+                          className={`interact-opt${on ? ' on' : ''}`}
+                          onClick={() => {
+                            setSelected((prev) => ({ ...prev, [q.id]: o.label }));
+                            setCustom((prev) => ({ ...prev, [q.id]: '' }));
+                          }}
+                        >
+                          <b>{o.label}</b>
+                          {o.description && <span>{o.description}</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {(!hasOpts || q.allowOther) && (
+                  <input
+                    className="interact-input"
+                    type={q.secret ? 'password' : 'text'}
+                    disabled={submitting}
+                    value={customVal}
+                    placeholder={hasOpts ? '或输入自定义回答…' : '请输入回答…'}
+                    onChange={(e) => setCustom((prev) => ({ ...prev, [q.id]: e.target.value }))}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                        e.preventDefault();
+                        submitQuestions();
+                      }
+                    }}
+                  />
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="interact-actions">
+          <button type="button" className="interact-btn primary" disabled={submitting} onClick={submitQuestions}>提交回答</button>
+          <button type="button" className="interact-btn danger" disabled={submitting} onClick={() => submit({ cancelled: true })}>取消</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="interact-box" data-interaction-id={request.id} role="region" aria-label={request.title}>
+      <div className="interact-head">
+        <span className="interact-badge"><Icon name="alert" size={12} />等待输入</span>
+        {request.tool && <span className="interact-tool">{request.tool}</span>}
+      </div>
+      <div className="interact-title">{request.title}</div>
+      {request.detail && <pre className="interact-detail">{request.detail}</pre>}
+      <input
+        className="interact-input"
+        type={request.secret ? 'password' : 'text'}
+        disabled={submitting}
+        value={inputText}
+        placeholder={request.placeholder ?? '请输入内容…'}
+        onChange={(e) => setInputText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+            e.preventDefault();
+            submit({ text: inputText });
+          }
+        }}
+      />
+      <div className="interact-actions">
+        <button type="button" className="interact-btn primary" disabled={submitting || !inputText.trim()} onClick={() => submit({ text: inputText })}>发送</button>
+        <button type="button" className="interact-btn danger" disabled={submitting} onClick={() => submit({ cancelled: true })}>取消</button>
+      </div>
+    </div>
+  );
+}
+
 // ── a single model's output ───────────────────────────────────────────────
-export function Card({ record, result, kind, showReasoning, activity, actions, zoomed, canFollowUp, followUpSelected }: {
+export function Card({ record, result, kind, showReasoning, activity, interactions, actions, zoomed, canFollowUp, followUpSelected }: {
   record: RunRecord; result: RunResultRecord; kind: CardKind; showReasoning: boolean;
-  activity?: Activity[]; actions: TurnActions; zoomed?: boolean; canFollowUp?: boolean; followUpSelected?: boolean;
+  activity?: Activity[]; interactions?: PendingInteractionItem[]; actions: TurnActions; zoomed?: boolean; canFollowUp?: boolean; followUpSelected?: boolean;
 }) {
   const running = result.status === 'running';
+  const needsInput = !!interactions?.length;
   const now = useTicker(running);
   if (running && !firstSeen.has(result.runId)) firstSeen.set(result.runId, Date.now());
   const call = record.calls.find((c) => c.id === result.runId);
@@ -45,27 +218,27 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
   const stick = useRef(true);
   useLayoutEffect(() => {
     const el = body.current;
-    if (el && running && stick.current) el.scrollTop = el.scrollHeight;
-  }, [result.text, result.reasoning, activity?.length, running]);
+    if (el && (running || needsInput) && stick.current) el.scrollTop = el.scrollHeight;
+  }, [result.text, result.reasoning, activity?.length, interactions?.length, running, needsInput]);
 
   const [thinkOpen, setThinkOpen] = useState(showReasoning);
-  const waiting = running && !result.text && !result.reasoning;
+  const waiting = running && !result.text && !result.reasoning && !needsInput;
   const format = kind === 'synthesis' ? synthesisFormatter(record) : undefined;
   const text = format?.(result.text) ?? result.text;
   const reasoning = format?.(result.reasoning) ?? result.reasoning;
   const tools = activity?.length ? activity : result.tools;
 
   return (
-    <article className={`card ${kind} ${result.status}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
+    <article className={`card ${kind} ${result.status}${needsInput ? ' needs-input' : ''}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
       <header>
         {kind === 'synthesis' ? <span className="mark"><Icon name="spark" size={14} /></span> : kind === 'exec' ? <span className="mark"><Icon name="run" size={14} /></span> : <i className="dot" />}
         <div className="who">
           <b>{label}</b>
           {meta && <span className="model">{meta}</span>}
         </div>
-        <span className={`status ${result.status}`}>
-          {running ? <Spinner /> : null}
-          {running ? seconds(elapsed) : `${statusText[result.status]}${result.durationMs ? ` · ${seconds(result.durationMs)}` : ''}`}
+        <span className={`status ${needsInput ? 'waiting-input' : result.status}`}>
+          {needsInput ? <Icon name="alert" size={12} /> : running ? <Spinner /> : null}
+          {needsInput ? '等待交互' : running ? seconds(elapsed) : `${statusText[result.status]}${result.durationMs ? ` · ${seconds(result.durationMs)}` : ''}`}
         </span>
       </header>
       <div
@@ -110,6 +283,9 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
         ) : result.text ? (
           <Markdown text={text} />
         ) : !running && !result.error ? <p className="empty">没有输出</p> : null}
+        {interactions && actions.respondInteraction && interactions.map((item) => (
+          <InteractionPrompt key={item.request.id} item={item} onRespond={actions.respondInteraction!} />
+        ))}
         {result.error && <div className="error"><Icon name="alert" size={14} /><span>{result.error}</span></div>}
       </div>
       <footer>
@@ -165,8 +341,8 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
 }
 
 // ── one round: question, answers, synthesis ───────────────────────────────
-export function Turn({ record, notices, activity, showReasoning, actions, isLatestComparison, followUp }: {
-  record: RunRecord; notices: string[]; activity: Record<string, Activity[]>; showReasoning: boolean; actions: TurnActions;
+export function Turn({ record, notices, activity, interactions, showReasoning, actions, isLatestComparison, followUp }: {
+  record: RunRecord; notices: string[]; activity: Record<string, Activity[]>; interactions?: Record<string, PendingInteractionItem[]>; showReasoning: boolean; actions: TurnActions;
   isLatestComparison?: boolean; followUp?: FollowUpChoice;
 }) {
   const active = isActive(record);
@@ -180,7 +356,7 @@ export function Turn({ record, notices, activity, showReasoning, actions, isLate
         <div className="q small">
           <div className="q-kicker"><Icon name="run" size={13} />实施方案{srcLabel && <> · 依据「{srcLabel}」</>}<span>{time}</span></div>
         </div>
-        {result ? <Card record={record} result={result} kind="exec" showReasoning={showReasoning} activity={activity[result.runId]} actions={actions} />
+        {result ? <Card record={record} result={result} kind="exec" showReasoning={showReasoning} activity={activity[result.runId]} interactions={interactions?.[result.runId]} actions={actions} />
           : <div className="pending"><Spinner />正在准备实施…</div>}
         {record.error && <div className="error"><Icon name="alert" size={14} /><span>{record.error}</span></div>}
         <div className="turn-foot">
@@ -213,14 +389,14 @@ export function Turn({ record, notices, activity, showReasoning, actions, isLate
           {answers.map((r) => (
             <Card
               key={r.runId} record={record} result={r} kind="answer" showReasoning={showReasoning}
-              activity={activity[r.runId]} actions={actions}
+              activity={activity[r.runId]} interactions={interactions?.[r.runId]} actions={actions}
               canFollowUp={isLatestComparison}
               followUpSelected={followUp?.turnId === record.id && followUp.targetId === r.targetId}
             />
           ))}
         </div>
       )}
-      {record.synthesis && <Card record={record} result={record.synthesis.result} kind="synthesis" showReasoning={showReasoning} actions={actions} />}
+      {record.synthesis && <Card record={record} result={record.synthesis.result} kind="synthesis" showReasoning={showReasoning} interactions={interactions?.[record.synthesis.result.runId]} actions={actions} />}
       {record.error && <div className="error"><Icon name="alert" size={14} /><span>{record.error}</span></div>}
       <div className="turn-foot">
         {active ? (

@@ -45,6 +45,47 @@ export interface Capabilities {
   exec: boolean;
 }
 
+export interface InteractionOption {
+  id: string;
+  label: string;
+  description?: string;
+  tone?: 'primary' | 'secondary' | 'danger';
+}
+
+export interface InteractionQuestion {
+  id: string;
+  header?: string;
+  question: string;
+  options?: { label: string; description?: string }[];
+  allowOther?: boolean;
+  secret?: boolean;
+}
+
+export interface InteractionRequest {
+  id?: string;
+  kind: 'approval' | 'question' | 'input';
+  title: string;
+  detail?: string;
+  tool?: string;
+  options?: InteractionOption[];
+  questions?: InteractionQuestion[];
+  placeholder?: string;
+  secret?: boolean;
+}
+
+export interface PendingInteraction extends InteractionRequest {
+  id: string;
+}
+
+export interface InteractionResponse {
+  optionId?: string;
+  answers?: Record<string, string[]>;
+  text?: string;
+  cancelled?: boolean;
+}
+
+export type InteractionHandler = (request: InteractionRequest) => Promise<InteractionResponse>;
+
 export interface RunRequest {
   prompt: string;
   /** Structured append-only messages for OpenAI-compatible API targets (preferred over prompt when present). */
@@ -54,6 +95,8 @@ export interface RunRequest {
   model?: string;
   reasoningEffort?: ReasoningEffort;
   signal?: AbortSignal;
+  /** Present when the host (Desktop / interactive CLI / TUI) can answer mid-turn approval or input prompts. */
+  interact?: InteractionHandler;
 }
 
 export interface DetectResult {

@@ -46,7 +46,31 @@ let quitting = false;
 let pendingQuotaNotice: QuotaNotice | undefined;
 let activeQuotaNotification: Notification | undefined;
 
-const push = (p: Push) => { if (win && !win.isDestroyed()) win.webContents.send('unify:push', p); };
+let activeInteractionNotification: Notification | undefined;
+
+const push = (p: Push) => {
+  if (win && !win.isDestroyed()) win.webContents.send('unify:push', p);
+  if (p.type === 'interaction' && !win?.isFocused() && Notification.isSupported()) {
+    try {
+      activeInteractionNotification?.close();
+      const body = p.request.detail ? `${p.request.title}\n${p.request.detail.slice(0, 120)}` : p.request.title;
+      const notification = activeInteractionNotification = new Notification({
+        title: `${p.targetLabel} 等待交互确认`,
+        body,
+      });
+      const release = () => { if (activeInteractionNotification === notification) activeInteractionNotification = undefined; };
+      notification.once('close', release);
+      notification.once('failed', release);
+      notification.once('click', () => {
+        if (!win || win.isDestroyed()) { createWindow(); return; }
+        if (win.isMinimized()) win.restore();
+        win.show();
+        win.focus();
+      });
+      notification.show();
+    } catch { /* The prompt is still visible inside the app window. */ }
+  }
+};
 
 function openQuotaPage(): void {
   pendingQuotaNotice = undefined;
@@ -140,6 +164,7 @@ const api: UnifyApi = {
   async retry(turnId, targetIds) { return need().retry(turnId, targetIds); },
   async cancel(turnId) { need().cancel(turnId); },
   async cancelTarget(turnId, targetId) { return need().cancelTarget(turnId, targetId); },
+  async respondInteraction(turnId, interactionId, response) { return need().respondInteraction(turnId, interactionId, response); },
   async previewExec(turnId, from, executor) { return need().previewExec(turnId, from, executor); },
   async exec(turnId, from, executor) { return need().exec(turnId, from, executor); },
   async quota(force) { return need().quota(force); },

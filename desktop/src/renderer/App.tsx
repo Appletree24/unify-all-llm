@@ -3,7 +3,7 @@ import type { DistillPreparation, DistillSourceRef, ExecPreview, Push, QuotaNoti
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
 import { SessionList } from './Sessions.js';
-import { Card, Composer, DistillDialog, ExecDialog, Turn, type Activity, type ComposerState, type FollowUpChoice, type TurnActions } from './Thread.js';
+import { Card, Composer, DistillDialog, ExecDialog, Turn, type Activity, type ComposerState, type FollowUpChoice, type PendingInteractionItem, type TurnActions } from './Thread.js';
 import { Icon, Spinner, hue, isActive } from './ui.js';
 
 type View = 'chat' | 'quota' | 'memory' | 'settings';
@@ -24,6 +24,7 @@ export function App() {
   const [current, setCurrent] = useState<string | null>(null);
   const [records, setRecords] = useState<Record<string, RunRecord>>({});
   const [activity, setActivity] = useState<Record<string, Activity[]>>({});
+  const [interactions, setInteractions] = useState<Record<string, PendingInteractionItem[]>>({});
   const [notices, setNotices] = useState<Record<string, string[]>>({});
   const [view, setView] = useState<View>(() => new URLSearchParams(window.location.search).get('view') === 'quota' ? 'quota' : 'chat');
   const [quota, setQuota] = useState<TargetQuota[]>();
@@ -78,9 +79,40 @@ export function App() {
     return onPush((p: Push) => {
       if (p.type === 'run') setRecords((r) => ({ ...r, [p.record.id]: p.record }));
       else if (p.type === 'activity') setActivity((a) => ({ ...a, [p.runId]: [...(a[p.runId] ?? []), { name: p.name, detail: p.detail }] }));
-      else if (p.type === 'notice') setNotices((n) => ({ ...n, [p.turnId]: [...(n[p.turnId] ?? []), p.message] }));
+      else if (p.type === 'interaction') {
+        setInteractions((prev) => {
+          const list = prev[p.callId] ?? [];
+          if (list.some((x) => x.request.id === p.request.id)) return prev;
+          return {
+            ...prev,
+            [p.callId]: [...list, { turnId: p.turnId, callId: p.callId, targetId: p.targetId, targetLabel: p.targetLabel, request: p.request }],
+          };
+        });
+      } else if (p.type === 'interaction-resolved') {
+        setInteractions((prev) => {
+          const list = prev[p.callId];
+          if (!list) return prev;
+          const next = list.filter((x) => x.request.id !== p.interactionId);
+          if (next.length) return { ...prev, [p.callId]: next };
+          const copy = { ...prev };
+          delete copy[p.callId];
+          return copy;
+        });
+      } else if (p.type === 'notice') setNotices((n) => ({ ...n, [p.turnId]: [...(n[p.turnId] ?? []), p.message] }));
       else if (p.type === 'workspace') setWs((w) => (w && w.cwd === p.info.cwd ? p.info : w));
-      else if (p.type === 'end') refreshSessions();
+      else if (p.type === 'end') {
+        setInteractions((prev) => {
+          let changed = false;
+          const copy: Record<string, PendingInteractionItem[]> = {};
+          for (const [cid, list] of Object.entries(prev)) {
+            const filtered = list.filter((x) => x.turnId !== p.turnId);
+            if (filtered.length !== list.length) changed = true;
+            if (filtered.length) copy[cid] = filtered;
+          }
+          return changed ? copy : prev;
+        });
+        refreshSessions();
+      }
       else if (p.type === 'quota' && p.cwd === activeCwd.current) setQuota(p.quotas);
       else if (p.type === 'quota-notice') setQuotaNotice(p.notice);
       else if (p.type === 'open-quota') openQuota();
@@ -96,6 +128,7 @@ export function App() {
     setDistillModal(undefined);
     setRecords({});
     setActivity({});
+    setInteractions({});
     setNotices({});
     setQuota(undefined);
     setQuotaLoading(false);
@@ -178,6 +211,7 @@ export function App() {
     setRecords((all) => Object.fromEntries(Object.entries(all).filter(([, record]) => record.sessionId !== id)));
     setNotices((all) => Object.fromEntries(Object.entries(all).filter(([turnId]) => !turnIds.has(turnId))));
     setActivity((all) => Object.fromEntries(Object.entries(all).filter(([callId]) => !callIds.has(callId))));
+    setInteractions((all) => Object.fromEntries(Object.entries(all).filter(([callId]) => !callIds.has(callId))));
     if (current === id) {
       openSessionRequest.current++;
       setCurrent(null);
@@ -213,6 +247,9 @@ export function App() {
     },
     cancel: (turnId) => { void unify.cancel(turnId); },
     cancelTarget: (turnId, targetId) => { void unify.cancelTarget(turnId, targetId); },
+    respondInteraction: (turnId, interactionId, response) => {
+      void unify.respondInteraction(turnId, interactionId, response).catch((err) => notify(errText(err), 'err'));
+    },
     followUp: (choice) => setFollowUp(choice),
     distill: (source) => {
       unify.prepareDistill(source).then((prep) => setDistillModal({ source, prep }), (err) => notify(errText(err), 'err'));
@@ -243,6 +280,17 @@ export function App() {
     const el = thread.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [turns, view]);
+
+  const pendingInteractions = useMemo(() => Object.values(interactions).flat(), [interactions]);
+  const jumpToInteraction = useCallback((item: PendingInteractionItem) => {
+    const rec = records[item.turnId];
+    setView('chat');
+    if (rec && rec.sessionId !== current) void openSession(rec.sessionId);
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-interaction-id="${CSS.escape(item.request.id)}"]`);
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, [records, current, openSession]);
 
   const zoomed = zoom && records[zoom.turnId];
   const zoomResult = zoomed && [...zoomed.results, ...(zoomed.synthesis ? [zoomed.synthesis.result] : [])].find((r) => r.runId === zoom.runId);
@@ -296,6 +344,22 @@ export function App() {
       )}
 
       <main className="sheet">
+        {pendingInteractions.length > 0 && view !== 'chat' && (
+          <div style={{ padding: '10px 24px 0', maxWidth: 1120, width: '100%', margin: '0 auto' }}>
+            <div className="interact-banner" role="status">
+              <div className="interact-banner-left">
+                <Icon name="alert" size={14} />
+                <span>
+                  <b>{pendingInteractions[0].targetLabel}</b> 等待交互：{pendingInteractions[0].request.title}
+                  {pendingInteractions.length > 1 ? `（另有 ${pendingInteractions.length - 1} 项）` : ''}
+                </span>
+              </div>
+              <button type="button" className="interact-banner-jump" onClick={() => jumpToInteraction(pendingInteractions[0])}>
+                前往处理
+              </button>
+            </div>
+          </div>
+        )}
         {!ws ? <Welcome onOpen={(d) => void openWorkspace(d)} />
           : view === 'quota' ? <QuotaPage quota={quota} loading={quotaLoading} refresh={() => refreshQuota(true)} />
           : view === 'memory' ? <MemoryPage cwd={ws.cwd} notify={notify} />
@@ -322,11 +386,27 @@ export function App() {
                   </div>
                 ) : turns.map((r) => (
                   <Turn
-                    key={r.id} record={r} notices={notices[r.id] ?? []} activity={activity} showReasoning={ws.showReasoning} actions={actions}
+                    key={r.id} record={r} notices={notices[r.id] ?? []} activity={activity} interactions={interactions} showReasoning={ws.showReasoning} actions={actions}
                     isLatestComparison={r.id === latestComparisonId} followUp={activeFollowUp}
                   />
                 ))}
               </div>
+              {pendingInteractions.length > 0 && (
+                <div style={{ padding: '0 24px', maxWidth: 1120, width: '100%', margin: '0 auto' }}>
+                  <div className="interact-banner" role="status">
+                    <div className="interact-banner-left">
+                      <Icon name="alert" size={14} />
+                      <span>
+                        <b>{pendingInteractions[0].targetLabel}</b> 等待交互：{pendingInteractions[0].request.title}
+                        {pendingInteractions.length > 1 ? `（另有 ${pendingInteractions.length - 1} 项）` : ''}
+                      </span>
+                    </div>
+                    <button type="button" className="interact-banner-jump" onClick={() => jumpToInteraction(pendingInteractions[0])}>
+                      定位处理
+                    </button>
+                  </div>
+                </div>
+              )}
               <Composer
                 ws={ws} quota={quotaMap} busy={busy} state={composer} setState={setComposer}
                 onSend={send} onCancel={cancelCurrent} autoFocusKey={`${ws.cwd}:${current}`}
@@ -338,7 +418,7 @@ export function App() {
         {zoomed && zoomResult && (
           <div className="zoom-back" onMouseDown={(e) => { if (e.target === e.currentTarget) setZoom(undefined); }}>
             <Card
-              record={zoomed} result={zoomResult} zoomed showReasoning={ws?.showReasoning ?? false} activity={activity[zoomResult.runId]} actions={actions}
+              record={zoomed} result={zoomResult} zoomed showReasoning={ws?.showReasoning ?? false} activity={activity[zoomResult.runId]} interactions={interactions[zoomResult.runId]} actions={actions}
               kind={zoomed.synthesis?.result.runId === zoomResult.runId ? 'synthesis' : zoomed.kind === 'execution' ? 'exec' : 'answer'}
             />
           </div>
