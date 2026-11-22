@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net';
 import { ConflictError, deleteMemory, editEntry, listBackups, readBackup, restoreBackup, writeMemory } from './edit.js';
 import { effectiveContext, scanMemory } from './scan.js';
+import { applyMemorySync, previewMemorySync } from './sync.js';
 import type { MemoryContext } from './types.js';
 
 export interface MemoryServer {
@@ -65,6 +66,15 @@ export async function startMemoryServer(ctx: MemoryContext, port = 0): Promise<M
       return {};
     }
     if (route === 'POST /api/restore') return restoreBackup(ctx, str(b.id, 'id'));
+    if (route === 'POST /api/sync/preview') {
+      const targets = Array.isArray(b.targetPaths) ? b.targetPaths.filter((x: unknown): x is string => typeof x === 'string') : [];
+      return previewMemorySync(ctx, str(b.sourcePath, 'sourcePath'), targets, !!b.force);
+    }
+    if (route === 'POST /api/sync/apply') {
+      const targets = Array.isArray(b.targetPaths) ? b.targetPaths.filter((x: unknown): x is string => typeof x === 'string') : [];
+      const baseHashes = b.baseHashes && typeof b.baseHashes === 'object' && !Array.isArray(b.baseHashes) ? b.baseHashes as Record<string, string> : undefined;
+      return applyMemorySync(ctx, { sourcePath: str(b.sourcePath, 'sourcePath'), targetPaths: targets, baseHashes, force: !!b.force });
+    }
     throw Object.assign(new Error('未找到'), { status: 404 });
   };
 

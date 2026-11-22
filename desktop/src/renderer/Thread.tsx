@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { synthesisFormatter } from '../../../src/core/synth.js';
-import type { ExecPreview, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
+import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSourceRef, DuplicateCheckResult, ExecPreview, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { Icon, Markdown, Spinner, hue, isActive, kilo, quotaSummary, seconds, statusText, useTicker } from './ui.js';
 
@@ -23,6 +23,7 @@ export interface TurnActions {
   cancel(turnId: string): void;
   cancelTarget(turnId: string, targetId: string): void;
   followUp?(choice?: FollowUpChoice): void;
+  distill?(source: DistillSourceRef): void;
 }
 
 // ── a single model's output ───────────────────────────────────────────────
@@ -71,6 +72,16 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
         className="body" ref={body}
         onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; }}
       >
+        {!!call?.input.memorySnapshot?.items.length && (
+          <details className="think">
+            <summary>已注入共享记忆<span>{call.input.memorySnapshot.items.length} 个文件 · Unify 已发送</span></summary>
+            <ul className="memory-injected">
+              {call.input.memorySnapshot.items.map((item, i) => (
+                <li key={i}><code>{item.logicalPath}</code><span>{item.bytes} B{item.truncated ? ' · 已截断' : ''}</span></li>
+              ))}
+            </ul>
+          </details>
+        )}
         {!!result.memoryReferences?.length && (
           <details className="think">
             <summary>记忆依据<span>{result.memoryReferences.length} 条 · 模型自报</span></summary>
@@ -103,13 +114,34 @@ export function Card({ record, result, kind, showReasoning, activity, actions, z
       </div>
       <footer>
         <span className="usage">
-          {result.usage?.inputTokens || result.usage?.outputTokens ? `↑${kilo(result.usage?.inputTokens)} ↓${kilo(result.usage?.outputTokens)} tokens` : ''}
+          {result.usage?.inputTokens || result.usage?.outputTokens
+            ? `↑${kilo(result.usage?.inputTokens)}${result.usage?.cachedInputTokens ? ` (缓存 ${kilo(result.usage.cachedInputTokens)})` : ''} ↓${kilo(result.usage?.outputTokens)} tokens`
+            : ''}
         </span>
         <span className="acts">
           {running && kind === 'answer' && record.status === 'answering' && (
             <button title="取消这个模型，其余继续" onClick={() => actions.cancelTarget(record.id, result.targetId)}><Icon name="x" /></button>
           )}
           {text && <button title="复制" onClick={() => void unify.copy(text)}><Icon name="copy" /></button>}
+          {result.ok && !turnRunning && text && actions.distill && (
+            <button
+              title="存为记忆…（可先划选一段文字）"
+              onClick={() => {
+                const sel = window.getSelection();
+                const selectedText = sel && body.current && sel.rangeCount > 0 && body.current.contains(sel.anchorNode)
+                  ? sel.toString().trim()
+                  : undefined;
+                actions.distill!({
+                  turnId: record.id,
+                  runId: result.runId,
+                  scope: kind,
+                  ...(selectedText ? { selectedText } : {}),
+                });
+              }}
+            >
+              <Icon name="bookmark" size={14} />
+            </button>
+          )}
           {kind === 'answer' && !running && !turnRunning && (
             <button title="只重新调用这个模型" onClick={() => actions.retry(record.id, [result.targetId])}><Icon name="retry" /></button>
           )}
@@ -276,11 +308,12 @@ function SynthesisPicker({ targets, defaultId, value, onChange }: {
   );
 }
 
-export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp }: {
+export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp, pendingMemoryUpdates, onClearMemoryUpdates }: {
   ws: WorkspaceInfo; quota: Map<string, TargetQuota>; busy: boolean;
   state: ComposerState; setState: (s: ComposerState) => void;
   onSend(text: string): Promise<boolean>; onCancel(): void; autoFocusKey: string;
   followUp?: FollowUpChoice; onClearFollowUp?: () => void;
+  pendingMemoryUpdates?: string[]; onClearMemoryUpdates?: () => void;
 }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -322,6 +355,12 @@ export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, a
         <div className="followup-bar">
           <span><Icon name="check" size={12} />下轮追问将沿用「<b>{followUp.label}</b>」的回答</span>
           <button type="button" onClick={onClearFollowUp} title="恢复默认上下文"><Icon name="x" size={12} /></button>
+        </div>
+      )}
+      {pendingMemoryUpdates && pendingMemoryUpdates.length > 0 && (
+        <div className="followup-bar">
+          <span><Icon name="bookmark" size={12} />下轮追问将尾部附带 <b>{pendingMemoryUpdates.length}</b> 条新沉淀记忆（不破坏前序缓存）</span>
+          <button type="button" onClick={onClearMemoryUpdates} title="取消本会话增量附带"><Icon name="x" size={12} /></button>
         </div>
       )}
       <div className={`composer${busy ? ' busy' : ''}`}>
@@ -429,6 +468,190 @@ export function ExecDialog({ initial, onClose, onStarted, onError }: {
             }}
           >
             开始实施
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── save to memory (distill) dialog ───────────────────────────────────────
+export function DistillDialog({ initial, source, onClose, onSaved, onError }: {
+  initial: DistillPreparation;
+  source: DistillSourceRef;
+  onClose(): void;
+  onSaved(result: DistillApplyResult, applyInSession: boolean): void;
+  onError(msg: string): void;
+}) {
+  const [text, setText] = useState(() => {
+    const t = initial.defaultText.trim();
+    return t && !t.startsWith('-') && !t.includes('\n') ? `- ${t}` : t;
+  });
+  const [targetPath, setTargetPath] = useState(initial.defaultTargetPath ?? initial.targets[0]?.path ?? '');
+  const [heading, setHeading] = useState('');
+  const [replaceRange, setReplaceRange] = useState<{ start: number; end: number }>();
+  const [applyInSession, setApplyInSession] = useState(false);
+  const [candidates, setCandidates] = useState<DistillCandidate[]>();
+  const [distilling, setDistilling] = useState(false);
+  const [duplicates, setDuplicates] = useState<DuplicateCheckResult>();
+  const [saving, setSaving] = useState(false);
+
+  const selectedTarget = initial.targets.find((t) => t.path === targetPath);
+
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!targetPath || !text.trim()) { setDuplicates(undefined); return; }
+    let stale = false;
+    const timer = setTimeout(() => {
+      void unify.checkDistillDuplicate(targetPath, text).then((res) => { if (!stale) setDuplicates(res); }, () => undefined);
+    }, 200);
+    return () => { stale = true; clearTimeout(timer); };
+  }, [targetPath, text]);
+
+  const runDistill = async () => {
+    setDistilling(true);
+    try {
+      const list = await unify.distillCandidates({ ...source, selectedText: text.trim() || source.selectedText });
+      setCandidates(list);
+      if (list.length === 1) setText(list[0].text);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDistilling(false);
+    }
+  };
+
+  const save = async () => {
+    if (!targetPath || !text.trim()) return;
+    setSaving(true);
+    try {
+      const res = await unify.applyDistill({
+        source,
+        targetPath,
+        text: text.trim(),
+        heading: heading.trim() || undefined,
+        mode: replaceRange ? 'replace' : 'append',
+        replaceStart: replaceRange?.start,
+        replaceEnd: replaceRange?.end,
+        baseHash: selectedTarget?.baseHash,
+      });
+      onSaved(res, applyInSession);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-back" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="modal distill-modal" role="dialog" aria-modal="true" aria-labelledby="distill-title">
+        <header className="distill-head">
+          <div>
+            <h2 id="distill-title">存为记忆</h2>
+            <p className="lede">源自「{initial.sourceLabel}」 · 只写入审阅后的干净规则，来源记录保存在本地审计日志</p>
+          </div>
+          <button className="btn" type="button" disabled={distilling || saving} onClick={() => void runDistill()}>
+            {distilling ? <><Spinner />提炼中…</> : <><Icon name="spark" size={14} />提炼候选</>}
+          </button>
+        </header>
+
+        {initial.scope === 'exec' && initial.planText && initial.execOutcome && (
+          <div className="distill-source-tabs">
+            <button type="button" className="btn" onClick={() => { setText(initial.planText!); setReplaceRange(undefined); }}>填入采纳的方案</button>
+            <button type="button" className="btn" onClick={() => { setText(initial.execOutcome!); setReplaceRange(undefined); }}>填入实施回报</button>
+          </div>
+        )}
+
+        {candidates && (
+          <div className="distill-cands">
+            {candidates.length === 0 ? (
+              <p className="faint small">模型未发现值得长期复用的规则，你仍可直接手工编辑并保存。</p>
+            ) : candidates.map((c, i) => (
+              <button key={i} type="button" className="distill-cand" onClick={() => { setText(c.text); setReplaceRange(undefined); }}>
+                <b>{c.text}</b>
+                {c.quote && <span>依据：{c.quote}</span>}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="distill-field">
+          <label>将要写入的记忆条目（Markdown）</label>
+          <textarea
+            value={text} rows={5} spellCheck={false}
+            placeholder="- 例如：本项目的记忆同步必须支持无软链权限的 Windows 环境"
+            onChange={(e) => { setText(e.target.value); setReplaceRange(undefined); }}
+          />
+        </div>
+
+        <dl className="kv distill-kv">
+          <dt>目标文件</dt>
+          <dd>
+            <select value={targetPath} onChange={(e) => { setTargetPath(e.target.value); setReplaceRange(undefined); }}>
+              {initial.targets.map((t) => (
+                <option key={t.path} value={t.path}>
+                  {t.harnessName} · {t.layerTitle} · {t.display}{t.exists ? '' : '（将新建）'}
+                </option>
+              ))}
+            </select>
+            {selectedTarget && (
+              <div className="faint small distill-target-hint">
+                路径：{selectedTarget.path}
+                {selectedTarget.sharedWith?.length ? ` · 同时被 ${selectedTarget.sharedWith.join('、')} 读取` : ''}
+              </div>
+            )}
+          </dd>
+          <dt>归属小节</dt>
+          <dd>
+            <input type="text" value={heading} placeholder="留空则追加到文件末尾（可选）" onChange={(e) => setHeading(e.target.value)} />
+            {selectedTarget && selectedTarget.headings.length > 0 && (
+              <div className="distill-chips">
+                {selectedTarget.headings.slice(0, 6).map((hd) => (
+                  <button key={hd} type="button" className="distill-chip" onClick={() => setHeading(hd)}>{hd}</button>
+                ))}
+              </div>
+            )}
+          </dd>
+        </dl>
+
+        {duplicates?.exact && (
+          <div className="distill-dup warn">
+            <b>已存在相同条目（第 {duplicates.exact.start} 行）</b>
+            <span>{duplicates.exact.text}</span>
+          </div>
+        )}
+        {!duplicates?.exact && !!duplicates?.similar.length && (
+          <div className="distill-dup">
+            <b>发现相似条目（可选择替换或继续追加）</b>
+            {duplicates.similar.slice(0, 2).map((s, i) => (
+              <div key={i} className="distill-dup-row">
+                <span>L{s.start}: {s.text}</span>
+                <button
+                  type="button" className="link"
+                  onClick={() => setReplaceRange(replaceRange?.start === s.start ? undefined : { start: s.start, end: s.end })}
+                >
+                  {replaceRange?.start === s.start ? '取消替换' : '替换此条'}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <label className="check distill-session-opt">
+          <input type="checkbox" checked={applyInSession} onChange={(e) => setApplyInSession(e.target.checked)} />
+          本对话后续追问也遵循此条（以尾部增量附带，不破坏当前 API 前缀缓存）
+        </label>
+
+        <div className="modal-acts">
+          <span className="faint small" style={{ marginRight: 'auto' }}>立即写入磁盘并自动备份旧版本</span>
+          <button className="btn" type="button" onClick={onClose}>取消</button>
+          <button className="btn primary" type="button" disabled={saving || !text.trim() || !targetPath} onClick={() => void save()}>
+            {saving ? <><Spinner />保存中…</> : replaceRange ? `替换第 ${replaceRange.start} 行` : '写入记忆'}
           </button>
         </div>
       </div>

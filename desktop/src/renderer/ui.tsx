@@ -6,6 +6,8 @@ import { renderMarkdown } from './markdown.js';
 
 // ── icons ─────────────────────────────────────────────────────────────────
 const paths: Record<string, ReactNode> = {
+  sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></>,
+  moon: <path d="M20 14a8.5 8.5 0 0 1-10-10 8.6 8.6 0 1 0 10 10Z" />,
   plus: <path d="M12 5v14M5 12h14" />,
   send: <path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" />,
   stop: <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none" />,
@@ -27,6 +29,7 @@ const paths: Record<string, ReactNode> = {
   alert: <><circle cx="12" cy="12" r="9" /><path d="M12 7.5v5.5M12 16.5v.01" /></>,
   open: <path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4" />,
   chat: <path d="M20 12a8 8 0 0 1-11.6 7.1L4 20l1-4.2A8 8 0 1 1 20 12z" />,
+  bookmark: <path d="M6 4.5A1.5 1.5 0 0 1 7.5 3h9A1.5 1.5 0 0 1 18 4.5V21l-6-4-6 4z" />,
 };
 
 export function Icon({ name, size = 16 }: { name: keyof typeof paths | string; size?: number }) {

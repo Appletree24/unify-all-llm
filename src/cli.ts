@@ -7,9 +7,11 @@ import { latestComparison, listRunIds, loadRun, type RunRecord } from './core/st
 import { synthesisFormatter } from './core/synth.js';
 import { detectTargets } from './core/targets.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent } from './core/workflow.js';
-import { defaultContext, effectiveContext, scanMemory } from './memory/scan.js';
-import { startMemoryServer } from './memory/server.js';
 import { formatMemoryReferences } from './memory/report.js';
+import { defaultContext, effectiveContext, scanMemory } from './memory/scan.js';
+import { applyDistillSave, prepareDistill, previewDistillSave, type DistillSourceScope } from './memory/distill.js';
+import { applyMemorySync, previewMemorySync } from './memory/sync.js';
+import { startMemoryServer } from './memory/server.js';
 import { buildRegistry } from './providers/index.js';
 import { formatQuota, QUOTA_REFRESH_MS, readTargetQuotas } from './quota/index.js';
 import { runTui } from './tui/app.js';
@@ -50,6 +52,8 @@ memory 选项:
       --json                    输出扫描结果 JSON
       --effective id            打印某个工具启动时拼接后的记忆（claude/codex/gemini/pi）
       --port 端口               网页监听端口（默认随机，仅本机可访问）
+      sync --from 源 --to 目标   预览单向同步到托管区块（加 --apply 落盘）
+      distill --turn id --call c 从记录沉淀记忆预览（加 --apply 落盘）
 
 exec 选项:
   -w, --with id                 支持实施的执行目标
@@ -200,9 +204,56 @@ async function cmdQuota(args: string[]): Promise<number> {
 }
 
 async function cmdMemory(args: string[]): Promise<number> {
+    const ctx = defaultContext(cwd);
+    if (args[0] === 'sync') {
+        const { values } = parseArgs({
+            args: args.slice(1),
+            options: { from: { type: 'string' }, to: { type: 'string' }, apply: { type: 'boolean' }, force: { type: 'boolean' } },
+        });
+        if (!values.from || !values.to) throw new Error('用法: unify memory sync --from <源文件> --to <目标1,目标2> [--apply]');
+        const targets = values.to.split(',').map((s) => s.trim()).filter(Boolean);
+        const preview = previewMemorySync(ctx, values.from, targets, !!values.force);
+        for (const t of preview.targets) {
+            process.stdout.write(`${bold(t.display)} · ${t.status}${t.changedLines !== undefined ? ` (${t.changedLines} 行变动)` : ''}${t.reason ? ` · ${t.reason}` : ''}\n`);
+        }
+        if (!values.apply) {
+            process.stdout.write(dim('以上为预览，未修改磁盘；添加 --apply 执行写入。\n'));
+            return 0;
+        }
+        const baseHashes = Object.fromEntries(preview.targets.filter((t) => t.baseHash !== undefined).map((t) => [t.targetPath, t.baseHash!]));
+        const applied = applyMemorySync(ctx, { sourcePath: values.from, targetPaths: targets, baseHashes, force: !!values.force });
+        for (const r of applied.results) process.stdout.write(`  ${r.targetPath} -> ${r.status}${r.message ? ` (${r.message})` : ''}\n`);
+        return applied.results.some((r) => r.status === 'error') ? 1 : 0;
+    }
+    if (args[0] === 'distill') {
+        const { values } = parseArgs({
+            args: args.slice(1),
+            options: {
+                turn: { type: 'string' }, call: { type: 'string' }, scope: { type: 'string' },
+                to: { type: 'string' }, text: { type: 'string' }, heading: { type: 'string' }, apply: { type: 'boolean' },
+            },
+        });
+        if (!values.turn || !values.call) throw new Error('用法: unify memory distill --turn <turnId> --call <runId> [--scope answer|synthesis|exec] [--to <文件>] [--text <内容>] [--apply]');
+        const scope = (values.scope ?? 'answer') as DistillSourceScope;
+        if (!['answer', 'synthesis', 'exec'].includes(scope)) throw new Error('--scope 必须是 answer、synthesis 或 exec');
+        const source = { turnId: values.turn, runId: values.call, scope, ...(values.text ? { selectedText: values.text } : {}) };
+        const prep = prepareDistill(ctx, source);
+        const targetPath = values.to ?? prep.defaultTargetPath;
+        if (!targetPath) throw new Error('未找到可写入的默认记忆文件，请使用 --to 指定');
+        const text = values.text ?? prep.defaultText;
+        const preview = previewDistillSave(ctx, { source, targetPath, text, heading: values.heading });
+        process.stdout.write(`${bold('来源')}: ${prep.sourceLabel} (${values.turn} / ${values.call})\n${bold('目标')}: ${preview.display} (${preview.targetPath})\n`);
+        if (preview.duplicates.exact) process.stdout.write(red(`重复提示: 第 ${preview.duplicates.exact.start} 行已有相同条目\n`));
+        if (!values.apply) {
+            process.stdout.write(`\n--- 预览写入内容 ---\n${text}\n${dim('以上为预览，未修改磁盘；添加 --apply 执行写入。\n')}`);
+            return 0;
+        }
+        const saved = applyDistillSave(ctx, { source, targetPath, text, heading: values.heading, baseHash: preview.baseHash });
+        process.stdout.write(`已写入 ${saved.display}（审计 ID: ${saved.auditId}）\n`);
+        return 0;
+    }
     const { values } = parseArgs({ args, options: { tui: { type: 'boolean' }, list: { type: 'boolean' }, json: { type: 'boolean' }, effective: { type: 'string' }, port: { type: 'string' } } });
     if (values.tui) return runTui(cwd, abort.signal, 'memory');
-    const ctx = defaultContext(cwd);
     if (values.effective) { process.stdout.write(effectiveContext(scanMemory(ctx), values.effective)); return 0; }
     if (values.json) { process.stdout.write(JSON.stringify(scanMemory(ctx), null, 2) + '\n'); return 0; }
     if (values.list) {

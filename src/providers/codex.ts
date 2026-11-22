@@ -66,7 +66,11 @@ export const codex: ProviderAdapter = {
         yield {
           type: 'done',
           text: req.mode === 'ask' ? last || acc : acc,
-          usage: { inputTokens: ev.usage?.input_tokens, outputTokens: ev.usage?.output_tokens },
+          usage: {
+            inputTokens: ev.usage?.input_tokens,
+            outputTokens: ev.usage?.output_tokens,
+            ...(ev.usage?.cached_input_tokens !== undefined ? { cachedInputTokens: ev.usage.cached_input_tokens } : {}),
+          },
         };
       }
     }

@@ -1862,6 +1862,7 @@ function renderFileSheet(hn, l, idx, f) {
               onclick: () => { fileTab = 'source'; inlineEditing = false; renderCanvas(); },
             }, f.writable ? '全文源码' : '查看全文'),
             h('div', { class: 'doc-tab-acts' },
+              f.exists ? h('button', { class: 'link-btn muted', style: 'font-size:12.5px', onclick: () => openSyncModal(f) }, '同步到其他工具') : null,
               f.exists ? h('button', { class: 'link-btn muted', style: 'font-size:12.5px', onclick: () => showHistory(f) }, '来历与备份') : null,
               f.exists && f.writable ? h('button', { class: 'link-btn danger', style: 'font-size:12.5px', onclick: () => openDeleteFileModal(f) }, '删除文件') : null,
             ),
@@ -2467,6 +2468,104 @@ function openTransferModal(f, e, fromLayer) {
     h('button', { class: 'btn sm', onclick: () => go('copy') }, '复制'),
     h('button', { class: 'btn sm accent', onclick: () => go('move') }, '移动'),
   ], { narrow: true });
+}
+
+const SYNC_STATUS = {
+  shared: '共用（零写入）',
+  unchanged: '已是最新',
+  create: '将新建',
+  update: '将更新区块',
+  conflict: '区块冲突',
+  blocked: '已跳过',
+};
+
+function openSyncModal(f) {
+  const candidates = [];
+  const seen = new Set();
+  for (const hn of state.harnesses) {
+    for (const tl of hn.layers) {
+      for (const t of tl.files) {
+        if (!t.writable || t.path === f.path || seen.has(t.path)) continue;
+        seen.add(t.path);
+        candidates.push({ hn, tl, t });
+      }
+    }
+  }
+  const picked = new Set(candidates.filter((c) => c.tl.scope === 'project' && c.hn.id !== current && !c.t.shadowedBy).map((c) => c.t.path));
+  const previewWrap = h('div', { style: 'display:flex;flex-direction:column;gap:8px' });
+  let latestPreview = null;
+  const applyBtn = h('button', { class: 'btn sm accent', disabled: true, onclick: () => applySync() }, '应用同步');
+
+  async function refreshPreview() {
+    const targetPaths = [...picked];
+    if (!targetPaths.length) {
+      latestPreview = null;
+      applyBtn.disabled = true;
+      previewWrap.replaceChildren(h('p', { class: 'field-hint' }, '请先勾选至少一个目标记忆文件。'));
+      return;
+    }
+    previewWrap.replaceChildren(h('p', { class: 'field-hint' }, '正在计算托管区块差异…'));
+    try {
+      const res = await api('/api/sync/preview', { sourcePath: f.path, targetPaths });
+      latestPreview = res;
+      const actionable = res.targets.filter((x) => x.status === 'create' || x.status === 'update');
+      applyBtn.disabled = !actionable.length;
+      previewWrap.replaceChildren(...res.targets.map((item) => h('div', { class: 'eff-chunk' },
+        h('div', { class: 'eff-head', style: 'display:flex;justify-content:space-between;gap:10px' },
+          h('span', {}, item.display),
+          h('span', { style: item.status === 'conflict' || item.status === 'blocked' ? 'color:var(--warn)' : '' },
+            `${SYNC_STATUS[item.status] || item.status}${item.changedLines ? ` · ${item.changedLines} 行变动` : ''}`),
+        ),
+        item.reason ? h('p', { class: 'field-hint', style: 'padding:8px 12px' }, item.reason) : null,
+        (item.status === 'create' || item.status === 'update')
+          ? h('pre', { class: 'raw', style: 'max-height:180px;overflow:auto' }, item.after || '')
+          : null,
+      )));
+    } catch (err) {
+      latestPreview = null;
+      applyBtn.disabled = true;
+      previewWrap.replaceChildren(h('div', { class: 'field-err' }, err.message));
+    }
+  }
+
+  async function applySync() {
+    if (!latestPreview) return;
+    const baseHashes = Object.fromEntries(latestPreview.targets.filter((x) => x.baseHash !== undefined).map((x) => [x.targetPath, x.baseHash]));
+    try {
+      const res = await api('/api/sync/apply', { sourcePath: f.path, targetPaths: [...picked], baseHashes });
+      const written = res.results.filter((r) => r.status === 'written').length;
+      const errs = res.results.filter((r) => r.status === 'error');
+      $('dlg').close();
+      raw = '';
+      await load();
+      toast(errs.length ? `同步完成（写入 ${written} 个，失败 ${errs.length} 个）` : `已单向同步到 ${written} 个文件（旧版本已备份）`, errs.length > 0);
+    } catch (err) { toast(err.message, true); }
+  }
+
+  const list = h('div', { style: 'display:flex;flex-direction:column;gap:6px;max-height:160px;overflow:auto;padding:8px 10px;border-radius:8px;background:var(--well);border:1px solid var(--line)' },
+    candidates.length ? candidates.map(({ hn, tl, t }) => {
+      const cb = h('input', {
+        type: 'checkbox',
+        checked: picked.has(t.path),
+        onchange: () => { if (cb.checked) picked.add(t.path); else picked.delete(t.path); void refreshPreview(); },
+      });
+      return h('label', { style: 'display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer' },
+        cb,
+        h('span', { class: 'mono' }, `${hn.name} · ${tl.title} · ${t.display}`),
+        t.shadowedBy ? h('span', { class: 'faint' }, `（被 ${t.shadowedBy} 取代）`) : !t.exists ? h('span', { class: 'faint' }, '（将新建）') : null,
+      );
+    }) : h('p', { class: 'field-hint' }, '没有其他可同步的目标文件。'),
+  );
+
+  openDialog(`单向同步 ${f.display}`, [
+    h('p', { class: 'field-hint' }, '只更新目标文件中的 <!-- unify:managed:start/end --> 托管区块，区块外手写内容逐字节保留；连续同步第二次零 diff。'),
+    h('div', { class: 'field' }, h('label', {}, '选择同步目标'), list),
+    previewWrap,
+  ], [
+    h('button', { class: 'btn sm', onclick: () => $('dlg').close() }, '取消'),
+    applyBtn,
+  ]);
+  void refreshPreview();
 }
 
 async function showEffective() {

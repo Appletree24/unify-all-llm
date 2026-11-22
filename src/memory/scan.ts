@@ -385,9 +385,11 @@ export function effectiveContext(state: MemoryState, harnessId: string): string 
     .map((f) => `<!-- ${l.title} · ${f.display} -->\n${(f.content ?? '').trimEnd()}\n`)).join('\n');
 }
 
-/** A path may be written only if a scan offers it: a known slot, or a new file in a layer's directory. */
+/** A path may be written only if a scan offers it: a known slot, a new file in a layer's directory, or Unify's shared memory slots. */
 export function writableTarget(state: MemoryState, path: string): boolean {
   const target = resolve(path);
+  const unifySlots = [resolve(join(state.root, '.unify', 'memory.md')), resolve(join(state.home, '.unify', 'memory.md'))];
+  if (unifySlots.includes(target)) return true;
   for (const h of state.harnesses) for (const l of h.layers) {
     if (l.readonly) continue;
     if (l.files.some((f) => f.path === target)) return true;

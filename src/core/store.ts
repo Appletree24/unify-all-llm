@@ -16,17 +16,47 @@ const capabilities = z.object({
 });
 const targetSchema = z.object({ id: safeId, label: z.string(), provider: safeId, model: z.string().optional(), reasoningEffort: effortSchema.optional(), capabilities, configuration: customSchema.optional() });
 const toolUseSchema = z.object({ name: z.string(), detail: z.string().optional() });
+const chatMessageSchema = z.object({ role: z.enum(['system', 'user', 'assistant']), content: z.string() });
+const memorySnapshotItemSchema = z.object({
+  scope: z.enum(['user', 'project']),
+  logicalPath: z.string(),
+  sourcePath: z.string(),
+  hash: z.string(),
+  bytes: z.number().nonnegative(),
+  truncated: z.boolean().optional(),
+  unexpandedImports: z.array(z.string()).optional(),
+});
+const memorySnapshotSchema = z.object({
+  version: z.string(),
+  items: z.array(memorySnapshotItemSchema),
+  notices: z.array(z.string()).optional(),
+  overrides: z.array(z.string()).optional(),
+});
 const resultSchema = z.object({
   runId: safeId, targetId: safeId, provider: safeId, model: z.string().optional(), reasoningEffort: effortSchema.optional(),
   status: z.enum(['running', 'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted']),
   ok: z.boolean(), text: z.string(), reasoning: z.string(), error: z.string().optional(), durationMs: z.number().nonnegative(),
-  usage: z.object({ inputTokens: z.number().optional(), outputTokens: z.number().optional() }).optional(),
+  usage: z.object({
+    inputTokens: z.number().optional(),
+    outputTokens: z.number().optional(),
+    cachedInputTokens: z.number().optional(),
+    cacheWriteTokens: z.number().optional(),
+  }).optional(),
   tools: z.array(toolUseSchema).optional(),
   memoryReferences: z.array(z.object({ source: z.string(), content: z.string(), effect: z.string() })).optional(),
   observerErrors: z.array(z.string()).optional(),
 }).refine((r) => r.ok === (r.status === 'succeeded'), 'ok 与 status 不一致');
-const historySchema = z.array(z.object({ turnId: safeId, question: z.string(), answer: z.string() }));
-const inputSchema = z.object({ prompt: z.string(), cwd: z.string(), history: historySchema });
+const historySchema = z.array(z.object({
+  turnId: safeId, question: z.string(), answer: z.string(),
+  userContent: z.string().optional(),
+}));
+const inputSchema = z.object({
+  prompt: z.string(), cwd: z.string(), history: historySchema,
+  userContent: z.string().optional(),
+  sharedFiles: z.array(z.string()).optional(),
+  memorySnapshot: memorySnapshotSchema.optional(),
+  memoryUpdates: z.array(z.string()).optional(),
+});
 const sourceSchema = z.object({
   turnId: safeId, runId: safeId, targetId: safeId, scope: z.enum(['answer', 'synthesis']),
   planText: z.string().optional(),
@@ -40,7 +70,14 @@ const recordSchema = z.object({
   error: z.string().optional(), results: z.array(resultSchema),
   calls: z.array(z.object({
     id: safeId, scope: z.enum(['decision', 'answer', 'synthesis', 'exec']), target: targetSchema,
-    input: z.object({ prompt: z.string(), cwd: z.string(), mode: z.enum(['ask', 'exec']), timeoutMs: z.number().positive() }),
+    input: z.object({
+      prompt: z.string(),
+      messages: z.array(chatMessageSchema).optional(),
+      memoryReportMarker: z.string().optional(),
+      memorySnapshot: memorySnapshotSchema.optional(),
+      includesUserMemory: z.boolean().optional(),
+      cwd: z.string(), mode: z.enum(['ask', 'exec']), timeoutMs: z.number().positive(),
+    }),
     result: resultSchema,
   })),
   decision: z.object({ providers: z.array(safeId), synthesize: z.boolean(), reason: z.string().optional() }).optional(),
@@ -200,32 +237,36 @@ function formatExecutedAnswer(planText: string | undefined, execution: RunRecord
 }
 
 export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, fromTargetId?: string): HistoryEntry[] {
+  const userContent = run.input.userContent;
+  const entry = (turnId: string, answer: string): HistoryEntry => ({
+    turnId, question: run.question, answer, ...(userContent ? { userContent } : {}),
+  });
   if (run.kind === 'execution') {
     const answer = formatExecutedAnswer(run.planSource?.planText?.trim(), run);
-    return [...run.input.history, ...(answer ? [{ turnId: run.planSource?.turnId ?? run.id, question: run.question, answer }] : [])];
+    return [...run.input.history, ...(answer ? [entry(run.planSource?.turnId ?? run.id, answer)] : [])];
   }
   if (fromTargetId) {
     if (fromTargetId === 'synthesis') {
       if (run.synthesis?.result.ok && run.synthesis.result.text.trim()) {
-        return [...run.input.history, { turnId: run.id, question: run.question, answer: synthesisFormatter(run)(run.synthesis.result.text) }];
+        return [...run.input.history, entry(run.id, synthesisFormatter(run)(run.synthesis.result.text))];
       }
     } else {
       const picked = run.results.find((r) => r.targetId === fromTargetId && r.ok && r.text.trim());
       if (picked) {
         const label = sourceDisplayName({ turnId: run.id, runId: picked.runId, targetId: picked.targetId, scope: 'answer' }, run);
-        return [...run.input.history, { turnId: run.id, question: run.question, answer: `[已选定回答：${label}]\n${picked.text.trim()}` }];
+        return [...run.input.history, entry(run.id, `[已选定回答：${label}]\n${picked.text.trim()}`)];
       }
     }
   }
   if (followUpExecution?.kind === 'execution' && followUpExecution.planSource?.turnId === run.id) {
     const planText = resolveChosenPlan(run, followUpExecution.planSource);
     const answer = formatExecutedAnswer(planText, followUpExecution, run);
-    if (answer) return [...run.input.history, { turnId: run.id, question: run.question, answer }];
+    if (answer) return [...run.input.history, entry(run.id, answer)];
   }
   if (run.synthesis?.result.ok && run.synthesis.result.text.trim()) {
     const answer = synthesisFormatter(run)(run.synthesis.result.text);
-    return [...run.input.history, { turnId: run.id, question: run.question, answer }];
+    return [...run.input.history, entry(run.id, answer)];
   }
   const best = run.results.find((r) => r.ok && r.text.trim());
-  return [...run.input.history, ...(best ? [{ turnId: run.id, question: run.question, answer: best.text }] : [])];
+  return [...run.input.history, ...(best ? [entry(run.id, best.text)] : [])];
 }

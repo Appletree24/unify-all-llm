@@ -1,13 +1,18 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { ExecPreview, Push, QuotaNotice, RunRecord, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import type { DistillPreparation, DistillSourceRef, ExecPreview, Push, QuotaNotice, RunRecord, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
-import { Card, Composer, ExecDialog, Turn, type Activity, type ComposerState, type FollowUpChoice, type TurnActions } from './Thread.js';
+import { Card, Composer, DistillDialog, ExecDialog, Turn, type Activity, type ComposerState, type FollowUpChoice, type TurnActions } from './Thread.js';
 import { Icon, Spinner, hue, isActive } from './ui.js';
 
 type View = 'chat' | 'quota' | 'memory' | 'settings';
 interface Toast { id: number; msg: string; kind: 'ok' | 'err' | 'info' }
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+const darkTheme = window.matchMedia('(prefers-color-scheme: dark)');
+function subscribeTheme(listener: () => void) {
+  darkTheme.addEventListener('change', listener);
+  return () => darkTheme.removeEventListener('change', listener);
+}
 
 function dayGroup(iso: string): string {
   const d = new Date(iso);
@@ -18,6 +23,8 @@ function dayGroup(iso: string): string {
 }
 
 export function App() {
+  const isDark = useSyncExternalStore(subscribeTheme, () => darkTheme.matches);
+  const themeAction = isDark ? '切换至亮色主题' : '切换至暗色主题';
   const [platform, setPlatform] = useState<string>('');
   const [ws, setWs] = useState<WorkspaceInfo | null | undefined>(undefined);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -31,6 +38,8 @@ export function App() {
   const [quotaNotice, setQuotaNotice] = useState<QuotaNotice>();
   const [toast, setToast] = useState<Toast>();
   const [execPreview, setExecPreview] = useState<ExecPreview>();
+  const [distillModal, setDistillModal] = useState<{ source: DistillSourceRef; prep: DistillPreparation }>();
+  const [pendingMemoryUpdates, setPendingMemoryUpdates] = useState<string[]>([]);
   const [zoom, setZoom] = useState<{ turnId: string; runId: string }>();
   const [followUp, setFollowUp] = useState<FollowUpChoice>();
   const [composer, setComposer] = useState<ComposerState>({ selected: [], manual: false, synth: '' });
@@ -81,6 +90,8 @@ export function App() {
   useEffect(() => {
     setCurrent(null);
     setFollowUp(undefined);
+    setPendingMemoryUpdates([]);
+    setDistillModal(undefined);
     setRecords({});
     setActivity({});
     setNotices({});
@@ -115,6 +126,7 @@ export function App() {
   const openSession = useCallback(async (id: string | null) => {
     setCurrent(id);
     setFollowUp(undefined);
+    setPendingMemoryUpdates([]);
     setView('chat');
     setZoom(undefined);
     if (!id) return;
@@ -156,8 +168,10 @@ export function App() {
         synthesize: composer.synth !== 'off', synthesizer: composer.synth && composer.synth !== 'off' ? composer.synth : undefined,
         sessionId: current ?? undefined,
         continueFrom: activeFollowUp?.targetId,
+        memoryUpdates: current && pendingMemoryUpdates.length ? pendingMemoryUpdates : undefined,
       });
       setFollowUp(undefined);
+      setPendingMemoryUpdates([]);
       setCurrent(ids.sessionId);
       refreshSessions();
       return true;
@@ -173,6 +187,9 @@ export function App() {
     cancel: (turnId) => { void unify.cancel(turnId); },
     cancelTarget: (turnId, targetId) => { void unify.cancelTarget(turnId, targetId); },
     followUp: (choice) => setFollowUp(choice),
+    distill: (source) => {
+      unify.prepareDistill(source).then((prep) => setDistillModal({ source, prep }), (err) => notify(errText(err), 'err'));
+    },
   };
   const cancelCurrent = () => { for (const t of turns) if (isActive(t)) void unify.cancel(t.id); };
 
@@ -231,6 +248,10 @@ export function App() {
             {ws.branch && <span className="tb-branch"><Icon name="branch" size={13} />{ws.branch}</span>}
           </>
         )}
+        <button type="button" className="tb-btn theme-toggle" title={themeAction} aria-label={themeAction}
+          onClick={() => void unify.setTheme(isDark ? 'light' : 'dark').catch(err => notify(errText(err), 'err'))}>
+          <Icon name={isDark ? 'sun' : 'moon'} />
+        </button>
       </div>
 
       {ws && sidebar && (
@@ -294,6 +315,7 @@ export function App() {
                 ws={ws} quota={quotaMap} busy={busy} state={composer} setState={setComposer}
                 onSend={send} onCancel={cancelCurrent} autoFocusKey={`${ws.cwd}:${current}`}
                 followUp={activeFollowUp} onClearFollowUp={() => setFollowUp(undefined)}
+                pendingMemoryUpdates={pendingMemoryUpdates} onClearMemoryUpdates={() => setPendingMemoryUpdates([])}
               />
             </>
           )}
@@ -312,6 +334,24 @@ export function App() {
           initial={execPreview} onClose={() => setExecPreview(undefined)}
           onError={(m) => notify(m, 'err')}
           onStarted={(ids) => { setExecPreview(undefined); setCurrent(ids.sessionId); setView('chat'); refreshSessions(); }}
+        />
+      )}
+      {distillModal && (
+        <DistillDialog
+          initial={distillModal.prep}
+          source={distillModal.source}
+          onClose={() => setDistillModal(undefined)}
+          onError={(m) => notify(m, 'err')}
+          onSaved={(res, applyInSession) => {
+            setDistillModal(undefined);
+            if (applyInSession) setPendingMemoryUpdates((prev) => [...prev, res.savedText]);
+            const effectNote = applyInSession
+              ? '已加入本对话下轮增量；新对话及原生 CLI 下轮起生效'
+              : res.affectsNativeCli
+                ? '新对话及原生 CLI 下轮起生效（当前 API 会话保持旧快照）'
+                : '新对话起生效';
+            notify(`已写入 ${res.display} · ${effectNote}`, 'ok');
+          }}
         />
       )}
       {toast && <div key={toast.id} className={`toast ${toast.kind}`} role="status">{toast.msg}</div>}

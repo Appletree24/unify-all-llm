@@ -6,13 +6,14 @@ export interface MemoryReference {
   effect: string;
 }
 
-const marker = (id: string) => `\n<unify-memory-${id}>`;
+export const memoryReportMarker = (id: string) => `\n<unify-memory-${id}>`;
 
-export function requestMemoryReport(prompt: string, id: string): string {
+export function requestMemoryReport(prompt: string, id: string, customMarker?: string): string {
+  const tag = customMarker ?? memoryReportMarker(id);
   return prompt + '\n\n仅当你实际依据持久记忆（如个人偏好、项目指令或跨会话记录）作出具体判断时，在最终回答后另起一行附上以下标记及 JSON 数组。'
     + '每项填写来源文件及已知行号或条目名、所用内容的简述、影响了本次回答的哪项判断。来源不详时写“来源不详”。'
     + '只报告本次自己采用的记忆，勿把对话历史、其他回答、普通项目文件或仅见过的规则列入。无需另行搜索。未使用时省略整个标记。'
-    + '数组元素的三个字符串字段分别为 source（来源）、content（记忆摘要）、effect（影响的判断）。标记为：' + marker(id);
+    + '数组元素的三个字符串字段分别为 source（来源）、content（记忆摘要）、effect（影响的判断）。标记为：' + tag;
 }
 
 export function formatMemoryReferences(refs?: MemoryReference[]): string {
@@ -38,9 +39,9 @@ function splitReport(text: string, tag: string) {
 }
 
 /** Keep the optional machine-readable trailer out of streamed answers, including split tags. */
-export async function* collectMemoryReport(events: AsyncIterable<ProviderEvent>, id: string, prompt: string): AsyncGenerator<ProviderEvent> {
-  const tag = marker(id);
-  if (!prompt.endsWith(tag)) {
+export async function* collectMemoryReport(events: AsyncIterable<ProviderEvent>, id: string, prompt: string, explicitMarker?: string): AsyncGenerator<ProviderEvent> {
+  const tag = explicitMarker ?? memoryReportMarker(id);
+  if (!explicitMarker && !prompt.endsWith(tag)) {
     yield* events;
     return;
   }

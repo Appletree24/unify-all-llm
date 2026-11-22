@@ -8,6 +8,13 @@ export type RunMode = 'ask' | 'exec';
 export interface Usage {
   inputTokens?: number;
   outputTokens?: number;
+  cachedInputTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
 }
 
 export interface ToolUse {
@@ -40,6 +47,8 @@ export interface Capabilities {
 
 export interface RunRequest {
   prompt: string;
+  /** Structured append-only messages for OpenAI-compatible API targets (preferred over prompt when present). */
+  messages?: ChatMessage[];
   cwd: string;
   mode: RunMode;
   model?: string;

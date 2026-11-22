@@ -3,14 +3,15 @@ import { hostname } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config.js';
 import { timeoutMillis } from './config.js';
-import { attachContextToPrompt, resolveSharedFileContext } from './context.js';
+import { resolveSharedFileContext } from './context.js';
 import { buildDecisionPrompt, parseDecision } from './decider.js';
 import { fanOut, runOne } from './orchestrator.js';
 import { createRun, exportRun, historyAfter, latestExecutionFor, newRunId, saveRun, type CallRecord, type PlanSource, type RunRecord } from './store.js';
-import { anonymize, buildConversationPrompt, buildExecPrompt, buildSynthesisPrompt, extractFinalPlan, synthesisFormatter } from './synth.js';
-import { appendToolUse, snapshotTarget, type ModelTarget, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
+import { anonymize, buildApiMessages, buildConversationPrompt, buildExecPrompt, buildSynthesisInput, buildSynthesisInstructions, buildSynthesisPrompt, buildTurnUserContent, extractFinalPlan, synthesisFormatter } from './synth.js';
+import { appendToolUse, snapshotTarget, type ChatMessage, type ModelTarget, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
 import { defaultTargetIds, detectTargets } from './targets.js';
-import { requestMemoryReport } from '../memory/report.js';
+import { memoryReportMarker, requestMemoryReport } from '../memory/report.js';
+import { canReceiveUserMemory, formatMemoryUpdateDelta, formatSharedMemoryPrompt, resolveSharedMemory, saveMemorySnapshots, type MemorySnapshot, type ResolvedSharedMemory } from '../memory/shared.js';
 
 type Scope = CallRecord['scope'];
 export type WorkflowEvent =
@@ -22,6 +23,7 @@ export type WorkflowEvent =
 
 interface CommonOptions {
   cwd: string;
+  home?: string;
   config: Config;
   targets: ModelTarget[];
   signal?: AbortSignal;
@@ -34,6 +36,8 @@ export interface ComparisonOptions extends CommonOptions {
   synthesize?: boolean;
   previous?: RunRecord;
   continueFrom?: string;
+  /** Optional append-only memory deltas saved mid-session, injected at the tail of the next API user turn. */
+  memoryUpdates?: string[];
   retry?: { record: RunRecord; targetIds: string[] };
 }
 export interface WorkflowHandle {
@@ -43,11 +47,53 @@ export interface WorkflowHandle {
   cancelTarget(id: string): boolean;
 }
 
+const REDACTED_USER_MEMORY_SYSTEM = '[user-memory-snapshot-redacted]';
+
+interface PreparedInput {
+  prompt: string;
+  messages?: ChatMessage[];
+  memoryReportMarker?: string;
+  memorySnapshot?: MemorySnapshot;
+  includesUserMemory?: boolean;
+  /** When true, requestMemoryReport is already applied or should not be appended again. */
+  skipReportWrap?: boolean;
+}
+
+/**
+ * Strip personal user-memory text before writing to project `.unify/runs/<id>/run.json`.
+ * Exact replay reconstructs the system message byte-for-byte from `<home>/.unify/memory-snapshots/`.
+ */
+function sanitizeMessagesForRun(messages: ChatMessage[] | undefined, includesUserMemory?: boolean): ChatMessage[] | undefined {
+  if (!messages) return undefined;
+  if (!includesUserMemory) return messages;
+  return messages.map((m, i) => (i === 0 && m.role === 'system' ? { role: 'system', content: REDACTED_USER_MEMORY_SYSTEM } : m));
+}
+
+function restoreMessagesForReplay(
+  cwd: string,
+  home: string | undefined,
+  call: CallRecord,
+  target: ModelTarget,
+  blobs?: ResolvedSharedMemory['blobs'],
+): ChatMessage[] | undefined {
+  const saved = call.input.messages;
+  if (!saved?.length) return undefined;
+  if (!call.input.includesUserMemory) return structuredClone(saved);
+  const baseSystem = target.adapter.configuration?.type === 'openai' ? target.adapter.configuration.system : undefined;
+  const { text: memText } = formatSharedMemoryPrompt(cwd, call.input.memorySnapshot, { includeUser: true, home, blobs });
+  const systemParts = [
+    baseSystem?.trim(),
+    memText.trim(),
+    call.scope === 'synthesis' ? buildSynthesisInstructions(false) : undefined,
+  ].filter((s): s is string => !!s);
+  return saved.map((m, i) => (i === 0 && m.role === 'system' ? { role: 'system', content: systemParts.join('\n\n') } : { ...m }));
+}
 /** Checkpoints own I/O failure handling so a broken display cannot stop model work. */
 class Journal {
   readonly ctl = new AbortController();
   private writeError?: Error;
   private lastWrite = 0;
+  private readonly liveMessages = new Map<string, ChatMessage[]>();
   private readonly abort = () => this.ctl.abort();
   constructor(readonly record: RunRecord, private opts: CommonOptions) {
     createRun(opts.cwd, record);
@@ -72,18 +118,44 @@ class Journal {
     this.assertWritable();
     this.emit({ type: 'stage', turnId: this.record.id, stage: status, targets: targets.map(snapshotTarget) });
   }
-  prepare(target: ModelTarget, scope: Scope, prompt: string, timeoutMs: number): CallRecord {
+  prepare(target: ModelTarget, scope: Scope, input: string | PreparedInput, timeoutMs: number): CallRecord {
     const id = randomUUID();
-    if (scope !== 'decision' && target.adapter.capabilities.askPolicy !== 'text-only') {
-      prompt = requestMemoryReport(prompt, id);
+    const spec: PreparedInput = typeof input === 'string' ? { prompt: input } : { ...input };
+    let prompt = spec.prompt;
+    let messages = spec.messages ? spec.messages.map((m) => ({ ...m })) : undefined;
+    let reportMarker = spec.memoryReportMarker;
+
+    const shouldReport = !spec.skipReportWrap && scope !== 'decision' && (
+      target.adapter.capabilities.askPolicy !== 'text-only'
+      || !!spec.memorySnapshot?.items.length
+    );
+    if (shouldReport) {
+      reportMarker ??= memoryReportMarker(id);
+      if (messages?.length && messages[messages.length - 1].role === 'user') {
+        const last = messages[messages.length - 1];
+        messages[messages.length - 1] = { role: 'user', content: requestMemoryReport(last.content, id, reportMarker) };
+      }
+      prompt = requestMemoryReport(prompt, id, reportMarker);
     }
+
+    if (messages) this.liveMessages.set(id, messages);
     const call: CallRecord = {
       id, scope, target: snapshotTarget(target),
-      input: { prompt, cwd: this.opts.cwd, mode: scope === 'exec' ? 'exec' : 'ask', timeoutMs },
+      input: {
+        prompt,
+        ...(messages ? { messages: sanitizeMessagesForRun(messages, spec.includesUserMemory) } : {}),
+        ...(reportMarker ? { memoryReportMarker: reportMarker } : {}),
+        ...(spec.memorySnapshot?.items.length ? { memorySnapshot: spec.memorySnapshot } : {}),
+        ...(spec.includesUserMemory ? { includesUserMemory: true } : {}),
+        cwd: this.opts.cwd, mode: scope === 'exec' ? 'exec' : 'ask', timeoutMs,
+      },
       result: { runId: id, targetId: target.id, provider: target.adapter.id, model: target.model, reasoningEffort: target.reasoningEffort, status: 'running', ok: false, text: '', reasoning: '', durationMs: 0 },
     };
     this.record.calls.push(call);
     return call;
+  }
+  messagesFor(callId: string): ChatMessage[] | undefined {
+    return this.liveMessages.get(callId);
   }
   begin(call: CallRecord): void {
     this.emit({ type: 'call', turnId: this.record.id, callId: call.id, scope: call.scope, target: call.target });
@@ -100,11 +172,11 @@ class Journal {
   async one(
     target: ModelTarget,
     scope: Scope,
-    prompt: string,
+    input: string | PreparedInput,
     timeoutMs: number,
     synthesisMeta?: { labels: Record<string, string>; preferredProvider?: string; fallback?: boolean; alsoAnswered?: boolean },
   ): Promise<CallRecord> {
-    const call = this.prepare(target, scope, prompt, timeoutMs);
+    const call = this.prepare(target, scope, input, timeoutMs);
     if (scope === 'exec') this.record.results.push(call.result);
     if (scope === 'synthesis') {
       this.record.synthesis = {
@@ -120,7 +192,10 @@ class Journal {
     this.assertWritable();
     this.begin(call);
     Object.assign(call.result, await runOne(target, {
-      ...call.input, runId: call.id, signal: this.ctl.signal, onEvent: (_id, event) => this.event(call, event),
+      ...call.input,
+      messages: this.messagesFor(call.id),
+      memoryReportMarker: call.input.memoryReportMarker,
+      runId: call.id, signal: this.ctl.signal, onEvent: (_id, event) => this.event(call, event),
     }));
     this.checkpoint();
     this.assertWritable();
@@ -225,26 +300,125 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     record.targets = targets.map(snapshotTarget);
     const hasTextOnly = targets.some((t) => t.adapter.capabilities.askPolicy === 'text-only')
       || (synthesize && opts.targets.some((t) => t.id === (opts.config.synthesizer ?? 'claude') && t.adapter.capabilities.askPolicy === 'text-only'));
-    const shared = hasTextOnly ? resolveSharedFileContext(opts.cwd, record.question) : { text: '', files: [], skipped: [] };
-    if (shared.files.length) {
-      const skipNote = shared.skipped.length ? `（跳过 ${shared.skipped.length} 个）` : '';
-      journal.emit({ type: 'notice', turnId: record.id, message: `已为纯文本模型附带引用文件: ${shared.files.join('、')}${skipNote}` });
+
+    // Resolve shared @file attachments and shared memory snapshot once per new turn;
+    // retries strictly replay the saved call snapshot without re-reading disk.
+    let shared = { text: '', files: [] as string[], skipped: [] as { path: string; reason: string }[] };
+    let memorySnapshot: MemorySnapshot | undefined = record.input.memorySnapshot;
+    let memoryBlobs: ResolvedSharedMemory['blobs'] | undefined;
+
+    if (!opts.retry) {
+      if (hasTextOnly) {
+        shared = resolveSharedFileContext(opts.cwd, record.question);
+        if (shared.files.length) {
+          record.input.sharedFiles = shared.files;
+          const skipNote = shared.skipped.length ? `（跳过 ${shared.skipped.length} 个）` : '';
+          journal.emit({ type: 'notice', turnId: record.id, message: `已为纯文本模型附带引用文件: ${shared.files.join('、')}${skipNote}` });
+        }
+        // Inherit frozen SessionStart memory snapshot on follow-up; resolve fresh only if absent.
+        if (opts.previous?.input.memorySnapshot) {
+          memorySnapshot = structuredClone(opts.previous.input.memorySnapshot);
+          record.input.memorySnapshot = memorySnapshot;
+        } else {
+          const resolved = resolveSharedMemory({ cwd: opts.cwd, home: opts.home }, opts.config);
+          if (resolved.snapshot.items.length || resolved.snapshot.notices?.length) {
+            saveMemorySnapshots(opts.cwd, resolved, opts.home);
+            memorySnapshot = resolved.snapshot;
+            memoryBlobs = resolved.blobs;
+            record.input.memorySnapshot = memorySnapshot;
+          }
+          if (resolved.snapshot.items.length) {
+            journal.emit({
+              type: 'notice', turnId: record.id,
+              message: `已为纯文本模型载入共享记忆: ${resolved.snapshot.items.map((i) => i.logicalPath).join('、')}`,
+            });
+          }
+          for (const note of resolved.snapshot.notices ?? []) {
+            journal.emit({ type: 'notice', turnId: record.id, message: note });
+          }
+        }
+      }
+      if (opts.memoryUpdates?.length) {
+        record.input.memoryUpdates = [...opts.memoryUpdates];
+      }
+      const memoryUpdate = formatMemoryUpdateDelta(record.input.memoryUpdates);
+      const userContent = buildTurnUserContent(record.question, { sharedContext: shared.text, memoryUpdate });
+      if (userContent !== record.question) record.input.userContent = userContent;
+    } else {
+      shared = { text: '', files: record.input.sharedFiles ?? [], skipped: [] };
     }
+
+    const prepareApiAnswer = (t: ModelTarget, timeoutMs: number): CallRecord => {
+      if (opts.retry) {
+        const prevCall = opts.retry.record.calls.find((c) => c.scope === 'answer' && c.target.id === t.id);
+        if (prevCall) {
+          const replayedMessages = restoreMessagesForReplay(opts.cwd, opts.home, prevCall, t, memoryBlobs);
+          return journal.prepare(t, 'answer', {
+            prompt: prevCall.input.prompt,
+            messages: replayedMessages,
+            memoryReportMarker: prevCall.input.memoryReportMarker,
+            memorySnapshot: prevCall.input.memorySnapshot,
+            includesUserMemory: prevCall.input.includesUserMemory,
+            skipReportWrap: true,
+          }, timeoutMs);
+        }
+      }
+      const allowUser = canReceiveUserMemory(t, opts.config);
+      const mem = formatSharedMemoryPrompt(opts.cwd, memorySnapshot, { includeUser: allowUser, home: opts.home, blobs: memoryBlobs });
+      const baseSystem = t.adapter.configuration?.type === 'openai' ? t.adapter.configuration.system : undefined;
+      const currentUserContent = record.input.userContent ?? record.question;
+      const messages = buildApiMessages({
+        baseSystem,
+        sharedMemory: mem.text || undefined,
+        history: record.input.history,
+        currentUserContent,
+      });
+      const prompt = shared.text || record.input.memoryUpdates?.length
+        ? buildConversationPrompt(record.input.history, record.question, [formatMemoryUpdateDelta(record.input.memoryUpdates), shared.text].filter(Boolean).join('\n\n'))
+        : record.input.prompt;
+      const targetSnapshot = mem.items.length ? { version: memorySnapshot!.version, items: mem.items } : undefined;
+      return journal.prepare(t, 'answer', {
+        prompt,
+        messages,
+        memorySnapshot: targetSnapshot,
+        includesUserMemory: mem.items.some((i) => i.scope === 'user'),
+      }, timeoutMs);
+    };
+
+    const prepareCliAnswer = (t: ModelTarget, timeoutMs: number): CallRecord => {
+      if (opts.retry) {
+        const prevCall = opts.retry.record.calls.find((c) => c.scope === 'answer' && c.target.id === t.id);
+        if (prevCall) {
+          return journal.prepare(t, 'answer', {
+            prompt: prevCall.input.prompt,
+            memoryReportMarker: prevCall.input.memoryReportMarker,
+            skipReportWrap: true,
+          }, timeoutMs);
+        }
+      }
+      return journal.prepare(t, 'answer', record.input.prompt, timeoutMs);
+    };
+
     journal.stage('answering', targets);
     const timeoutMs = timeoutMillis(opts.config.timeoutSec ?? 600);
-    const calls = new Map(targets.map((t) => {
-      const prompt = shared.text && t.adapter.capabilities.askPolicy === 'text-only'
-        ? attachContextToPrompt(record.input.prompt, shared.text)
-        : record.input.prompt;
-      return [t.id, journal.prepare(t, 'answer', prompt, timeoutMs)];
-    }));
+    const calls = new Map(targets.map((t) => [
+      t.id,
+      t.adapter.capabilities.askPolicy === 'text-only' ? prepareApiAnswer(t, timeoutMs) : prepareCliAnswer(t, timeoutMs),
+    ]));
     const prompts = new Map([...calls].map(([id, call]) => [id, call.input.prompt]));
+    const messagesByTarget = new Map<string, ChatMessage[]>();
+    const reportMarkers = new Map<string, string>();
+    for (const [id, call] of calls) {
+      const m = journal.messagesFor(call.id);
+      if (m) messagesByTarget.set(id, m);
+      if (call.input.memoryReportMarker) reportMarkers.set(id, call.input.memoryReportMarker);
+    }
     record.results = targets.map((t) => calls.get(t.id)!.result);
     journal.checkpoint();
     journal.assertWritable();
     for (const call of calls.values()) journal.begin(call);
     await fanOut(targets, {
-      prompt: record.input.prompt, prompts, cwd: opts.cwd, mode: 'ask', timeoutMs, concurrency: opts.config.concurrency ?? 3,
+      prompt: record.input.prompt, prompts, messagesByTarget, reportMarkers, cwd: opts.cwd, mode: 'ask', timeoutMs, concurrency: opts.config.concurrency ?? 3,
       signal: journal.ctl.signal, targetSignals: new Map([...controls].map(([id, c]) => [id, c.signal])),
       runIds: new Map([...calls].map(([id, c]) => [id, c.id])),
       onEvent: (id, event) => journal.event(calls.get(id)!, event),
@@ -252,7 +426,8 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     });
     journal.assertWritable();
     if (journal.ctl.signal.aborted) return;
-    const answers = anonymize(record.results, record.targets, shared.files);
+    const memoryTargets = new Set([...calls.entries()].filter(([, c]) => !!c.input.memorySnapshot?.items.length).map(([id]) => id));
+    const answers = anonymize(record.results, record.targets, shared.files, memoryTargets);
     if (!synthesize || answers.length < 2) return;
     const preferredId = opts.config.synthesizer ?? 'claude';
     const preferred = opts.targets.find((t) => t.id === preferredId);
@@ -271,13 +446,56 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     journal.stage('synthesizing', [synth]);
     const labels = Object.fromEntries(answers.map((a) => [a.label, a.provider]));
     const synthCanInspect = synth.adapter.capabilities.askPolicy !== 'text-only';
+
+    // Ensure fallback or separately-configured text-only synthesizer also receives frozen shared memory + shared files.
+    if (!synthCanInspect && !memorySnapshot && !opts.retry) {
+      if (opts.previous?.input.memorySnapshot) {
+        memorySnapshot = structuredClone(opts.previous.input.memorySnapshot);
+        record.input.memorySnapshot = memorySnapshot;
+      } else {
+        const resolved = resolveSharedMemory({ cwd: opts.cwd, home: opts.home }, opts.config);
+        if (resolved.snapshot.items.length) {
+          saveMemorySnapshots(opts.cwd, resolved, opts.home);
+          memorySnapshot = resolved.snapshot;
+          memoryBlobs = resolved.blobs;
+          record.input.memorySnapshot = memorySnapshot;
+        }
+      }
+    }
+    if (!synthCanInspect && !shared.text && !opts.retry && !shared.files.length) {
+      shared = resolveSharedFileContext(opts.cwd, record.question);
+    }
+
+    const synthPrompt = buildSynthesisPrompt(record.input.prompt, answers, {
+      canInspectWorkspace: synthCanInspect,
+      sharedContext: !synthCanInspect ? shared.text : undefined,
+    });
+    let synthInput: string | PreparedInput = synthPrompt;
+    if (!synthCanInspect) {
+      const allowUser = canReceiveUserMemory(synth, opts.config);
+      const mem = formatSharedMemoryPrompt(opts.cwd, memorySnapshot, { includeUser: allowUser, home: opts.home, blobs: memoryBlobs });
+      const baseSystem = synth.adapter.configuration?.type === 'openai' ? synth.adapter.configuration.system : undefined;
+      const systemParts = [baseSystem?.trim(), mem.text || undefined, buildSynthesisInstructions(false)].filter((s): s is string => !!s);
+      const userBody = [
+        formatMemoryUpdateDelta(record.input.memoryUpdates),
+        buildSynthesisInput(record.input.prompt, answers, { canInspectWorkspace: false, sharedContext: shared.text }),
+      ].filter(Boolean).join('\n\n');
+      const synthSnapshot = mem.items.length ? { version: memorySnapshot!.version, items: mem.items } : undefined;
+      synthInput = {
+        prompt: synthPrompt,
+        messages: [
+          { role: 'system', content: systemParts.join('\n\n') },
+          { role: 'user', content: userBody },
+        ],
+        memorySnapshot: synthSnapshot,
+        includesUserMemory: mem.items.some((i) => i.scope === 'user'),
+      };
+    }
+
     await journal.one(
       synth,
       'synthesis',
-      buildSynthesisPrompt(record.input.prompt, answers, {
-        canInspectWorkspace: synthCanInspect,
-        sharedContext: !synthCanInspect ? shared.text : undefined,
-      }),
+      synthInput,
       timeoutMs,
       {
         labels,

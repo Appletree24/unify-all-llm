@@ -13,6 +13,7 @@ const statePath = () => join(app.getPath('userData'), 'state.json');
 
 interface State {
   recent: string[];
+  theme?: 'light' | 'dark';
   bounds?: { x: number; y: number; width: number; height: number; maximized?: boolean };
   quotaReminders: QuotaReminderHistory;
 }
@@ -23,6 +24,7 @@ function readState(): State {
     const reminders = s.quotaReminders;
     return {
       recent: Array.isArray(s.recent) ? s.recent.filter((p: unknown) => typeof p === 'string') : [], bounds: s.bounds,
+      theme: s.theme === 'dark' || s.theme === 'light' ? s.theme : undefined,
       quotaReminders: reminders && typeof reminders === 'object' && !Array.isArray(reminders) ? reminders : {},
     };
   } catch { return { recent: [], quotaReminders: {} }; }
@@ -101,6 +103,12 @@ const need = (): Workspace => {
 
 const api: UnifyApi = {
   async platform() { return process.platform; },
+  async setTheme(theme) {
+    if (theme !== 'light' && theme !== 'dark') throw new Error('请选择亮色或暗色主题');
+    nativeTheme.themeSource = theme;
+    state.theme = theme;
+    writeState(state);
+  },
   async workspace() {
     if (pendingQuotaNotice) {
       push({ type: 'quota-notice', notice: pendingQuotaNotice });
@@ -132,6 +140,10 @@ const api: UnifyApi = {
   async setSetting(key, value, entry) { return need().setSetting(key, value, entry); },
   async saveApi(id, model, apiKey) { return need().saveApi(id, model, apiKey); },
   async memoryUrl() { return need().memoryUrl(); },
+  async prepareDistill(source) { return need().prepareDistill(source); },
+  async distillCandidates(source, targetId) { return need().distillCandidates(source, targetId); },
+  async checkDistillDuplicate(targetPath, text) { return need().checkDistillDuplicate(targetPath, text); },
+  async applyDistill(req) { return need().applyDistill(req); },
   async reveal(what, id) {
     const ws = need();
     const settings = what.endsWith('config') ? ws.settings() : undefined;
@@ -238,6 +250,7 @@ if (!app.requestSingleInstanceLock()) {
 
   void app.whenReady().then(async () => {
     state = readState();
+    nativeTheme.themeSource = state.theme ?? 'system';
     await prepareProviderPath();
     const fromArgs = process.argv.slice(app.isPackaged ? 1 : 2).find((a) => !a.startsWith('-') && isDir(a));
     const initial = process.env.UNIFY_CWD ?? fromArgs ?? state.recent.find(isDir);

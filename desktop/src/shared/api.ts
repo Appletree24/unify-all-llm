@@ -4,8 +4,9 @@ import type { RunRecord } from '../../../src/core/store.js';
 import type { ModelTestState } from '../../../src/core/model-tests.js';
 import type { TargetQuota } from '../../../src/quota/types.js';
 import type { QuotaNotice } from '../../../src/quota/reminders.js';
+import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult } from '../../../src/memory/distill.js';
 
-export type { Config, QuotaNotice, ReasoningEffort, RunRecord, TargetQuota };
+export type { Config, DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult, QuotaNotice, ReasoningEffort, RunRecord, TargetQuota };
 export type RunResultRecord = RunRecord['results'][number];
 export type CallRecord = RunRecord['calls'][number];
 
@@ -61,6 +62,8 @@ export interface AskRequest {
   sessionId?: string;
   /** Optional targetId (or 'synthesis') from the previous turn to carry into follow-up history. */
   continueFrom?: string;
+  /** Optional newly distilled memory items appended to the next API turn without mutating cached system prefix. */
+  memoryUpdates?: string[];
 }
 
 export interface ExecPreview {
@@ -108,6 +111,7 @@ export type Push =
 
 export interface UnifyApi {
   platform(): Promise<NodeJS.Platform>;
+  setTheme(theme: 'light' | 'dark'): Promise<void>;
   workspace(): Promise<WorkspaceInfo | null>;
   openWorkspace(dir?: string): Promise<WorkspaceInfo | null>;
   recentWorkspaces(): Promise<string[]>;
@@ -125,6 +129,10 @@ export interface UnifyApi {
   setSetting(key: keyof Config, value: unknown, entry?: string): Promise<WorkspaceInfo>;
   saveApi(id: string, model: string, apiKey?: string): Promise<WorkspaceInfo>;
   memoryUrl(): Promise<string>;
+  prepareDistill(source: DistillSourceRef): Promise<DistillPreparation>;
+  distillCandidates(source: DistillSourceRef, targetId?: string): Promise<DistillCandidate[]>;
+  checkDistillDuplicate(targetPath: string, text: string): Promise<DuplicateCheckResult>;
+  applyDistill(req: DistillSaveRequest): Promise<DistillApplyResult>;
   reveal(what: 'project' | 'run' | 'user-config' | 'project-config', id?: string): Promise<void>;
   copy(text: string): Promise<void>;
 }

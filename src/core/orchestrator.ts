@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { collectMemoryReport } from '../memory/report.js';
-import { appendToolUse, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
+import { appendToolUse, type ChatMessage, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
 
 export interface RunOptions {
   prompt: string;
+  messages?: ChatMessage[];
+  memoryReportMarker?: string;
   cwd: string;
   mode: RunMode;
   timeoutMs: number;
@@ -48,9 +50,11 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
       if (ctl.signal.aborted) return;
       if (opts.mode === 'exec' && !target.adapter.capabilities.exec) throw new Error(`${target.label} 不支持实施`);
       const events = target.adapter.run({
-        prompt: opts.prompt, cwd: opts.cwd, mode: opts.mode, model: target.model, reasoningEffort: target.reasoningEffort, signal: ctl.signal,
+        prompt: opts.prompt,
+        ...(opts.messages ? { messages: opts.messages } : {}),
+        cwd: opts.cwd, mode: opts.mode, model: target.model, reasoningEffort: target.reasoningEffort, signal: ctl.signal,
       });
-      for await (const ev of collectMemoryReport(events, res.runId, opts.prompt)) {
+      for await (const ev of collectMemoryReport(events, res.runId, opts.prompt, opts.memoryReportMarker)) {
         if (stopped || ctl.signal.aborted) break;
         if (terminal) throw new Error('模型在终态后继续发送事件');
         if (ev.type === 'done' || ev.type === 'error') {
@@ -104,6 +108,8 @@ export async function fanOut(
   opts: RunOptions & {
     concurrency: number;
     prompts?: ReadonlyMap<string, string>;
+    messagesByTarget?: ReadonlyMap<string, ChatMessage[]>;
+    reportMarkers?: ReadonlyMap<string, string>;
     targetSignals?: ReadonlyMap<string, AbortSignal>;
     runIds?: ReadonlyMap<string, string>;
     onResult?: (result: RunResult) => void;
@@ -128,6 +134,8 @@ export async function fanOut(
         results[i] = await runOne(target, {
           ...opts,
           prompt: opts.prompts?.get(target.id) ?? opts.prompt,
+          messages: opts.messagesByTarget?.get(target.id) ?? opts.messages,
+          memoryReportMarker: opts.reportMarkers?.get(target.id) ?? opts.memoryReportMarker,
           runId: opts.runIds?.get(target.id),
           signal: ctl.signal,
         });

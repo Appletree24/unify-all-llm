@@ -8,6 +8,7 @@ import { defaultTargetIds, detectTargets } from '../../../src/core/targets.js';
 import { ModelTests } from '../../../src/core/model-tests.js';
 import type { ModelTarget } from '../../../src/core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../../../src/core/workflow.js';
+import { applyDistillSave, checkMemoryDuplicates, distillCandidates as runDistillCandidates, prepareDistill as buildDistillPrep, type DistillApplyResult, type DistillCandidate, type DistillPreparation, type DistillSaveRequest, type DistillSourceRef, type DuplicateCheckResult } from '../../../src/memory/distill.js';
 import { defaultContext } from '../../../src/memory/scan.js';
 import { startMemoryServer, type MemoryServer } from '../../../src/memory/server.js';
 import { effortChoices } from '../../../src/providers/effort.js';
@@ -206,7 +207,8 @@ export class Workspace {
     const config = req.synthesizer ? parseConfig({ ...this.cfg, synthesizer: req.synthesizer }) : this.cfg;
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected,
-      manualSelection: req.manual, synthesize: req.synthesize, previous, continueFrom: req.continueFrom, onEvent,
+      manualSelection: req.manual, synthesize: req.synthesize, previous, continueFrom: req.continueFrom,
+      memoryUpdates: req.memoryUpdates, onEvent,
     }));
   }
 
@@ -341,6 +343,27 @@ export class Workspace {
   memoryUrl(): Promise<string> {
     this.memory ??= startMemoryServer(defaultContext(this.cwd));
     return this.memory.then((m) => m.url, (err) => { this.memory = undefined; throw err; });
+  }
+
+  prepareDistill(source: DistillSourceRef): DistillPreparation {
+    return buildDistillPrep(defaultContext(this.cwd), source);
+  }
+
+  async distillCandidates(source: DistillSourceRef, targetId?: string): Promise<DistillCandidate[]> {
+    await this.detecting;
+    const picked = (targetId ? this.targets.find((t) => t.id === targetId) : undefined)
+      ?? (this.cfg.synthesizer ? this.targets.find((t) => t.id === this.cfg.synthesizer && this.installed.get(t.id)) : undefined)
+      ?? this.targets.find((t) => this.installed.get(t.id));
+    if (!picked) throw new Error('没有可用于提炼候选的可用模型');
+    return runDistillCandidates(defaultContext(this.cwd), source, picked);
+  }
+
+  checkDistillDuplicate(targetPath: string, text: string): DuplicateCheckResult {
+    return checkMemoryDuplicates(defaultContext(this.cwd), targetPath, text);
+  }
+
+  applyDistill(req: DistillSaveRequest): DistillApplyResult {
+    return applyDistillSave(defaultContext(this.cwd), req);
   }
 
   runDir(id: string): string {

@@ -16,6 +16,15 @@ export type { CustomProviderConfig } from '../core/config.js';
  *
  * Custom models are answer-only: they cannot be the executor.
  */
+const usageSchema = z.object({
+  prompt_tokens: z.number().optional(),
+  completion_tokens: z.number().optional(),
+  prompt_cache_hit_tokens: z.number().optional(),
+  cache_read_input_tokens: z.number().optional(),
+  cache_creation_input_tokens: z.number().optional(),
+  prompt_tokens_details: z.object({ cached_tokens: z.number().optional() }).passthrough().optional(),
+}).passthrough();
+
 const chunkSchema = z.object({
   error: z.object({ message: z.string() }).passthrough().optional(),
   choices: z.array(z.object({
@@ -24,8 +33,19 @@ const chunkSchema = z.object({
       content: z.string().nullish(), reasoning_content: z.string().nullish(), reasoning: z.string().nullish(),
     }).optional(),
   })).optional(),
-  usage: z.object({ prompt_tokens: z.number().optional(), completion_tokens: z.number().optional() }).nullable().optional(),
+  usage: usageSchema.nullable().optional(),
 });
+
+function parseHttpUsage(u: z.infer<typeof usageSchema>) {
+  const cached = u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? u.cache_read_input_tokens;
+  const write = u.cache_creation_input_tokens;
+  return {
+    inputTokens: u.prompt_tokens,
+    outputTokens: u.completion_tokens,
+    ...(cached !== undefined ? { cachedInputTokens: cached } : {}),
+    ...(write !== undefined ? { cacheWriteTokens: write } : {}),
+  };
+}
 
 function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'openai' }>, getKey = () => c.apiKeyEnv ? process.env[c.apiKeyEnv] : undefined): ProviderAdapter {
   return {
@@ -42,6 +62,9 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
         yield { type: 'error', message: `环境变量 ${c.apiKeyEnv} 未设置` };
         return;
       }
+      const messages = req.messages?.length
+        ? req.messages
+        : [...(c.system ? [{ role: 'system' as const, content: c.system }] : []), { role: 'user' as const, content: req.prompt }];
       const res = await fetch(`${c.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
         method: 'POST',
         signal: req.signal,
@@ -50,7 +73,7 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
           model: req.model ?? c.model,
           stream: true,
           ...httpEffort(c.baseUrl, req.reasoningEffort),
-          messages: [...(c.system ? [{ role: 'system', content: c.system }] : []), { role: 'user', content: req.prompt }],
+          messages,
         }),
       });
       if (!res.ok || !res.body) {
@@ -60,7 +83,7 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
       }
       let acc = '';
       let finished = false;
-      let usage: { inputTokens?: number; outputTokens?: number } | undefined;
+      let usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; cacheWriteTokens?: number } | undefined;
       for await (const data of sseData(res.body)) {
         if (data.trim() === '[DONE]') {
           finished = true;
@@ -68,7 +91,7 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
         }
         const chunk = chunkSchema.parse(JSON.parse(data));
         if (chunk.error) throw new Error(chunk.error.message);
-        if (chunk.usage) usage = { inputTokens: chunk.usage.prompt_tokens, outputTokens: chunk.usage.completion_tokens };
+        if (chunk.usage) usage = parseHttpUsage(chunk.usage);
         const choice = chunk.choices?.find((v) => (v.index ?? 0) === 0);
         if (!choice) continue;
         const delta = choice.delta;

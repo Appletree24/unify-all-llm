@@ -37,7 +37,11 @@ export const gemini: ProviderAdapter = {
           yield {
             type: 'done',
             text: acc,
-            usage: { inputTokens: ev.stats?.input_tokens, outputTokens: ev.stats?.output_tokens },
+            usage: {
+              inputTokens: ev.stats?.input_tokens,
+              outputTokens: ev.stats?.output_tokens,
+              ...(ev.stats?.cached !== undefined ? { cachedInputTokens: ev.stats.cached } : {}),
+            },
           };
         }
       }

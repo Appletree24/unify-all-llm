@@ -18,6 +18,13 @@ export const customSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({ type: z.literal('command'), label: text.optional(), command: text, args: z.array(z.string()).optional() }),
 ]);
+const memorySchema = z.strictObject({
+  projectSource: z.enum(['auto', 'AGENTS.md', 'CLAUDE.md', '.unify/memory.md', 'off']).optional(),
+  userEnabled: z.boolean().optional(),
+  userPath: text.optional(),
+  userAllowTargets: z.array(id).optional(),
+  maxBytes: z.number().int().min(1024).max(256 * 1024).optional(),
+});
 const schema = z.strictObject({
   showReasoning: z.boolean().optional(), mouse: z.boolean().optional(),
   disableClaude: z.boolean().optional(),
@@ -30,8 +37,10 @@ const schema = z.strictObject({
   concurrency: z.number().int().min(1).max(64).optional(),
   custom: z.record(id, customSchema).optional(),
   quotaCommands: z.record(id, z.strictObject({ command: text, args: z.array(z.string()).optional() })).optional(),
+  memory: memorySchema.optional(),
 });
 export type Config = z.infer<typeof schema>;
+export type MemoryConfig = z.infer<typeof memorySchema>;
 export type CustomProviderConfig = z.infer<typeof customSchema>;
 
 export function parseConfig(value: unknown, source = '配置'): Config {
@@ -58,11 +67,20 @@ export function loadConfig(cwd: string): Config {
 }
 
 export function mergeConfig(user: Config, project: Config): Config {
+  const memory: MemoryConfig | undefined = (user.memory || project.memory) ? {
+    // User-level memory disclosure is trusted ONLY from user config.
+    ...(user.memory?.userEnabled !== undefined ? { userEnabled: user.memory.userEnabled } : {}),
+    ...(user.memory?.userPath !== undefined ? { userPath: user.memory.userPath } : {}),
+    ...(user.memory?.userAllowTargets !== undefined ? { userAllowTargets: user.memory.userAllowTargets } : {}),
+    ...(project.memory?.projectSource ?? user.memory?.projectSource ? { projectSource: project.memory?.projectSource ?? user.memory?.projectSource } : {}),
+    ...(project.memory?.maxBytes ?? user.memory?.maxBytes ? { maxBytes: project.memory?.maxBytes ?? user.memory?.maxBytes } : {}),
+  } : undefined;
   return {
     ...user, ...project, custom: user.custom, quotaCommands: user.quotaCommands,
     disableClaude: user.disableClaude === true || project.disableClaude === true,
     reasoningEffort: { ...user.reasoningEffort, ...project.reasoningEffort },
     models: { ...user.models, ...project.models }, targets: { ...user.targets, ...project.targets },
+    ...(memory && Object.keys(memory).length ? { memory } : {}),
   };
 }
 

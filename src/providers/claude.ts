@@ -51,7 +51,12 @@ export const claude: ProviderAdapter = {
             type: 'done',
             // In ask mode the final message is the answer; in exec mode keep the whole narration.
             text: req.mode === 'ask' ? String(ev.result || acc) : acc || String(ev.result ?? ''),
-            usage: { inputTokens: ev.usage?.input_tokens, outputTokens: ev.usage?.output_tokens },
+            usage: {
+              inputTokens: ev.usage?.input_tokens,
+              outputTokens: ev.usage?.output_tokens,
+              ...(ev.usage?.cache_read_input_tokens !== undefined ? { cachedInputTokens: ev.usage.cache_read_input_tokens } : {}),
+              ...(ev.usage?.cache_creation_input_tokens !== undefined ? { cacheWriteTokens: ev.usage.cache_creation_input_tokens } : {}),
+            },
           };
         }
       }
