@@ -1,8 +1,8 @@
-import { execFile } from 'node:child_process';
 import { lstatSync, mkdtempSync, realpathSync, renameSync, rmdirSync, statSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { atomicWrite } from '../../../src/core/atomic-write.js';
 import { loadConfig, parseConfig, readJson, type Config } from '../../../src/core/config.js';
+import { currentGitBranch, listGitBranches, switchGitBranch } from '../../../src/core/git-branches.js';
 import { projectConfigPath, userConfigPath, writeSetting } from '../../../src/core/settings.js';
 import { listRunIds, loadRun, type RunRecord } from '../../../src/core/store.js';
 import { defaultTargetIds, detectTargets } from '../../../src/core/targets.js';
@@ -26,12 +26,6 @@ const QUOTA_TTL_MS = 45_000;
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-function gitBranch(cwd: string): Promise<string | undefined> {
-  return new Promise((done) => {
-    execFile('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, windowsHide: true, timeout: 3000 }, (err, out) => done(err ? undefined : out.trim() || undefined));
-  });
-}
-
 /**
  * One project directory: its merged config, targets, live workflows and caches.
  * Everything model-related goes through the same core functions the CLI and TUI use.
@@ -43,7 +37,8 @@ export class Workspace {
   private installed = new Map<string, boolean>();
   private detecting?: Promise<void>;
   private detectCtl = new AbortController();
-  private branch?: string;
+  private branch?: string | null;
+  private branchChange?: Promise<void>;
   private readonly handles = new Map<string, WorkflowHandle>();
   private readonly deletions = new Map<string, Promise<void>>();
   private readonly runCache = new Map<string, { mtime: number; run: RunRecord }>();
@@ -57,7 +52,7 @@ export class Workspace {
   constructor(readonly cwd: string, private readonly push: (p: Push) => void, private readonly onQuota: (quotas: TargetQuota[]) => void) {
     this.modelTests = new ModelTests(cwd, () => this.pushInfo());
     this.reload();
-    void gitBranch(cwd).then((b) => { this.branch = b; this.pushInfo(); });
+    void this.refreshGitBranch();
     this.quotaTimer = setInterval(() => this.refreshQuota(), QUOTA_REFRESH_MS);
   }
 
@@ -116,7 +111,34 @@ export class Workspace {
   }
 
   get busy(): boolean {
-    return this.handles.size > 0 || this.deletions.size > 0;
+    return !!this.branchChange || this.handles.size > 0 || this.deletions.size > 0;
+  }
+
+  private async refreshGitBranch(): Promise<void> {
+    this.branch = await currentGitBranch(this.cwd).catch(() => undefined);
+    if (!this.disposed) this.pushInfo();
+  }
+
+  async gitBranches() {
+    const branches = await listGitBranches(this.cwd);
+    if (!this.disposed && !this.branchChange && this.branch !== branches.current) {
+      this.branch = branches.current;
+      this.pushInfo();
+    }
+    return branches;
+  }
+
+  async switchBranch(branch: string): Promise<void> {
+    if (this.disposed) throw new Error('项目已关闭');
+    if (this.busy) throw new Error('当前项目还有操作在进行，请等待完成后再切换分支');
+    const change = switchGitBranch(this.cwd, branch).finally(() => this.refreshGitBranch());
+    this.branchChange = change;
+    try { await change; }
+    finally { this.branchChange = undefined; }
+  }
+
+  private assertBranchIdle(): void {
+    if (this.branchChange) throw new Error('正在切换 Git 分支，请稍候');
   }
 
   // ── records ────────────────────────────────────────────────────────────
@@ -192,6 +214,7 @@ export class Workspace {
   }
 
   async deleteSession(id: string, trash: (path: string) => Promise<void>): Promise<void> {
+    this.assertBranchIdle();
     this.assertSessionIdle(id);
     const runs = this.session(id);
     if (!runs.length) throw new Error('找不到这段对话');
@@ -240,6 +263,7 @@ export class Workspace {
    * structural events go out at once. Events emitted before the handle exists are replayed.
    */
   private start(begin: (onEvent: (e: WorkflowEvent) => void) => WorkflowHandle): { turnId: string; sessionId: string } {
+    this.assertBranchIdle();
     const early: WorkflowEvent[] = [];
     let route: (e: WorkflowEvent) => void = (e) => early.push(e);
     const handle = begin((e) => route(e));
@@ -489,7 +513,7 @@ export class Workspace {
     const pending = [...this.handles.values()];
     for (const h of pending) h.cancel();
     const deletions = Array.from(this.deletions.values(), (deletion) => deletion.catch(() => undefined));
-    await Promise.all([quota, this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined)), ...deletions]);
+    await Promise.all([quota, this.branchChange?.catch(() => undefined), this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined)), ...deletions]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 }

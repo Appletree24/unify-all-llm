@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename } from 'node:path';
+import { currentGitBranch, listGitBranches, switchGitBranch, type GitBranches } from '../core/git-branches.js';
 import { loadConfig, type Config, type RunRecord } from '../core/store.js';
 import type { ModelTarget, ProviderEvent } from '../core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
@@ -102,7 +102,10 @@ export class App {
   private quitArmed = 0;
   private help = false;
   private tokens = { input: 0, output: 0 };
-  private branch = '';
+  private branch?: string | null;
+  private branchOperation?: Promise<void>;
+  private switchingBranch = false;
+  private branchView?: GitBranches & { offset: number };
   private memory?: Promise<MemoryServer>;
   private mem?: MemoryView;
   private settings?: SettingsView;
@@ -146,7 +149,7 @@ export class App {
 
   // ── lifecycle ────────────────────────────────────────────────────────────
   async init(open?: 'memory'): Promise<void> {
-    try { this.branch = /^ref: refs\/heads\/(.+)$/m.exec(readFileSync(join(this.cwd, '.git', 'HEAD'), 'utf8'))?.[1] ?? ''; } catch { /* not a repository */ }
+    const initialBranch = currentGitBranch(this.cwd).catch(() => undefined);
     this.showReasoning = this.cfg.showReasoning ?? false;
     this.mouseOn = this.cfg.mouse ?? true;
     if (!this.mouseOn) this.io.setMouse?.(false);
@@ -160,8 +163,9 @@ export class App {
       }
     }, 100);
     const initial = this.all;
-    const detected = await detectTargets(initial, this.detecting.signal);
+    const [detected, branch] = await Promise.all([detectTargets(initial, this.detecting.signal), initialBranch]);
     if (this.disposed) return;
+    if (!this.branchOperation && this.branch === undefined) this.branch = branch;
     for (const target of initial) {
       if (this.adapter(target.id) === target) this.installed.set(target.id, detected.get(target.id) ?? false);
     }
@@ -182,7 +186,7 @@ export class App {
     if (this.ticker) clearInterval(this.ticker);
     this.ctl?.abort();
     this.detecting.abort();
-    await Promise.all([this.active?.done.catch(() => undefined), this.modelTests.reset()]);
+    await Promise.all([this.active?.done.catch(() => undefined), this.branchOperation, this.modelTests.reset()]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 
@@ -274,6 +278,7 @@ export class App {
   }
 
   private async ask(question: string, retryIds?: string[]): Promise<void> {
+    if (this.switchingBranch) return this.say('正在切换 Git 分支，请稍候', YELLOW);
     if (!this.selected.length) return this.say('没有可用的模型，输入 /settings 接入官方 API，或检查 CLI 登录状态', RED);
     const previous = this.lastRun;
     const continueFrom = retryIds ? undefined : this.continueFrom;
@@ -307,6 +312,7 @@ export class App {
   }
 
   private startExec(executorId?: string): void {
+    if (this.switchingBranch) return this.say('正在切换 Git 分支，请稍候', YELLOW);
     if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
     const run = this.lastRun;
     if (!run) return this.say('还没有可实施的方案：先提一个问题', YELLOW);
@@ -474,7 +480,38 @@ export class App {
     }
   }
 
+  private changeBranch(branch: string): void {
+    if (this.branchOperation) return this.say('Git 分支操作正在进行，请稍候', YELLOW);
+    if (branch && this.busy) return this.say('请等待当前请求结束后切换分支', YELLOW);
+    this.switchingBranch = !!branch;
+    if (branch) this.say('正在切换 Git 分支…');
+    this.branchOperation = (async () => {
+      if (!branch) {
+        const branches = await listGitBranches(this.cwd);
+        if (this.branch !== branches.current) this.files = undefined;
+        this.branch = branches.current;
+        this.branchView = { ...branches, offset: Math.max(0, branches.local.indexOf(branches.current ?? '')) };
+        return;
+      }
+      try {
+        await switchGitBranch(this.cwd, branch);
+        this.say(`已切换到 ${branch}`, GOLD);
+      } finally {
+        const current = await currentGitBranch(this.cwd).catch(() => undefined);
+        if (current !== this.branch || current === branch) this.files = undefined;
+        this.branch = current;
+      }
+    })().catch((err: Error) => this.say(err.message.replace(/\s*\r?\n\s*/g, ' '), RED))
+      .finally(() => {
+        this.branchOperation = undefined;
+        this.switchingBranch = false;
+        this.requestRender();
+      });
+  }
+
   private command(line: string): void {
+    const branch = /^\/branch(?:[ \t]+(.*))?$/.exec(line);
+    if (branch) return this.changeBranch(branch[1] ?? '');
     const [name, ...rest] = line.slice(1).trim().split(/\s+/);
     const arg = rest.join(' ');
     if (name === 'settings') {
@@ -553,6 +590,18 @@ export class App {
 
   // ── input ────────────────────────────────────────────────────────────────
   handleKey(k: Key): void {
+    const branches = this.branchView;
+    if (branches) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      if (k.name === 'esc' || k.name === 'ctrl+c' || k.name === 'enter') {
+        this.branchView = undefined;
+      } else if (k.name === 'up' || k.name === 'wheelup') {
+        branches.offset--;
+      } else if (k.name === 'down' || k.name === 'wheeldown') {
+        branches.offset++;
+      }
+      return this.requestRender();
+    }
     const view = this.api ?? this.settings;
     if (view) {
       if (k.name === 'ctrl+d') return this.onQuit();
@@ -824,8 +873,10 @@ export class App {
   }
 
   private submit(): void {
-    const text = this.ed.text.trim();
+    const raw = this.ed.text.trimStart();
+    const text = /^\/branch(?:[ \t]|$)/.test(raw) ? raw.replace(/[ \t\r\n]+$/, '') : raw.trimEnd();
     if (!text) return;
+    if (this.switchingBranch && !text.startsWith('/')) return this.say('正在切换 Git 分支，请稍候', YELLOW);
     if (!/^\/settings\s/.test(text) && this.history[this.history.length - 1] !== text) this.history.push(text);
     this.histIdx = this.history.length;
     this.draft = '';
@@ -862,6 +913,10 @@ export class App {
     const s = new Screen(cols, rows);
     this.cursor = null;
     this.rects = [];
+    if (this.branchView) {
+      this.drawBranches(s, this.branchView);
+      return s;
+    }
     const view = this.api ?? this.settings;
     if (view) {
       view.draw(s);
@@ -881,6 +936,21 @@ export class App {
     this.drawBody(s, 2, rows - 3 - inputH);
     this.drawPopup(s);
     return s;
+  }
+
+  private drawBranches(s: Screen, branches: GitBranches & { offset: number }): void {
+    const { current, local } = branches;
+    const limit = s.rows - 5;
+    branches.offset = clamp(branches.offset, 0, Math.max(0, local.length - limit));
+    s.put(1, 0, '本地 Git 分支', '1;' + GOLD);
+    s.put(1, 1, truncate(`当前分支 · ${current ?? '游离 HEAD'}`, s.cols - 2), DIM);
+    if (!local.length) s.put(1, 3, '暂无本地分支', DIM);
+    local.slice(branches.offset, branches.offset + limit).forEach((name, row) => {
+      const selected = name === current;
+      s.put(1, row + 3, truncate((selected ? '* ' : '  ') + name, s.cols - 2), selected ? GOLD : '');
+    });
+    s.put(1, s.rows - 2, '↑↓ 滚动 · Esc 返回', DIM);
+    s.put(1, s.rows - 1, '使用 /branch 分支名 切换', DIM);
   }
 
   private drawHeader(s: Screen): void {
@@ -995,7 +1065,7 @@ export class App {
     const rx = s.cols - textWidth(right) - 1;
     if (right) s.put(rx, y, right, DIM);
     const home = homedir();
-    const branch = this.branch ? ` (${this.branch})` : '';
+    const branch = this.branch === undefined ? '' : ` (${this.branch ?? '游离 HEAD'})`;
     const where = (this.cwd === home || this.cwd.startsWith(home + '/') ? '~' + this.cwd.slice(home.length) : this.cwd) + branch;
     const who = this.selected.length ? `${this.selected.join(' + ')}${this.cfg.synthesizer && this.selected.length > 1 ? ` → ${this.cfg.synthesizer}` : ''}` : '';
     const room = (right ? rx : s.cols) - 2;

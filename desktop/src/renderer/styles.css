@@ -70,7 +70,10 @@ kbd { font: 11px var(--sans); color: var(--faint); margin-left: auto; }
 .tb-project { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 7px; color: var(--ink-2); font-weight: 500; max-width: 320px; }
 .tb-project:hover { background: var(--hover); }
 .tb-project .icon:last-child { color: var(--faint); }
-.tb-branch { display: flex; gap: 5px; align-items: center; font: 12px var(--mono); color: var(--faint); margin-left: 2px; white-space: nowrap; overflow: hidden; }
+.tb-branch { display: flex; gap: 5px; align-items: center; min-width: 0; padding: 4px 7px; border-radius: 7px; font: 12px var(--mono); color: var(--dim); }
+.tb-branch:hover, .tb-branch:focus-visible { background: var(--hover); color: var(--ink); }
+.tb-branch .icon { flex: none; }
+.tb-branch span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .menu-back { position: fixed; inset: 0; z-index: 49; }
 .menu { position: absolute; top: 36px; left: 0; min-width: 320px; max-width: 480px; background: var(--raised); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow-lg); padding: 5px; z-index: 50; animation: rise .14s; }
 .menu button { display: flex; flex-direction: column; align-items: flex-start; width: 100%; padding: 7px 10px; border-radius: 7px; text-align: left; }
@@ -422,7 +425,7 @@ input.num { width: 110px; text-align: right; font-variant-numeric: tabular-nums;
 .distill-dup-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; color: var(--dim); }
 .distill-session-opt { margin-top: 2px; }
 .toast { position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 8px 16px; border-radius: 10px; font-size: 13px; box-shadow: var(--shadow-lg); z-index: 80; animation: toast .18s; max-width: min(640px, 90vw); }
-.toast.err { background: var(--err); color: #fff; }
+.toast.err { background: var(--err); color: #fff; white-space: pre-line; overflow-wrap: anywhere; }
 .quota-notice { position: fixed; z-index: 81; top: 56px; right: 16px; width: min(376px, calc(100vw - 32px)); padding: 12px 14px; background: var(--raised); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow-lg); animation: rise .18s; }
 .quota-notice header { display: flex; gap: 8px; align-items: center; padding-right: 24px; }
 .quota-notice header .icon { color: var(--accent); }

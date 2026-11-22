@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { App } from '../dist/tui/app.js';
 import { listRunIds, loadRun } from '../dist/core/store.js';
 import { QUOTA_REFRESH_MS } from '../dist/quota/index.js';
@@ -82,6 +86,52 @@ test('TUI rejects duplicate target selection and /exit remains available', async
 
 const type = (app, text) => app.handleKey({ name: 'char', text });
 const screen = (app) => { app.invalidate(); return app.snapshot().join('\n'); };
+
+test('TUI lists local branches, switches through /branch, and preserves conflicting edits', async (t) => {
+  const cwd = workspace(t);
+  const git = (...args) => execFileSync('git', args, { cwd, stdio: 'pipe', encoding: 'utf8' }).trimEnd();
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.name', 'Unify Test');
+  git('config', 'user.email', 'unify@example.invalid');
+  git('config', 'commit.gpgsign', 'false');
+  git('config', 'core.hooksPath', '.unify-test-hooks');
+
+  const file = join(cwd, 'tracked.txt');
+  writeFileSync(file, 'main\n');
+  git('add', 'tracked.txt');
+  git('commit', '-qm', 'main');
+  git('switch', '-qc', 'feature/git');
+  writeFileSync(file, 'feature\n');
+  git('commit', '-qam', 'feature');
+  git('switch', '-q', 'main');
+  git('update-ref', 'refs/remotes/origin/remote-only', 'HEAD');
+
+  const app = new App({ cols: () => 140, rows: () => 30, write() {} }, cwd, {}, []);
+  t.after(() => app.dispose());
+  await app.init();
+  const waitForScreen = async (pattern) => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const contents = screen(app);
+      if (pattern.test(contents)) return contents;
+      await delay(20);
+    }
+    assert.match(screen(app), pattern);
+  };
+  submit(app, '/branch');
+  const listing = await waitForScreen(/\* main/);
+  assert.match(listing, /feature\/git/);
+  assert.doesNotMatch(listing, /remote-only/);
+  app.handleKey({ name: 'esc' });
+
+  submit(app, '/branch feature/git');
+  await waitForScreen(/\(feature\/git\)/);
+  assert.equal(readFileSync(file, 'utf8').trim(), 'feature');
+  writeFileSync(file, 'local edit\n');
+  submit(app, '/branch main');
+  await waitForScreen(/overwritten by checkout|local changes/i);
+  assert.equal(git('symbolic-ref', '--short', 'HEAD'), 'feature/git');
+  assert.equal(readFileSync(file, 'utf8'), 'local edit\n');
+});
 
 function quotaClock(t) {
   const timers = new Map();

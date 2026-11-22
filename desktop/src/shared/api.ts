@@ -32,7 +32,7 @@ export interface TargetInfo {
 export interface WorkspaceInfo {
   cwd: string;
   name: string;
-  branch?: string;
+  branch?: string | null;
   targets: TargetInfo[];
   /** The selection the CLI/TUI would use when the user picks nothing. */
   defaults: string[];
@@ -41,6 +41,17 @@ export interface WorkspaceInfo {
   decider?: string;
   showReasoning: boolean;
   configError?: string;
+}
+
+export interface ComposerSelection {
+  /** Omit to follow the project defaults. An empty array is a manual selection. */
+  selected?: string[];
+  synth?: string;
+}
+
+export interface OpenedWorkspace {
+  info: WorkspaceInfo;
+  selection?: ComposerSelection;
 }
 
 export interface SessionSummary {
@@ -123,9 +134,11 @@ export type Push =
 export interface UnifyApi {
   platform(): Promise<NodeJS.Platform>;
   setTheme(theme: 'light' | 'dark'): Promise<void>;
-  workspace(): Promise<WorkspaceInfo | null>;
-  openWorkspace(dir?: string): Promise<WorkspaceInfo | null>;
+  workspace(): Promise<OpenedWorkspace | null>;
+  openWorkspace(dir?: string): Promise<OpenedWorkspace | null>;
+  saveComposerSelection(cwd: string, selection: ComposerSelection): Promise<void>;
   recentWorkspaces(): Promise<string[]>;
+  chooseGitBranch(cwd: string, x: number, y: number): Promise<void>;
   sessions(): Promise<SessionSummary[]>;
   session(id: string): Promise<RunRecord[]>;
   updateSession(cwd: string, id: string, changes: SessionChanges): Promise<void>;

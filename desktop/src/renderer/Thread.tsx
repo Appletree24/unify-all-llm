@@ -417,7 +417,7 @@ export function Turn({ record, notices, activity, interactions, showReasoning, a
 }
 
 // ── composer ──────────────────────────────────────────────────────────────
-export interface ComposerState { selected: string[]; manual: boolean; synth: string }
+export interface ComposerState { selected: string[]; synth: string }
 
 function SynthesisPicker({ targets, defaultId, value, onChange }: {
   targets: WorkspaceInfo['targets']; defaultId?: string; value: string; onChange(value: string): void;
@@ -487,9 +487,9 @@ function SynthesisPicker({ targets, defaultId, value, onChange }: {
   );
 }
 
-export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp, pendingMemoryUpdates, onClearMemoryUpdates }: {
+export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisChange, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp, pendingMemoryUpdates, onClearMemoryUpdates }: {
   ws: WorkspaceInfo; quota: Map<string, TargetQuota>; busy: boolean;
-  state: ComposerState; setState: (s: ComposerState) => void;
+  state: ComposerState; onToggleTarget(id: string): void; onSynthesisChange(value: string): void;
   onSend(text: string): Promise<boolean>; onCancel(): void; autoFocusKey: string;
   followUp?: FollowUpChoice; onClearFollowUp?: () => void;
   pendingMemoryUpdates?: string[]; onClearMemoryUpdates?: () => void;
@@ -510,11 +510,6 @@ export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, a
 
   const usable = ws.targets.filter((t) => t.installed !== false);
   const count = state.selected.length;
-  const toggle = (id: string) => {
-    const on = state.selected.includes(id);
-    setState({ ...state, manual: true, selected: on ? state.selected.filter((s) => s !== id) : [...state.selected, id] });
-  };
-
   const send = async () => {
     const q = text.trim();
     if (!q || busy || sending || !count) return;
@@ -570,7 +565,7 @@ export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, a
               return (
                 <button
                   key={t.id} type="button" className={`chip${on ? ' on' : ''}${q?.ratio !== undefined && q.ratio < 0.15 ? ' low' : ''}`}
-                  style={{ '--h': hue(t.id) } as CSSProperties} onClick={() => toggle(t.id)}
+                  style={{ '--h': hue(t.id) } as CSSProperties} onClick={() => onToggleTarget(t.id)}
                   title={`${t.label}${t.model ? ` · ${t.model}` : ''}${t.reasoningEffort ? ` · 思考 ${t.reasoningEffort}` : ''}${t.installed === undefined ? '\n正在检测…' : ''}${q?.title ? `\n${q.title}` : ''}`}
                 >
                   <i className={`dot${t.installed === undefined ? ' probing' : ''}`} />
@@ -580,8 +575,7 @@ export function Composer({ ws, quota, busy, state, setState, onSend, onCancel, a
               );
             })}
           </div>
-          <SynthesisPicker targets={usable} defaultId={ws.synthesizer} value={state.synth}
-            onChange={(synth) => setState({ ...state, synth })} />
+          <SynthesisPicker targets={usable} defaultId={ws.synthesizer} value={state.synth} onChange={onSynthesisChange} />
           {busy ? (
             <button type="button" className="send stop" onClick={onCancel} title="停止 (Esc)"><Icon name="stop" /></button>
           ) : (

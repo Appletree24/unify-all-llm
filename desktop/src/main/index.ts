@@ -1,10 +1,11 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, Notification, screen, shell } from 'electron';
+import type { MenuItemConstructorOptions } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, Notification, screen, shell } from 'electron';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicWrite } from '../../../src/core/atomic-write.js';
 import { collectQuotaReminders, type QuotaReminderHistory } from '../../../src/quota/reminders.js';
-import type { Method, Push, QuotaNotice, Reply, TargetQuota, UnifyApi } from '../shared/api.js';
+import type { ComposerSelection, Method, OpenedWorkspace, Push, QuotaNotice, Reply, TargetQuota, UnifyApi } from '../shared/api.js';
 import { prepareProviderPath } from './env.js';
 import { Workspace } from './workspace.js';
 
@@ -16,18 +17,32 @@ interface State {
   theme?: 'light' | 'dark';
   bounds?: { x: number; y: number; width: number; height: number; maximized?: boolean };
   quotaReminders: QuotaReminderHistory;
+  composerSelections: Record<string, ComposerSelection>;
+}
+
+function parseComposerSelection(value: unknown): ComposerSelection | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const { selected, synth } = value as Record<string, unknown>;
+  if (selected !== undefined && (!Array.isArray(selected) || selected.some((id) => typeof id !== 'string'))) return undefined;
+  if (synth !== undefined && typeof synth !== 'string') return undefined;
+  return { selected: selected && [...new Set(selected)], synth };
 }
 
 function readState(): State {
   try {
     const s = JSON.parse(readFileSync(statePath(), 'utf8'));
     const reminders = s.quotaReminders;
+    const composerSelections = Object.fromEntries(Object.entries(s.composerSelections ?? {}).flatMap(([cwd, value]) => {
+      const selection = parseComposerSelection(value);
+      return selection ? [[cwd, selection]] : [];
+    }));
     return {
       recent: Array.isArray(s.recent) ? s.recent.filter((p: unknown) => typeof p === 'string') : [], bounds: s.bounds,
       theme: s.theme === 'dark' || s.theme === 'light' ? s.theme : undefined,
       quotaReminders: reminders && typeof reminders === 'object' && !Array.isArray(reminders) ? reminders : {},
+      composerSelections,
     };
-  } catch { return { recent: [], quotaReminders: {} }; }
+  } catch { return { recent: [], quotaReminders: {}, composerSelections: {} }; }
 }
 
 function writeState(state: State): void {
@@ -125,11 +140,15 @@ const need = (): Workspace => {
   return workspace;
 };
 
-const sessionWorkspace = (cwd: string): Workspace => {
+const currentWorkspace = (cwd: string): Workspace => {
   const ws = need();
   if (cwd !== ws.cwd) throw new Error('项目已切换，请在当前项目中重试');
   return ws;
 };
+
+const describeWorkspace = (ws: Workspace): OpenedWorkspace => ({
+  info: ws.info(), selection: state.composerSelections[ws.cwd],
+});
 
 const api: UnifyApi = {
   async platform() { return process.platform; },
@@ -144,7 +163,7 @@ const api: UnifyApi = {
       push({ type: 'quota-notice', notice: pendingQuotaNotice });
       pendingQuotaNotice = undefined;
     }
-    return workspace?.info() ?? null;
+    return workspace ? describeWorkspace(workspace) : null;
   },
   async openWorkspace(dir) {
     let target = dir;
@@ -153,13 +172,40 @@ const api: UnifyApi = {
       if (picked.canceled || !picked.filePaths[0]) return null;
       target = picked.filePaths[0];
     }
-    return openWorkspace(target).info();
+    return describeWorkspace(openWorkspace(target));
+  },
+  async saveComposerSelection(cwd, selection) {
+    const ws = currentWorkspace(cwd);
+    const parsed = parseComposerSelection(selection);
+    if (!parsed) throw new Error('模型选择无效');
+    state.composerSelections[ws.cwd] = parsed;
+    writeState(state);
   },
   async recentWorkspaces() { return state.recent.filter(isDir); },
+  async chooseGitBranch(cwd, x, y) {
+    const ws = currentWorkspace(cwd);
+    const { current, local } = await ws.gitBranches();
+    if (workspace !== ws || !win) return;
+    const owner = win;
+    const selected = await new Promise<string | undefined>((resolve) => {
+      let branch: string | undefined;
+      const items: MenuItemConstructorOptions[] = local.map((name) => ({
+        label: name.replaceAll('&', '&&'),
+        type: 'checkbox',
+        checked: name === current,
+        enabled: name !== current,
+        click: () => { branch = name; },
+      }));
+      if (!items.length) items.push({ label: '暂无本地分支', enabled: false });
+      const menu = Menu.buildFromTemplate(items);
+      menu.popup({ window: owner, x, y, callback: () => resolve(branch) });
+    });
+    if (selected && workspace === ws) await ws.switchBranch(selected);
+  },
   async sessions() { return need().sessions(); },
   async session(id) { return need().session(id); },
-  async updateSession(cwd, id, changes) { sessionWorkspace(cwd).updateSession(id, changes); },
-  async deleteSession(cwd, id) { await sessionWorkspace(cwd).deleteSession(id, (path) => shell.trashItem(path)); },
+  async updateSession(cwd, id, changes) { currentWorkspace(cwd).updateSession(id, changes); },
+  async deleteSession(cwd, id) { await currentWorkspace(cwd).deleteSession(id, (path) => shell.trashItem(path)); },
   async ask(req) { return need().ask(req); },
   async retry(turnId, targetIds) { return need().retry(turnId, targetIds); },
   async cancel(turnId) { need().cancel(turnId); },

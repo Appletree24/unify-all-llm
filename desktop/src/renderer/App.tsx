@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import type { DistillPreparation, DistillSourceRef, ExecPreview, Push, QuotaNotice, RunRecord, SessionChanges, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
+import type { ComposerSelection, DistillPreparation, DistillSourceRef, ExecPreview, OpenedWorkspace, Push, QuotaNotice, RunRecord, SessionChanges, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
 import { SessionList } from './Sessions.js';
@@ -36,7 +36,7 @@ export function App() {
   const [pendingMemoryUpdates, setPendingMemoryUpdates] = useState<string[]>([]);
   const [zoom, setZoom] = useState<{ turnId: string; runId: string }>();
   const [followUp, setFollowUp] = useState<FollowUpChoice>();
-  const [composer, setComposer] = useState<ComposerState>({ selected: [], manual: false, synth: '' });
+  const [composerSelection, setComposerSelection] = useState<ComposerSelection>();
   const [sidebar, setSidebar] = useState(true);
   const [menu, setMenu] = useState(false);
   const [recent, setRecent] = useState<string[]>([]);
@@ -71,11 +71,15 @@ export function App() {
   }, []);
 
   const openQuota = useCallback(() => { setQuotaNotice(undefined); setView('quota'); }, []);
+  const showWorkspace = useCallback((opened: OpenedWorkspace | null) => {
+    setWs(opened?.info ?? null);
+    setComposerSelection(opened?.selection);
+  }, []);
 
   // ── bootstrap and pushes ────────────────────────────────────────────────
   useEffect(() => {
     void unify.platform().then(setPlatform);
-    void unify.workspace().then(setWs);
+    void unify.workspace().then(showWorkspace);
     return onPush((p: Push) => {
       if (p.type === 'run') setRecords((r) => ({ ...r, [p.record.id]: p.record }));
       else if (p.type === 'activity') setActivity((a) => ({ ...a, [p.runId]: [...(a[p.runId] ?? []), { name: p.name, detail: p.detail }] }));
@@ -117,7 +121,7 @@ export function App() {
       else if (p.type === 'quota-notice') setQuotaNotice(p.notice);
       else if (p.type === 'open-quota') openQuota();
     });
-  }, [refreshSessions, openQuota]);
+  }, [refreshSessions, openQuota, showWorkspace]);
 
   // A different project starts from a clean slate.
   useEffect(() => {
@@ -132,31 +136,43 @@ export function App() {
     setNotices({});
     setQuota(undefined);
     setQuotaLoading(false);
-    setComposer({ selected: [], manual: false, synth: '' });
     if (!cwd) return;
     refreshSessions();
     refreshQuota();
   }, [cwd, refreshSessions, refreshQuota]);
 
-  // Follow the configured defaults until the user picks targets by hand.
-  useEffect(() => {
-    if (!ws) return;
-    setComposer((c) => {
-      const selected = (c.manual ? c.selected : ws.defaults).filter((id) => ws.targets.some((t) => t.id === id && t.installed !== false));
-      const synth = ws.targets.some((t) => t.id === c.synth && t.installed === false) ? '' : c.synth;
-      return { ...c, selected, synth };
+  const composer = useMemo<ComposerState>(() => {
+    const available = new Set(ws?.targets.filter((target) => target.installed !== false).map((target) => target.id));
+    const selected = (composerSelection?.selected ?? ws?.defaults ?? []).filter((id) => available.has(id));
+    const synth = composerSelection?.synth ?? '';
+    return { selected, synth: synth === 'off' || available.has(synth) ? synth : '' };
+  }, [ws, composerSelection]);
+
+  const changeComposerSelection = (selection: ComposerSelection) => {
+    if (!cwd) return;
+    setComposerSelection(selection);
+    void unify.saveComposerSelection(cwd, selection).catch((err) => {
+      if (cwd === activeCwd.current) notify(errText(err), 'err');
     });
-  }, [ws]);
+  };
+
+  const toggleTarget = (id: string) => {
+    const selected = composerSelection?.selected ?? composer.selected;
+    changeComposerSelection({
+      ...composerSelection,
+      selected: selected.includes(id) ? selected.filter((target) => target !== id) : [...selected, id],
+    });
+  };
 
   useEffect(() => { if (menu) void unify.recentWorkspaces().then(setRecent); }, [menu]);
 
   const openWorkspace = useCallback(async (dir?: string) => {
     setMenu(false);
     try {
-      const info = await unify.openWorkspace(dir);
-      if (info) { setWs(info); setView('chat'); }
+      const opened = await unify.openWorkspace(dir);
+      if (opened) { showWorkspace(opened); setView('chat'); }
     } catch (err) { notify(errText(err), 'err'); }
-  }, [notify]);
+  }, [notify, showWorkspace]);
 
   const openSession = useCallback(async (id: string | null) => {
     const requestedCwd = activeCwd.current;
@@ -225,7 +241,7 @@ export function App() {
   const send = async (question: string): Promise<boolean> => {
     try {
       const ids = await unify.ask({
-        question, selected: composer.selected, manual: composer.manual,
+        question, selected: composer.selected, manual: composerSelection?.selected !== undefined,
         synthesize: composer.synth !== 'off', synthesizer: composer.synth && composer.synth !== 'off' ? composer.synth : undefined,
         sessionId: current ?? undefined,
         continueFrom: activeFollowUp?.targetId,
@@ -321,7 +337,17 @@ export function App() {
                 </>
               )}
             </div>
-            {ws.branch && <span className="tb-branch"><Icon name="branch" size={13} />{ws.branch}</span>}
+            {ws.branch !== undefined && (
+              <button type="button" className="tb-branch" title={`切换 Git 分支（${ws.branch ?? '游离 HEAD'}）`}
+                aria-haspopup="menu" onClick={(event) => {
+                  const { left, bottom } = event.currentTarget.getBoundingClientRect();
+                  void unify.chooseGitBranch(ws.cwd, Math.round(left), Math.round(bottom)).catch(err => notify(errText(err), 'err'));
+                }}>
+                <Icon name="branch" size={13} />
+                <span>{ws.branch ?? '游离 HEAD'}</span>
+                <Icon name="chevron" size={12} />
+              </button>
+            )}
           </>
         )}
         <button type="button" className="tb-btn theme-toggle" title={themeAction} aria-label={themeAction}
@@ -408,7 +434,8 @@ export function App() {
                 </div>
               )}
               <Composer
-                ws={ws} quota={quotaMap} busy={busy} state={composer} setState={setComposer}
+                ws={ws} quota={quotaMap} busy={busy} state={composer} onToggleTarget={toggleTarget}
+                onSynthesisChange={(synth) => changeComposerSelection({ ...composerSelection, synth })}
                 onSend={send} onCancel={cancelCurrent} autoFocusKey={`${ws.cwd}:${current}`}
                 followUp={activeFollowUp} onClearFollowUp={() => setFollowUp(undefined)}
                 pendingMemoryUpdates={pendingMemoryUpdates} onClearMemoryUpdates={() => setPendingMemoryUpdates([])}

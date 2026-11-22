@@ -29,6 +29,7 @@ export const COMMANDS: CommandSpec[] = [
   { name: 'models', detail: '选择之后提问的目标，如 /models codex,deepseek', arg: 'targets' },
   { name: 'settings', detail: '设置模型、思考强度、官方 API 和运行偏好' },
   { name: 'synth', detail: '设置汇总目标', arg: 'target', required: true },
+  { name: 'branch', detail: '查看本地分支；/branch 分支名 切换' },
   { name: 'quota', detail: '监控各模型的套餐余量和重置时间' },
   { name: 'exec', detail: '按汇总或唯一成功回答实施，可指定执行目标', arg: 'executor' },
   { name: 'use', detail: '下轮追问沿用指定目标的回答（不带参数恢复默认）', arg: 'target' },
