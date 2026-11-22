@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
-import { statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { lstatSync, mkdtempSync, realpathSync, renameSync, rmdirSync, statSync } from 'node:fs';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { atomicWrite } from '../../../src/core/atomic-write.js';
 import { loadConfig, parseConfig, readJson, type Config } from '../../../src/core/config.js';
 import { projectConfigPath, userConfigPath, writeSetting } from '../../../src/core/settings.js';
 import { listRunIds, loadRun, type RunRecord } from '../../../src/core/store.js';
@@ -16,9 +17,10 @@ import { buildRegistry } from '../../../src/providers/index.js';
 import { targetModelIds, modelIds } from '../../../src/providers/models.js';
 import { officialApis, readApiProfile, saveApiProfile } from '../../../src/providers/official.js';
 import { QUOTA_REFRESH_MS, readTargetQuotas, type TargetQuota } from '../../../src/quota/index.js';
-import type { AskRequest, ExecPreview, Push, SessionSummary, SettingsInfo, TargetInfo, WorkspaceInfo } from '../shared/api.js';
+import { SESSION_TITLE_LIMIT, type AskRequest, type ExecPreview, type Push, type SessionChanges, type SessionSummary, type SettingsInfo, type TargetInfo, type WorkspaceInfo } from '../shared/api.js';
 
 const ACTIVE = new Set<RunRecord['status']>(['created', 'deciding', 'answering', 'synthesizing']);
+const SESSION_BUSY = '这个对话还有请求在进行，请等待完成或先取消';
 const PUSH_INTERVAL_MS = 60;
 const QUOTA_TTL_MS = 45_000;
 
@@ -43,6 +45,7 @@ export class Workspace {
   private detectCtl = new AbortController();
   private branch?: string;
   private readonly handles = new Map<string, WorkflowHandle>();
+  private readonly deletions = new Map<string, Promise<void>>();
   private readonly runCache = new Map<string, { mtime: number; run: RunRecord }>();
   private quotaCache?: { at: number; value: Promise<TargetQuota[]> };
   private quotaRun?: AbortController;
@@ -113,7 +116,7 @@ export class Workspace {
   }
 
   get busy(): boolean {
-    return this.handles.size > 0;
+    return this.handles.size > 0 || this.deletions.size > 0;
   }
 
   // ── records ────────────────────────────────────────────────────────────
@@ -136,6 +139,17 @@ export class Workspace {
     return listRunIds(this.cwd).map((id) => this.load(id)).filter((r): r is RunRecord => !!r);
   }
 
+  private sessionSettingsPath(first: RunRecord): string {
+    return join(this.runDir(first.id), 'desktop-session.json');
+  }
+
+  private sessionSettings(first: RunRecord): SessionChanges {
+    try {
+      const data = readJson(this.sessionSettingsPath(first)) as SessionChanges | undefined;
+      return { title: typeof data?.title === 'string' ? data.title : undefined, pinned: data?.pinned === true };
+    } catch { return {}; }
+  }
+
   sessions(): SessionSummary[] {
     const map = new Map<string, RunRecord[]>();
     for (const run of this.runs()) {
@@ -145,16 +159,78 @@ export class Workspace {
     return [...map.entries()].map(([id, runs]) => {
       const first = runs[0];
       const last = runs[runs.length - 1];
+      const { title, pinned } = this.sessionSettings(first);
       return {
-        id, title: first.question.replace(/\s+/g, ' ').trim().slice(0, 120), createdAt: first.createdAt,
+        id, title: title ?? first.question.replace(/\s+/g, ' ').trim().slice(0, SESSION_TITLE_LIMIT),
+        pinned: pinned ?? false, createdAt: first.createdAt,
         updatedAt: last.updatedAt, turns: runs.filter((r) => r.kind === 'comparison').length,
-        status: last.status, hasExec: runs.some((r) => r.kind === 'execution'),
+        status: runs.find((run) => ACTIVE.has(run.status))?.status ?? last.status,
+        hasExec: runs.some((r) => r.kind === 'execution'),
       };
-    }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
   }
 
   session(id: string): RunRecord[] {
     return this.runs().filter((r) => r.sessionId === id);
+  }
+
+  updateSession(id: string, changes: SessionChanges): void {
+    if (this.deletions.has(id)) throw new Error('正在删除这段对话');
+    const [first] = this.session(id);
+    if (!first) throw new Error('找不到这段对话');
+    const settings = this.sessionSettings(first);
+    if (changes.title !== undefined) {
+      const title = typeof changes.title === 'string' ? changes.title.replace(/\s+/g, ' ').trim() : '';
+      if (!title || title.length > SESSION_TITLE_LIMIT) throw new Error(`请输入 1–${SESSION_TITLE_LIMIT} 字的对话标题`);
+      settings.title = title;
+    }
+    if (changes.pinned !== undefined) {
+      if (typeof changes.pinned !== 'boolean') throw new Error('无效的置顶设置');
+      settings.pinned = changes.pinned;
+    }
+    atomicWrite(this.sessionSettingsPath(first), JSON.stringify(settings, null, 2) + '\n');
+  }
+
+  async deleteSession(id: string, trash: (path: string) => Promise<void>): Promise<void> {
+    this.assertSessionIdle(id);
+    const runs = this.session(id);
+    if (!runs.length) throw new Error('找不到这段对话');
+    if (runs.some((r) => ACTIVE.has(r.status))) throw new Error(SESSION_BUSY);
+
+    const root = realpathSync(join(this.cwd, '.unify', 'runs'));
+    const fromProject = relative(realpathSync(this.cwd), root);
+    if (!fromProject || fromProject === '..' || fromProject.startsWith(`..${sep}`) || isAbsolute(fromProject)) {
+      throw new Error('对话记录目录必须位于当前项目内');
+    }
+    const pending = this.trashSessionRuns(root, runs, trash);
+    this.deletions.set(id, pending);
+    try { await pending; }
+    finally { this.deletions.delete(id); }
+  }
+
+  private async trashSessionRuns(root: string, runs: RunRecord[], trash: (path: string) => Promise<void>): Promise<void> {
+    // Stage the complete session on the same filesystem so the OS receives a single trash item.
+    const staged = mkdtempSync(join(root, '.deleted-session-'));
+    const moved: string[] = [];
+    try {
+      for (const run of runs) {
+        const source = join(root, run.id);
+        if (!lstatSync(source).isDirectory()) throw new Error('对话记录目录已更改');
+        renameSync(source, join(staged, run.id));
+        moved.push(run.id);
+        this.runCache.delete(run.id);
+      }
+      await trash(staged);
+    } catch (err) {
+      let restored = true;
+      for (const id of moved.reverse()) {
+        try { renameSync(join(staged, id), join(root, id)); }
+        catch { restored = false; }
+      }
+      if (!restored) throw new Error(`部分对话记录无法还原，请检查 ${staged} 或系统回收站。${message(err)}`);
+      try { rmdirSync(staged); } catch { /* The session records are already restored. */ }
+      throw new Error(`无法将对话移到系统回收站：${message(err)}`);
+    }
   }
 
   // ── workflows ──────────────────────────────────────────────────────────
@@ -195,15 +271,24 @@ export class Workspace {
     return { turnId: record.id, sessionId: record.sessionId };
   }
 
-  private sessionBusy(sessionId: string): boolean {
-    return [...this.handles.values()].some((h) => h.record.sessionId === sessionId);
+  private assertSessionIdle(sessionId: string): void {
+    if (this.deletions.has(sessionId)) throw new Error('正在删除这段对话');
+    if ([...this.handles.values()].some((h) => h.record.sessionId === sessionId)) {
+      throw new Error(SESSION_BUSY);
+    }
   }
 
   async ask(req: AskRequest): Promise<{ turnId: string; sessionId: string }> {
     if (this.configError) throw new Error(`配置有误：${this.configError}`);
-    if (req.sessionId && this.sessionBusy(req.sessionId)) throw new Error('这个对话还有请求在进行，请等待完成或先取消');
     await this.detecting;
-    const previous = req.sessionId ? this.session(req.sessionId).filter((r) => r.kind === 'comparison').at(-1) : undefined;
+    if (this.disposed) throw new Error('项目已关闭');
+    let previous: RunRecord | undefined;
+    if (req.sessionId) {
+      this.assertSessionIdle(req.sessionId);
+      const runs = this.session(req.sessionId);
+      if (!runs.length) throw new Error('找不到可以继续的对话');
+      previous = runs.findLast((r) => r.kind === 'comparison');
+    }
     const config = req.synthesizer ? parseConfig({ ...this.cfg, synthesizer: req.synthesizer }) : this.cfg;
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected,
@@ -213,12 +298,13 @@ export class Workspace {
   }
 
   async retry(turnId: string, targetIds?: string[]): Promise<{ turnId: string; sessionId: string }> {
+    await this.detecting;
+    if (this.disposed) throw new Error('项目已关闭');
     const original = this.load(turnId);
     if (!original) throw new Error(`找不到记录 ${turnId}`);
-    if (this.sessionBusy(original.sessionId)) throw new Error('这个对话还有请求在进行，请等待完成或先取消');
+    this.assertSessionIdle(original.sessionId);
     const ids = targetIds?.length ? targetIds : original.targets.filter((t) => !original.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id);
     if (!ids.length) throw new Error('没有需要重试的目标');
-    await this.detecting;
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config: this.cfg, targets: this.targets, question: '',
       retry: { record: original, targetIds: ids }, onEvent,
@@ -254,11 +340,12 @@ export class Workspace {
   }
 
   async exec(turnId: string, from: string | undefined, executorId: string): Promise<{ turnId: string; sessionId: string }> {
+    await this.detecting;
+    if (this.disposed) throw new Error('项目已关闭');
     if ([...this.handles.values()].some((h) => h.record.kind === 'execution')) throw new Error('已有实施在进行，请等待它结束');
     const source = this.load(turnId);
     if (!source) throw new Error(`找不到记录 ${turnId}`);
-    if (this.sessionBusy(source.sessionId)) throw new Error('这个对话还有请求在进行，请等待完成或先取消');
-    await this.detecting;
+    this.assertSessionIdle(source.sessionId);
     const executor = chooseExecutor(this.targets, executorId, this.installed);
     return this.start((onEvent) => startExecution({ cwd: this.cwd, config: this.cfg, targets: this.targets, executor, source, from, onEvent }));
   }
@@ -379,7 +466,8 @@ export class Workspace {
     this.detectCtl.abort();
     const pending = [...this.handles.values()];
     for (const h of pending) h.cancel();
-    await Promise.all([quota, this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined))]);
+    const deletions = Array.from(this.deletions.values(), (deletion) => deletion.catch(() => undefined));
+    await Promise.all([quota, this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined)), ...deletions]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 }

@@ -45,12 +45,20 @@ export interface WorkspaceInfo {
 export interface SessionSummary {
   id: string;
   title: string;
+  pinned: boolean;
   createdAt: string;
   updatedAt: string;
   turns: number;
   status: RunRecord['status'];
   hasExec: boolean;
 }
+
+export interface SessionChanges {
+  title?: string;
+  pinned?: boolean;
+}
+
+export const SESSION_TITLE_LIMIT = 120;
 
 export interface AskRequest {
   question: string;
@@ -117,6 +125,8 @@ export interface UnifyApi {
   recentWorkspaces(): Promise<string[]>;
   sessions(): Promise<SessionSummary[]>;
   session(id: string): Promise<RunRecord[]>;
+  updateSession(cwd: string, id: string, changes: SessionChanges): Promise<void>;
+  deleteSession(cwd: string, id: string): Promise<void>;
   ask(req: AskRequest): Promise<{ turnId: string; sessionId: string }>;
   retry(turnId: string, targetIds?: string[]): Promise<{ turnId: string; sessionId: string }>;
   cancel(turnId: string): Promise<void>;

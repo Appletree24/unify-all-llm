@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import type { DistillPreparation, DistillSourceRef, ExecPreview, Push, QuotaNotice, RunRecord, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
+import type { DistillPreparation, DistillSourceRef, ExecPreview, Push, QuotaNotice, RunRecord, SessionChanges, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
+import { SessionList } from './Sessions.js';
 import { Card, Composer, DistillDialog, ExecDialog, Turn, type Activity, type ComposerState, type FollowUpChoice, type TurnActions } from './Thread.js';
 import { Icon, Spinner, hue, isActive } from './ui.js';
 
@@ -12,14 +13,6 @@ const darkTheme = window.matchMedia('(prefers-color-scheme: dark)');
 function subscribeTheme(listener: () => void) {
   darkTheme.addEventListener('change', listener);
   return () => darkTheme.removeEventListener('change', listener);
-}
-
-function dayGroup(iso: string): string {
-  const d = new Date(iso);
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const diff = (today.getTime() - new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()) / 86_400_000;
-  return diff <= 0 ? '今天' : diff === 1 ? '昨天' : diff < 7 ? '7 天内' : diff < 30 ? '30 天内' : '更早';
 }
 
 export function App() {
@@ -48,6 +41,8 @@ export function App() {
   const [recent, setRecent] = useState<string[]>([]);
   const cwd = ws?.cwd;
   const activeCwd = useRef(cwd);
+  const sessionListRequest = useRef(0);
+  const openSessionRequest = useRef(0);
   useLayoutEffect(() => { activeCwd.current = cwd; }, [cwd]);
 
   const notify = useCallback((msg: string, kind: Toast['kind'] = 'info') => setToast({ id: Date.now(), msg, kind }), []);
@@ -57,7 +52,13 @@ export function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const refreshSessions = useCallback(() => { unify.sessions().then(setSessions, () => undefined); }, []);
+  const refreshSessions = useCallback(() => {
+    const requestedCwd = activeCwd.current;
+    const request = ++sessionListRequest.current;
+    void unify.sessions().then((list) => {
+      if (requestedCwd === activeCwd.current && request === sessionListRequest.current) setSessions(list);
+    }, () => undefined);
+  }, []);
   const refreshQuota = useCallback((force = false) => {
     const requestedCwd = activeCwd.current;
     setQuotaLoading(true);
@@ -89,6 +90,7 @@ export function App() {
   // A different project starts from a clean slate.
   useEffect(() => {
     setCurrent(null);
+    setSessions([]);
     setFollowUp(undefined);
     setPendingMemoryUpdates([]);
     setDistillModal(undefined);
@@ -124,6 +126,8 @@ export function App() {
   }, [notify]);
 
   const openSession = useCallback(async (id: string | null) => {
+    const requestedCwd = activeCwd.current;
+    const request = ++openSessionRequest.current;
     setCurrent(id);
     setFollowUp(undefined);
     setPendingMemoryUpdates([]);
@@ -132,12 +136,15 @@ export function App() {
     if (!id) return;
     try {
       const runs = await unify.session(id);
+      if (requestedCwd !== activeCwd.current || request !== openSessionRequest.current) return;
       setRecords((r) => {
         const next = { ...r };
         for (const run of runs) if (!(next[run.id] && isActive(next[run.id]))) next[run.id] = run;
         return next;
       });
-    } catch (err) { notify(errText(err), 'err'); }
+    } catch (err) {
+      if (requestedCwd === activeCwd.current && request === openSessionRequest.current) notify(errText(err), 'err');
+    }
   }, [notify]);
 
   // ── derived ─────────────────────────────────────────────────────────────
@@ -150,17 +157,37 @@ export function App() {
   const activeFollowUp = followUp && followUp.turnId === latestComparisonId ? followUp : undefined;
   const liveSessions = useMemo(() => new Set(Object.values(records).filter(isActive).map((r) => r.sessionId)), [records]);
   const quotaMap = useMemo(() => new Map((quota ?? []).map((q) => [q.targetId, q])), [quota]);
-  const grouped = useMemo(() => {
-    const out: [string, SessionSummary[]][] = [];
-    for (const s of sessions) {
-      const g = dayGroup(s.updatedAt);
-      const last = out[out.length - 1];
-      if (last && last[0] === g) last[1].push(s); else out.push([g, [s]]);
-    }
-    return out;
-  }, [sessions]);
 
   // ── actions ─────────────────────────────────────────────────────────────
+  const updateSession = async (id: string, changes: SessionChanges) => {
+    if (!cwd) return;
+    await unify.updateSession(cwd, id, changes);
+    if (cwd === activeCwd.current) refreshSessions();
+  };
+
+  const deleteSession = async (id: string) => {
+    if (!cwd) return;
+    try { await unify.deleteSession(cwd, id); }
+    finally { if (cwd === activeCwd.current) refreshSessions(); }
+    if (cwd !== activeCwd.current) return;
+
+    const deletedTurns = Object.values(records).filter((record) => record.sessionId === id);
+    const turnIds = new Set(deletedTurns.map((record) => record.id));
+    const callIds = new Set(deletedTurns.flatMap((record) => record.calls.map((call) => call.id)));
+    setSessions((list) => list.filter((session) => session.id !== id));
+    setRecords((all) => Object.fromEntries(Object.entries(all).filter(([, record]) => record.sessionId !== id)));
+    setNotices((all) => Object.fromEntries(Object.entries(all).filter(([turnId]) => !turnIds.has(turnId))));
+    setActivity((all) => Object.fromEntries(Object.entries(all).filter(([callId]) => !callIds.has(callId))));
+    if (current === id) {
+      openSessionRequest.current++;
+      setCurrent(null);
+      setFollowUp(undefined);
+      setPendingMemoryUpdates([]);
+      setZoom(undefined);
+    }
+    notify('已将对话移到系统回收站', 'ok');
+  };
+
   const send = async (question: string): Promise<boolean> => {
     try {
       const ids = await unify.ask({
@@ -196,6 +223,7 @@ export function App() {
   // ── keyboard ────────────────────────────────────────────────────────────
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
+      if (e.target instanceof Element && e.target.closest('.session-dialog')) return;
       const mod = e.ctrlKey || e.metaKey;
       if (e.key === 'Escape' && zoom) { setZoom(undefined); return; }
       if (!mod || !ws) return;
@@ -257,20 +285,8 @@ export function App() {
       {ws && sidebar && (
         <aside className="sidebar">
           <button className="new-chat" onClick={() => void openSession(null)}><Icon name="plus" />新对话<kbd>Ctrl N</kbd></button>
-          <nav className="sessions">
-            {grouped.length === 0 && <p className="side-empty">还没有对话记录</p>}
-            {grouped.map(([group, list]) => (
-              <div key={group} className="session-group">
-                <div className="label">{group}</div>
-                {list.map((s) => (
-                  <button key={s.id} className={`session${current === s.id && view === 'chat' ? ' on' : ''}`} onClick={() => void openSession(s.id)} title={s.title}>
-                    <span className="session-title">{s.title || '（空问题）'}</span>
-                    {liveSessions.has(s.id) ? <Spinner /> : s.turns > 1 ? <small>{s.turns}</small> : s.hasExec ? <Icon name="run" size={12} /> : null}
-                  </button>
-                ))}
-              </div>
-            ))}
-          </nav>
+          <SessionList key={ws.cwd} sessions={sessions} current={view === 'chat' ? current : null} live={liveSessions}
+            open={(id) => void openSession(id)} update={updateSession} remove={deleteSession} onError={(msg) => notify(msg, 'err')} />
           <nav className="side-nav">
             <button className={view === 'quota' ? 'on' : ''} onClick={openQuota}><Icon name="gauge" />额度</button>
             <button className={view === 'memory' ? 'on' : ''} onClick={() => setView('memory')}><Icon name="layers" />记忆</button>

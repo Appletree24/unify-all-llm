@@ -88,7 +88,7 @@ function openWorkspace(dir: string): Workspace {
   const cwd = resolve(dir);
   if (!isDir(cwd)) throw new Error(`目录不存在：${cwd}`);
   if (workspace?.cwd === cwd) return workspace;
-  if (workspace?.busy) throw new Error('当前项目还有请求在进行，请先取消或等待完成');
+  if (workspace?.busy) throw new Error('当前项目还有操作在进行，请等待完成后再切换');
   void workspace?.dispose();
   workspace = new Workspace(cwd, push, monitorQuota);
   state.recent = [cwd, ...state.recent.filter((p) => p !== cwd)].slice(0, 12);
@@ -99,6 +99,12 @@ function openWorkspace(dir: string): Workspace {
 const need = (): Workspace => {
   if (!workspace) throw new Error('请先打开一个项目文件夹');
   return workspace;
+};
+
+const sessionWorkspace = (cwd: string): Workspace => {
+  const ws = need();
+  if (cwd !== ws.cwd) throw new Error('项目已切换，请在当前项目中重试');
+  return ws;
 };
 
 const api: UnifyApi = {
@@ -128,6 +134,8 @@ const api: UnifyApi = {
   async recentWorkspaces() { return state.recent.filter(isDir); },
   async sessions() { return need().sessions(); },
   async session(id) { return need().session(id); },
+  async updateSession(cwd, id, changes) { sessionWorkspace(cwd).updateSession(id, changes); },
+  async deleteSession(cwd, id) { await sessionWorkspace(cwd).deleteSession(id, (path) => shell.trashItem(path)); },
   async ask(req) { return need().ask(req); },
   async retry(turnId, targetIds) { return need().retry(turnId, targetIds); },
   async cancel(turnId) { need().cancel(turnId); },
