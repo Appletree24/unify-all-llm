@@ -19,7 +19,7 @@ export const graderSchema = z.discriminatedUnion('kind', [
     kind: z.literal('patch'), image: z.string().regex(/^(?:[a-z0-9][a-z0-9._/:-]*@)?sha256:[a-f0-9]{64}$/, '镜像需要不可变 digest'),
     files: z.array(file), command: z.array(nonempty).nonempty(),
   }).strict(),
-  z.object({ kind: z.literal('rubric'), criteria: z.array(nonempty).nonempty() }).strict(),
+  z.object({ kind: z.literal('rubric'), criteria: z.array(nonempty).nonempty(), perCriterion: z.boolean().optional() }).strict(),
 ]);
 export const reviewSchema = z.object({
   skill: nonempty, negative: z.string(), positive: z.string().refine(s => !!s.trim(), '参考解不能为空'), grader: graderSchema,

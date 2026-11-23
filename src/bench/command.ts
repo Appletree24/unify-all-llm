@@ -3,13 +3,15 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { loadConfig, timeoutMillis } from '../core/config.js';
 import { buildRegistry } from '../providers/index.js';
-import { capture, draftsDir, getDraft, listBench, repoSchema } from './cases.js';
+import { capture, draftsDir, getDraft, listBench, repoSchema, saveDraft } from './cases.js';
+import { exampleCase, examples } from './examples.js';
 import { draftCase, publish, runBench, validateCase } from './workflow.js';
 
 export const benchHelp = `unify bench — 从日常失败构造评测题
 
   add [turn] [--call id] [--note "预期行为"]  保存候选。省略 turn 使用最近记录
   list                                      列出候选、草稿和已发布题目
+  example [示例名]                           列出示例，或从指定示例创建草稿
   draft <候选id> --with <出题目标>            生成可编辑的草稿，可附 --note
       [--commit <完整SHA> --files a.ts,b.ts]  从当前仓库的指定版本引用题目文件
   check <草稿id> [--judge <评审目标>]        验证代表性错解与参考解
@@ -28,6 +30,11 @@ export async function benchCommand(cwd: string, args: string[], signal: AbortSig
     models: { type: 'string' }, json: { type: 'boolean' },
   } });
   const [id] = positionals;
+  if (cmd === 'example') {
+    if (id) console.log('草稿 ID ' + saveDraft(cwd, exampleCase(id)));
+    else for (const example of examples) console.log(example.key + '  ' + example.label + ' · ' + example.task.title);
+    return 0;
+  }
   if (cmd === 'add') {
     const item = capture(cwd, id, values.call, values.note);
     console.log('已留作评测候选 ' + item.id);
@@ -67,7 +74,10 @@ export async function benchCommand(cwd: string, args: string[], signal: AbortSig
     if (!names?.length || new Set(names).size !== names.length) throw new Error('请用 --models 指定各个参评目标');
     const rows = await runBench(cwd, positionals, names.map(model), judge, signal);
     if (values.json) console.log(JSON.stringify(rows, null, 2));
-    else for (const r of rows) console.log([r.status, r.target, r.title, r.detail, r.durationMs + 'ms'].join('  '));
+    else for (const r of rows) {
+      console.log([r.status, r.target, r.title, r.detail, r.durationMs + 'ms'].join('  '));
+      for (const check of r.checks ?? []) console.log('  ' + (check.pass ? '✓ ' : '✗ ') + check.criterion + '  ' + check.reason);
+    }
     return rows.every(r => r.status === 'pass') ? 0 : 1;
   }
   throw new Error(benchHelp);

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { BenchCase, BenchIndex, BenchResult, WorkspaceInfo } from '../shared/api.js';
 import { caseSchema } from '../../../src/bench/schema.js';
+import { exampleCase, examples } from '../../../src/bench/examples.js';
 import { unify } from './api.js';
 import { Spinner } from './ui.js';
 
@@ -14,7 +15,7 @@ export function BenchmarkPage({ ws }: { ws: WorkspaceInfo }) {
   const [index, setIndex] = useState<BenchIndex>();
   const [stage, setStage] = useState<Stage>('candidates');
   const [id, setId] = useState('');
-  const [model, setModel] = useState(ws.synthesizer || ws.defaults[0] || targets[0]?.id || '');
+  const [model, setModel] = useState(() => [ws.synthesizer, ...ws.defaults, targets[0]?.id].find(id => targets.some(t => t.id === id)) ?? '');
   const [participants, setParticipants] = useState<string[]>(ws.defaults.filter(name => targets.some(t => t.id === name)));
   const [evidence, setEvidence] = useState<{ question: string; answer: string; followUp: string }>();
   const [note, setNote] = useState('');
@@ -26,6 +27,7 @@ export function BenchmarkPage({ ws }: { ws: WorkspaceInfo }) {
   const [results, setResults] = useState<BenchResult[]>([]);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  const needsJudge = id ? data?.review.grader.kind === 'rubric' : index?.cases.some(c => c.kind === 'rubric');
 
   useEffect(() => {
     let active = true;
@@ -54,12 +56,26 @@ export function BenchmarkPage({ ws }: { ws: WorkspaceInfo }) {
       }
     });
   }
+  async function openDraft(id: string, c: BenchCase) {
+    clearSelection();
+    setStage('drafts'); setId(id); setData(c); setAdvanced(JSON.stringify(c, null, 2));
+    setIndex(await unify.benchIndex(cwd));
+  }
+  async function saveDraft(c: BenchCase) {
+    await openDraft(await unify.benchSaveDraft(cwd, c), c);
+  }
+  function editRubric(c: BenchCase) {
+    if (c.review.grader.kind !== 'rubric') return;
+    setData(c);
+    const grader = { ...c.review.grader, criteria: c.review.grader.criteria.filter(line => line.trim()) };
+    const value = { ...c, review: { ...c.review, grader } };
+    setAdvanced(JSON.stringify(value, null, 2)); setInvalid(!caseSchema.safeParse(value).success);
+  }
   async function draft() {
     await perform('正在出题', async () => {
       const repository = commit.trim() || paths.trim() ? { commit: commit.trim(), paths: paths.split('\n').map(s => s.trim()).filter(Boolean) } : undefined;
       const generated = await unify.benchDraft(cwd, id, model, note, repository);
-      setIndex(await unify.benchIndex(cwd)); setStage('drafts'); setId(generated.id); setData(generated.data);
-      setAdvanced(JSON.stringify(generated.data, null, 2)); setEvidence(undefined);
+      await openDraft(generated.id, generated.data);
     });
   }
   async function publish() {
@@ -94,6 +110,10 @@ export function BenchmarkPage({ ws }: { ws: WorkspaceInfo }) {
         </select>
       </label> : <p className="lede">{stage === 'candidates' ? '在对话回答上点「留题」，即可把一次不符合预期的结果放到这里。'
         : stage === 'drafts' ? '从待出题的失败线索生成第一份草稿。' : '草稿经审阅并通过对照校验后，会出现在这里。'}</p>}
+      {stage !== 'cases' && !id && <div className="bench-field">从示例创建草稿
+        <div className="bench-picks">{examples.map(e => <button className="btn" key={e.key}
+          onClick={() => void perform('创建草稿', () => saveDraft(exampleCase(e.key)))}>{e.label}</button>)}</div>
+      </div>}
       {stage === 'candidates' && evidence && <>
         <h3>{evidence.question}</h3><details><summary>当时的回答</summary><pre>{evidence.answer}</pre></details>
         <label className="distill-field">你期望它怎么做？
@@ -114,11 +134,16 @@ export function BenchmarkPage({ ws }: { ws: WorkspaceInfo }) {
         </details>
         <details key={id + '-review'}><summary>评审侧 · {kindName[data.review.grader.kind]}</summary>
           <p>{data.review.skill}</p><b>代表性错解</b><pre>{data.review.negative || '未修改的起点'}</pre>
-          <b>参考解</b><pre>{data.review.positive}</pre><b>判分依据</b><pre>{JSON.stringify(data.review.grader, null, 2)}</pre>
+          <b>参考答案</b><pre>{data.review.positive}</pre><b>判分标准</b>
+          {data.review.grader.kind === 'rubric' ? <ol>{data.review.grader.criteria.map((c, i) => <li key={i}>{c}</li>)}</ol>
+            : <pre>{JSON.stringify(data.review.grader, null, 2)}</pre>}
         </details>
       </>}
       {stage === 'drafts' && data && <>
-        <details><summary>编辑题目与验收材料</summary>
+        {data.review.grader.kind === 'rubric' && <details><summary>编辑题面与判分标准</summary>
+          <RubricFields data={data} onChange={editRubric} />
+        </details>}
+        <details><summary>{data.review.grader.kind === 'rubric' ? '编辑完整 JSON' : '编辑题目与验收材料'}</summary>
           <label className="distill-field">草稿 JSON<textarea rows={16} value={advanced} onChange={e => {
             const text = e.target.value;
             setAdvanced(text);
@@ -126,19 +151,39 @@ export function BenchmarkPage({ ws }: { ws: WorkspaceInfo }) {
             catch { setInvalid(true); }
           }} /></label>
         </details>
-        {invalid && <p role="alert">草稿 JSON 无效，上方显示最近一次有效预览。</p>}
-        {data.review.grader.kind === 'rubric' && modelPicker}<button className="btn primary" disabled={invalid || (data.review.grader.kind === 'rubric' && !model)} onClick={() => void publish()}>确认难点一致，校验并发布</button>
+        {invalid && <p role="alert">草稿格式或必填内容有误，请检查题面、参考答案和判分标准。</p>}
+        {data.review.grader.kind === 'rubric' && modelPicker}
+        <div className="bench-picks">
+          <button className="btn" disabled={invalid} onClick={() => void perform('保存草稿', () => saveDraft(caseSchema.parse(JSON.parse(advanced))))}>保存草稿</button>
+          <button className="btn primary" disabled={invalid || (data.review.grader.kind === 'rubric' && !model)} onClick={() => void publish()}>确认难点一致，校验并发布</button>
+        </div>
       </>}
       {stage === 'cases' && index.cases.length > 0 && <>
         <div className="bench-field">参评模型<div className="bench-picks">{targets.map(t =>
           <label key={t.id}><input type="checkbox" checked={participants.includes(t.id)} onChange={e => setParticipants(
             e.target.checked ? [...participants, t.id] : participants.filter(x => x !== t.id))} /> {t.label}</label>)}</div></div>
-        {(id ? data?.review.grader.kind === 'rubric' : index.cases.some(c => c.kind === 'rubric')) && modelPicker}<button className="btn primary" disabled={!participants.length} onClick={() => void run()}>运行评测</button>
+        {needsJudge && modelPicker}<button className="btn primary" disabled={!participants.length || (needsJudge && !model)} onClick={() => void run()}>运行评测</button>
         {results.map(r => <details key={r.caseId + r.target}><summary>{r.title} · {r.target} · {({ pass: '通过', fail: '未通过', error: '运行错误' })[r.status]}</summary>
-          <p>{r.detail} · {(r.durationMs / 1000).toFixed(1)} 秒</p><pre>{r.answer}</pre></details>)}
+          <p>{r.detail} · {(r.durationMs / 1000).toFixed(1)} 秒</p>
+          {r.checks && <ol>{r.checks.map((c, i) => <li key={i}><b>{c.pass ? '通过' : '未通过'}</b> · {c.criterion}<p>{c.reason}</p></li>)}</ol>}
+          <pre>{r.answer}</pre></details>)}
       </>}
     </fieldset>}
     {busy && <p role="status"><Spinner /> {busy}…</p>}
     {error && <div className="error block" role="alert">{error}</div>}
   </section>;
+}
+
+function RubricFields({ data, onChange }: { data: BenchCase; onChange(c: BenchCase): void }) {
+  const { task, review } = data, grader = review.grader;
+  if (grader.kind !== 'rubric') return null;
+  return <>
+    <label className="bench-field">标题<input value={task.title} onChange={e => onChange({ ...data, task: { ...task, title: e.target.value } })} /></label>
+    <label className="distill-field">考生可见的任务与材料<textarea rows={6} value={task.prompt} onChange={e => onChange({ ...data, task: { ...task, prompt: e.target.value } })} /></label>
+    {([['skill', '想测什么'], ['negative', '代表性错答'], ['positive', '参考答案']] as const).map(([key, label]) =>
+      <label className="distill-field" key={key}>{label}<textarea rows={2} value={review[key]} onChange={e =>
+        onChange({ ...data, review: { ...review, [key]: e.target.value } })} /></label>)}
+    <label className="distill-field">判分标准，每行一项<textarea rows={4} value={grader.criteria.join('\n')} onChange={e =>
+      onChange({ ...data, review: { ...review, grader: { ...grader, criteria: e.target.value.split('\n') } } })} /></label>
+  </>;
 }

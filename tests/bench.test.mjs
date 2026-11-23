@@ -169,3 +169,75 @@ test('rubric grading receives an anonymous answer and malformed verdicts stay er
   assert.equal((await runBench(cwd, [id], [solver], judge))[0].status, 'pass');
   assert.equal((await runBench(cwd, [id], [solver], model('badjudge', () => '{}')))[0].status, 'error');
 });
+
+test('text examples can be listed offline and opened as ordinary editable drafts', t => {
+  const cwd = workspace(t);
+  const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+  const run = (...args) => execFileSync(process.execPath, [cli, 'bench', 'example', ...args], { cwd, encoding: 'utf8' });
+  const names = run();
+  assert.match(names, /meeting-notes/);
+  assert.match(names, /customer-support/);
+  assert.match(names, /research-summary/);
+  assert.match(names, /brand-copy/);
+  assert.deepEqual(readdirSync(cwd), []);
+  const first = run('meeting-notes');
+  assert.equal(run('meeting-notes'), first);
+  const { drafts, cases } = listBench(cwd);
+  assert.equal(drafts.length, 1);
+  assert.ok(first.includes(drafts[0].id));
+  assert.equal(drafts[0].title, '发布会后纪要');
+  assert.deepEqual(cases, []);
+  assert.equal(existsSync(join(cwd, '.unify', 'runs')), false);
+});
+
+test('authored open-ended tasks retain the original format and pass only when every criterion passes', async t => {
+  const cwd = workspace(t);
+  const { exampleCase } = await import('../dist/bench/examples.js');
+  const sample = exampleCase('meeting-notes');
+  const criteria = sample.review.grader.criteria;
+  record(cwd, 'a', sample.task.prompt);
+  const candidate = capture(cwd, 'a', 'call', '不要把上线目标写成承诺');
+  const author = model('author', ({ prompt }) => {
+    if (prompt.startsWith('从原始请求')) {
+      assert.doesNotMatch(prompt, /不要把上线目标写成承诺/);
+      return JSON.stringify(sample.task);
+    }
+    assert.match(prompt, /不要把上线目标写成承诺/);
+    return JSON.stringify({ ...sample.review, grader: { kind: 'rubric', criteria } });
+  });
+  const { data, id: draftId } = await draftCase(cwd, candidate.id, author);
+  assert.equal(draftId, caseId(sample));
+
+  const wrong = '产品已确定周五上线。';
+  const paraphrase = '授权条款获批后才能敲定日子，目前瞄准周五。';
+  const judge = model('judge', ({ prompt }) => {
+    const input = JSON.parse(prompt.slice(prompt.indexOf('\n') + 1));
+    assert.deepEqual(input.criteria, criteria);
+    assert.doesNotMatch(prompt, /participant-private-id/);
+    return JSON.stringify({ checks: [3, 1, 2].map(index => {
+      const pass = index !== 2 || !input.answer.includes(wrong);
+      return { index, pass, reason: pass ? '符合本项标准' : '答卷写了“已确定周五上线”' };
+    }) });
+  });
+  const id = await publish(cwd, data, judge);
+  const rows = await runBench(cwd, [id], [
+    model('participant-private-id', req => {
+      assert.ok(!req.prompt.includes(criteria[0]));
+      return sample.review.negative;
+    }),
+    model('paraphrase', () => sample.review.positive.replace('产品以周五为上线目标，具体时间取决于法务确认授权条款。', paraphrase)),
+  ], judge);
+  assert.deepEqual(rows.map(r => r.status), ['fail', 'pass']);
+  assert.deepEqual(rows[0].checks.map(c => c.criterion), criteria);
+  assert.deepEqual(rows[0].checks.map(c => c.pass), [true, false, true]);
+  assert.equal(rows[0].detail, '2/3 项通过');
+  assert.equal(rows[1].detail, '3/3 项通过');
+  await assert.rejects(publish(cwd, { ...data, review: { ...data.review, positive: data.review.negative } }, judge), /已确定周五上线/);
+
+  for (const indexes of [[1, 2], [1, 1, 3], [0, 1, 2], [1, 2, 3, 4]]) {
+    const broken = model('judge', () => JSON.stringify({ pass: true, checks: indexes.map(index => ({ index, pass: true, reason: 'ok' })) }));
+    const [r] = await runBench(cwd, [id], [model('solver', () => sample.review.positive)], broken);
+    assert.equal(r.status, 'error');
+    assert.equal(r.checks, undefined);
+  }
+});

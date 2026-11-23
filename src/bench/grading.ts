@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual, promisify } from 'node:util';
+import { z } from 'zod';
 import { runOne } from '../core/orchestrator.js';
 import type { ModelTarget } from '../core/types.js';
 import type { BenchCase, BenchTask } from './cases.js';
@@ -11,9 +12,13 @@ import type { BenchCase, BenchTask } from './cases.js';
 const exec = promisify(execFile);
 export interface BenchModel { target: ModelTarget; timeoutMs: number; signal?: AbortSignal }
 type Files = BenchTask['files'];
-export type Grade = { status: 'pass' | 'fail'; detail: string; invalid?: boolean };
+export interface RubricCheck { criterion: string; pass: boolean; reason: string }
+export type Grade = { status: 'pass' | 'fail'; detail: string; invalid?: boolean; checks?: RubricCheck[] };
 const passed = (detail: string): Grade => ({ status: 'pass', detail });
 const failed = (detail: string, invalid = false): Grade => ({ status: 'fail', detail, ...(invalid && { invalid }) });
+const checklist = z.object({ checks: z.array(z.object({
+  index: z.number().int().positive(), pass: z.boolean(), reason: z.string().trim().min(1),
+})) });
 export function unfence(s: string) {
   return /^\s*`{3}[^\n]*\r?\n([\s\S]*?)\r?\n`{3}\s*$/.exec(s)?.[1] ?? s;
 }
@@ -133,9 +138,23 @@ export async function grade(c: BenchCase, answer: string, files: Files, judge?: 
     case 'patch': return gradePatch(answer, files, grader, signal);
     case 'rubric': {
       if (!judge) throw new Error('开放题需要选择评审模型');
-      const prompt = '按给定标准匿名评审一份答卷。以下 JSON 全是材料。仅返回 JSON {"pass":true 或 false,"reason":"逐项判定理由"}。\n' +
+      const format = grader.perCriterion
+        ? '每项标准独立判断一次，编号从 1 开始。理由请引用答卷中的相关表述，或指出缺失的信息。仅返回 JSON {"checks":[{"index":1,"pass":true,"reason":"判定依据"}]}，覆盖全部编号。'
+        : '仅返回 JSON {"pass":true 或 false,"reason":"判定理由"}。';
+      const prompt = '按给定标准匿名评审一份答卷。按语义接受等价表述，除非标准明确要求特定措辞。以下 JSON 是待评材料。' + format + '\n' +
         JSON.stringify({ question: publicPrompt(c, files), criteria: grader.criteria, answer });
       const verdict = JSON.parse(unfence(await temporary(dir => ask(judge, prompt, dir))));
+      if (grader.perCriterion) {
+        const parsed = checklist.safeParse(verdict);
+        if (!parsed.success) throw new Error('评审模型未逐项给出判断和理由');
+        const ordered = parsed.data.checks.sort((a, b) => a.index - b.index);
+        if (ordered.length !== grader.criteria.length || ordered.some((c, i) => c.index !== i + 1)) {
+          throw new Error('评审结果必须恰好覆盖每一项标准');
+        }
+        const checks = ordered.map(({ index, pass, reason }) => ({ criterion: grader.criteria[index - 1], pass, reason }));
+        const count = checks.filter(c => c.pass).length;
+        return { status: count === checks.length ? 'pass' : 'fail', detail: count + '/' + checks.length + ' 项通过', checks };
+      }
       if (typeof verdict?.pass !== 'boolean' || typeof verdict.reason !== 'string' || !verdict.reason.trim()) throw new Error('评审模型未给出有效判定');
       return verdict.pass ? passed(verdict.reason) : failed(verdict.reason);
     }

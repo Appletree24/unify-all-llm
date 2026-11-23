@@ -160,6 +160,7 @@ export interface UnifyApi {
   memoryUrl(): Promise<string>;
   captureBench(cwd: string, turn: string, call?: string): Promise<Candidate>;
   benchIndex(cwd: string): Promise<BenchIndex>;
+  benchSaveDraft(cwd: string, data: BenchCase): Promise<string>;
   benchEvidence(cwd: string, id: string): Promise<{ question: string; answer: string; followUp: string }>;
   benchDraft(cwd: string, id: string, target: string, note: string, repo?: Repository): Promise<{ id: string; data: BenchCase }>;
   benchRead(cwd: string, id: string, published: boolean): Promise<BenchCase>;

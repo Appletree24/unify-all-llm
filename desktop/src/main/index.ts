@@ -1,4 +1,4 @@
-import { candidateEvidence, capture, getCase, getDraft, listBench } from '../../../src/bench/cases.js';
+import { candidateEvidence, capture, getCase, getDraft, listBench, saveDraft } from '../../../src/bench/cases.js';
 import type { MenuItemConstructorOptions } from 'electron';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, Notification, screen, shell } from 'electron';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -214,6 +214,7 @@ const api: UnifyApi = {
   async respondInteraction(turnId, interactionId, response) { return need().respondInteraction(turnId, interactionId, response); },
   async captureBench(cwd, turn, call) { return capture(currentWorkspace(cwd).cwd, turn, call); },
   async benchIndex(cwd) { return listBench(currentWorkspace(cwd).cwd); },
+  async benchSaveDraft(cwd, data) { return saveDraft(currentWorkspace(cwd).cwd, data); },
   async benchEvidence(cwd, id) { return candidateEvidence(currentWorkspace(cwd).cwd, id); },
   async benchDraft(cwd, id, target, note, repo) { return currentWorkspace(cwd).benchDraft(id, target, note, repo); },
   async benchRead(cwd, id, published) { return (published ? getCase : getDraft)(currentWorkspace(cwd).cwd, id); },
