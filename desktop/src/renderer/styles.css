@@ -639,13 +639,3 @@ input.num { width: 110px; text-align: right; font-variant-numeric: tabular-nums;
   background: var(--bg);
 }
 .interact-banner-jump:hover { background: var(--hover); }
-
-.bench-tabs, .bench-picks { display: flex; flex-wrap: wrap; gap: 8px; }
-.bench-body { border: 0; min-width: 0; padding: 20px 0; display: grid; align-content: start; gap: 16px; }
-.bench-body .btn { justify-self: start; }
-.bench-field { display: grid; gap: 6px; font-size: 13px; }
-.bench-field select, .bench-field input { max-width: 100%; }
-.bench-page details { border-left: 2px solid var(--line-2); padding: 4px 12px; }
-.bench-page summary { cursor: pointer; }
-.bench-page pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.6 var(--mono); }
-.bench-page details > .bench-field, .bench-page details > .distill-field { margin-top: 10px; }

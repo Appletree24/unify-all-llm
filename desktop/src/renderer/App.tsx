@@ -387,8 +387,9 @@ export function App() {
             </div>
           </div>
         )}
+        {ws && <BenchmarkPage key={ws.cwd} ws={ws} visible={view === 'bench'} />}
         {!ws ? <Welcome onOpen={(d) => void openWorkspace(d)} />
-          : view === 'bench' ? <BenchmarkPage key={ws.cwd} ws={ws} />
+          : view === 'bench' ? null
           : view === 'quota' ? <QuotaPage quota={quota} loading={quotaLoading} refresh={() => refreshQuota(true)} />
           : view === 'memory' ? <MemoryPage cwd={ws.cwd} notify={notify} />
           : view === 'settings' ? <SettingsPage ws={ws} onChange={setWs} notify={notify} />

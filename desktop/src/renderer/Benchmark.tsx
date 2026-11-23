@@ -1,189 +1,927 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { BenchCase, BenchIndex, BenchResult, WorkspaceInfo } from '../shared/api.js';
 import { caseSchema } from '../../../src/bench/schema.js';
 import { exampleCase, examples } from '../../../src/bench/examples.js';
 import { unify } from './api.js';
-import { Spinner } from './ui.js';
+import { Icon, Spinner } from './ui.js';
+import './Benchmark.css';
 
-type Stage = 'candidates' | 'drafts' | 'cases';
-const stageName = { candidates: '失败线索', drafts: '草稿', cases: '已发布' };
-const kindName = { exact: '精确答案', javascript: 'JavaScript 用例', patch: '补丁测试', rubric: '评审标准' };
+type View = 'home' | 'candidate' | 'draft' | 'case' | 'suite';
+type Filter = 'all' | 'cases' | 'drafts' | 'candidates';
+type BenchKind = BenchCase['review']['grader']['kind'];
+type CandidateItem = BenchIndex['candidates'][number];
 
-export function BenchmarkPage({ ws }: { ws: WorkspaceInfo }) {
+const KIND_LABEL: Record<BenchKind, string> = {
+  rubric: '开放评审',
+  exact: '精确答案',
+  javascript: 'JavaScript 用例',
+  patch: '补丁校验',
+};
+const STATUS_LABEL: Record<BenchResult['status'], string> = {
+  pass: '通过',
+  fail: '未通过',
+  error: '运行错误',
+};
+const SCENE_ICON: Record<string, string> = {
+  'meeting-notes': 'edit',
+  'customer-support': 'chat',
+  'research-summary': 'search',
+  'brand-copy': 'spark',
+};
+
+function materialExcerpt(prompt: string): string {
+  const parts = prompt.split('\n\n').map(s => s.trim()).filter(Boolean);
+  return parts.length > 1 ? parts.slice(1).join('\n') : prompt;
+}
+
+function normalizeCase(c: BenchCase): BenchCase {
+  if (c.review.grader.kind !== 'rubric') return c;
+  return {
+    ...c,
+    review: {
+      ...c.review,
+      grader: { ...c.review.grader, criteria: c.review.grader.criteria.map(s => s.trim()).filter(Boolean) },
+    },
+  };
+}
+
+function validateCase(value: unknown): { ok: true; data: BenchCase } | { ok: false; message: string } {
+  const parsed = caseSchema.safeParse(value);
+  if (parsed.success) return { ok: true, data: parsed.data };
+  const issue = parsed.error.issues[0];
+  return { ok: false, message: issue?.message ? `草稿校验未通过：${issue.message}` : '草稿格式或必填项有误，请检查题面、参考答案与评审标准。' };
+}
+
+export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boolean }) {
   const cwd = ws.cwd;
+  const page = useRef<HTMLElement>(null);
   const targets = ws.targets.filter(t => t.installed !== false);
   const [index, setIndex] = useState<BenchIndex>();
-  const [stage, setStage] = useState<Stage>('candidates');
+  const [view, setView] = useState<View>('home');
+  const [filter, setFilter] = useState<Filter>('all');
+  const [showStarters, setShowStarters] = useState(false);
   const [id, setId] = useState('');
-  const [model, setModel] = useState(() => [ws.synthesizer, ...ws.defaults, targets[0]?.id].find(id => targets.some(t => t.id === id)) ?? '');
-  const [participants, setParticipants] = useState<string[]>(ws.defaults.filter(name => targets.some(t => t.id === name)));
+  const [selectedModel, setModel] = useState<string>();
+  const [participants, setParticipants] = useState<string[]>();
+  const [candidate, setCandidate] = useState<CandidateItem>();
   const [evidence, setEvidence] = useState<{ question: string; answer: string; followUp: string }>();
   const [note, setNote] = useState('');
   const [commit, setCommit] = useState('');
   const [paths, setPaths] = useState('');
   const [data, setData] = useState<BenchCase>();
-  const [invalid, setInvalid] = useState(false);
   const [advanced, setAdvanced] = useState('');
+  const [invalidMsg, setInvalidMsg] = useState('');
   const [results, setResults] = useState<BenchResult[]>([]);
+  const [dirty, setDirty] = useState(false);
+  const [pendingNav, setPendingNav] = useState<(() => void) | null>(null);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
-  const needsJudge = id ? data?.review.grader.kind === 'rubric' : index?.cases.some(c => c.kind === 'rubric');
+  const [notice, setNotice] = useState('');
 
   useEffect(() => {
+    if (!visible) return;
     let active = true;
-    unify.benchIndex(cwd).then(value => { if (active) setIndex(value); }, e => { if (active) setError(String(e)); });
+    unify.benchIndex(cwd).then(v => { if (active) setIndex(v); }, e => { if (active) setError(e instanceof Error ? e.message : String(e)); });
     return () => { active = false; };
-  }, [cwd]);
+  }, [cwd, visible]);
 
-  function clearSelection() {
-    setId(''); setData(undefined); setAdvanced(''); setInvalid(false); setError(''); setEvidence(undefined); setResults([]); setNote(''); setCommit(''); setPaths('');
+  useLayoutEffect(() => { page.current?.scrollTo(0, 0); }, [view, id]);
+  useLayoutEffect(() => {
+    if (pendingNav || error) page.current?.scrollTo(0, 0);
+  }, [pendingNav, error]);
+
+  useEffect(() => {
+    if (!dirty) return;
+    const onUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', onUnload);
+    return () => window.removeEventListener('beforeunload', onUnload);
+  }, [dirty]);
+
+  const model = [selectedModel ?? ws.synthesizer, ...ws.defaults, targets[0]?.id].find(id => targets.some(t => t.id === id)) ?? '';
+  const activeParticipants = (participants ?? ws.defaults).filter(p => targets.some(t => t.id === p));
+  const needsJudge = view === 'case' ? data?.review.grader.kind === 'rubric' : !!index?.cases.some(c => c.kind === 'rubric');
+
+  function resetDetail() {
+    setId(''); setCandidate(undefined); setEvidence(undefined); setNote(''); setCommit(''); setPaths('');
+    setData(undefined); setAdvanced(''); setInvalidMsg(''); setResults([]); setDirty(false); setError(''); setNotice('');
   }
-  async function perform(label: string, action: () => Promise<void>) {
-    setBusy(label); setError('');
-    try { await action(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+
+  function guardNav(action: () => void) {
+    if (busy) return;
+    if (dirty) { setPendingNav(() => action); return; }
+    setPendingNav(null);
+    action();
+  }
+
+  async function perform(label: string, action: () => Promise<void>): Promise<boolean> {
+    setBusy(label); setError(''); setNotice('');
+    try { await action(); return true; }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); return false; }
     finally { setBusy(''); }
   }
-  async function select(value: string) {
-    clearSelection(); setId(value);
-    if (!value) return;
-    await perform('读取题目', async () => {
-      if (stage === 'candidates') {
-        setNote(index?.candidates.find(c => c.id === value)?.note ?? '');
-        setEvidence(await unify.benchEvidence(cwd, value));
-      } else {
-        const c = await unify.benchRead(cwd, value, stage === 'cases');
+
+  function goHome() {
+    guardNav(() => { resetDetail(); setView('home'); });
+  }
+
+  function openCandidate(item: CandidateItem) {
+    guardNav(() => {
+      resetDetail(); setView('candidate'); setId(item.id); setCandidate(item); setNote(item.note ?? '');
+      void perform('正在读取线索内容', async () => { setEvidence(await unify.benchEvidence(cwd, item.id)); });
+    });
+  }
+
+  function openDraftById(draftId: string) {
+    guardNav(() => {
+      resetDetail(); setView('draft'); setId(draftId);
+      void perform('正在读取草稿', async () => {
+        const c = await unify.benchRead(cwd, draftId, false);
         setData(c); setAdvanced(JSON.stringify(c, null, 2));
-      }
+      });
     });
   }
-  async function openDraft(id: string, c: BenchCase) {
-    clearSelection();
-    setStage('drafts'); setId(id); setData(c); setAdvanced(JSON.stringify(c, null, 2));
+
+  function openCaseById(caseId: string) {
+    guardNav(() => {
+      resetDetail(); setView('case'); setId(caseId);
+      void perform('正在读取案例', async () => {
+        const c = await unify.benchRead(cwd, caseId, true);
+        setData(c); setAdvanced(JSON.stringify(c, null, 2));
+      });
+    });
+  }
+
+  function openSuite() {
+    guardNav(() => { resetDetail(); setView('suite'); });
+  }
+
+  async function loadSavedDraft(savedId: string, c: BenchCase, msg: string) {
+    resetDetail();
+    setView('draft'); setId(savedId); setData(c); setAdvanced(JSON.stringify(c, null, 2));
     setIndex(await unify.benchIndex(cwd));
+    setShowStarters(false);
+    setNotice(msg);
   }
-  async function saveDraft(c: BenchCase) {
-    await openDraft(await unify.benchSaveDraft(cwd, c), c);
-  }
-  function editRubric(c: BenchCase) {
-    if (c.review.grader.kind !== 'rubric') return;
-    setData(c);
-    const grader = { ...c.review.grader, criteria: c.review.grader.criteria.filter(line => line.trim()) };
-    const value = { ...c, review: { ...c.review, grader } };
-    setAdvanced(JSON.stringify(value, null, 2)); setInvalid(!caseSchema.safeParse(value).success);
-  }
-  async function draft() {
-    await perform('正在出题', async () => {
-      const repository = commit.trim() || paths.trim() ? { commit: commit.trim(), paths: paths.split('\n').map(s => s.trim()).filter(Boolean) } : undefined;
-      const generated = await unify.benchDraft(cwd, id, model, note, repository);
-      await openDraft(generated.id, generated.data);
+
+  function createFromExample(key: string) {
+    guardNav(() => {
+      void perform('正在从场景示例创建草稿', async () => {
+        const c = exampleCase(key);
+        const savedId = await unify.benchSaveDraft(cwd, c);
+        await loadSavedDraft(savedId, c, '已从场景示例创建草稿，可直接修改题面与评审标准。');
+      });
     });
   }
-  async function publish() {
-    await perform('正在验证错解和参考解', async () => {
-      const c: BenchCase = JSON.parse(advanced);
-      const published = await unify.benchPublish(cwd, c, c.review.grader.kind === 'rubric' ? model : undefined);
-      setIndex(await unify.benchIndex(cwd)); setStage('cases'); setId(published); setData(c);
+
+  function updateDraftForm(next: BenchCase) {
+    setData(next); setDirty(true); setNotice('');
+    const normalized = normalizeCase(next);
+    setAdvanced(JSON.stringify(normalized, null, 2));
+    const checked = validateCase(normalized);
+    setInvalidMsg(checked.ok ? '' : checked.message);
+  }
+
+  function updateDraftJson(text: string) {
+    setAdvanced(text); setDirty(true); setNotice('');
+    try {
+      const checked = validateCase(JSON.parse(text));
+      if (checked.ok) { setData(checked.data); setInvalidMsg(''); }
+      else setInvalidMsg(checked.message);
+    } catch {
+      setInvalidMsg('JSON 语法有误，请检查引号、逗号或括号匹配。');
+    }
+  }
+
+  async function generateDraft() {
+    await perform('正在根据线索整理草稿', async () => {
+      const repoPaths = paths.split('\n').map(s => s.trim()).filter(Boolean);
+      const repo = commit.trim() || repoPaths.length ? { commit: commit.trim(), paths: repoPaths } : undefined;
+      const generated = await unify.benchDraft(cwd, id, model, note, repo);
+      await loadSavedDraft(generated.id, generated.data, '已生成案例草稿，请审阅题面与评审标准。');
     });
   }
-  async function run() {
-    await perform('正在运行评测', async () => {
-      setResults([]); setResults(await unify.benchRun(cwd, id ? [id] : [], participants, model || undefined));
+
+  async function saveCurrentDraft(): Promise<boolean> {
+    return perform('正在保存草稿', async () => {
+      const parsed = caseSchema.parse(JSON.parse(advanced));
+      const savedId = await unify.benchSaveDraft(cwd, parsed);
+      setId(savedId); setData(parsed); setAdvanced(JSON.stringify(parsed, null, 2));
+      setDirty(false); setInvalidMsg('');
+      setIndex(await unify.benchIndex(cwd));
+      setNotice('草稿已保存。');
     });
   }
-  const modelPicker = <label className="bench-field">{stage === 'candidates' ? '出题模型' : '开放题评审模型'}
-    <select value={model} onChange={e => setModel(e.target.value)}>
-      <option value="">选择模型</option>{targets.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
-    </select>
-  </label>;
-  return <section className="page bench-page">
-    <header className="page-head"><h1>项目评测集</h1></header>
-    <div className="bench-tabs">{(Object.keys(stageName) as Stage[]).map(s =>
-      <button className={'btn ' + (stage === s ? 'primary' : '')} key={s} disabled={!!busy} onClick={() => { clearSelection(); setStage(s); }}>
-        {stageName[s]} · {index?.[s].length ?? 0}
-      </button>)}</div>
-    {!index && !error && <Spinner />}
-    {index && <fieldset disabled={!!busy} className="bench-body">
-      {index[stage].length > 0 ? <label className="bench-field">{stage === 'candidates' ? '失败线索' : '题目'}
-        <select value={id} onChange={e => void select(e.target.value)}>
-          <option value="">{stage === 'cases' ? '整个题集' : '选择一条记录'}</option>
-          {index[stage].map(item => <option value={item.id} key={item.id}>{item.title} · {item.id.slice(0, 6)}</option>)}
-        </select>
-      </label> : <p className="lede">{stage === 'candidates' ? '在对话回答上点「留题」，即可把一次不符合预期的结果放到这里。'
-        : stage === 'drafts' ? '从待出题的失败线索生成第一份草稿。' : '草稿经审阅并通过对照校验后，会出现在这里。'}</p>}
-      {stage !== 'cases' && !id && <div className="bench-field">从示例创建草稿
-        <div className="bench-picks">{examples.map(e => <button className="btn" key={e.key}
-          onClick={() => void perform('创建草稿', () => saveDraft(exampleCase(e.key)))}>{e.label}</button>)}</div>
-      </div>}
-      {stage === 'candidates' && evidence && <>
-        <h3>{evidence.question}</h3><details><summary>当时的回答</summary><pre>{evidence.answer}</pre></details>
-        <label className="distill-field">你期望它怎么做？
-          <textarea rows={3} value={note} onChange={e => setNote(e.target.value)} placeholder="可选，指出遗漏的条件或错误的行为" />
-        </label>
-        {evidence.followUp && <button className="btn" onClick={() => setNote(evidence.followUp)}>采用下一轮追问作为纠正</button>}
-        <details><summary>引用已有 Git 版本</summary>
-          <label className="bench-field">完整 commit SHA<input value={commit} onChange={e => setCommit(e.target.value)} /></label>
-          <label className="distill-field">用于出题的仓库文件，每行一个路径<textarea rows={3} value={paths} onChange={e => setPaths(e.target.value)} /></label>
-        </details>
-        {modelPicker}<button className="btn primary" disabled={!model} onClick={() => void draft()}>生成草稿</button>
-      </>}
-      {data && <>
-        <h3>{data.task.title}</h3>
-        <details open key={id + '-task'}><summary>考生可见的题面</summary><pre>{data.task.prompt}</pre>
-          {data.task.files.map(f => <details key={f.path}><summary>{f.path}</summary><pre>{f.content}</pre></details>)}
-          {data.task.repository && <p>Git {data.task.repository.commit.slice(0, 12)} · {data.task.repository.paths.join('、')}</p>}
-        </details>
-        <details key={id + '-review'}><summary>评审侧 · {kindName[data.review.grader.kind]}</summary>
-          <p>{data.review.skill}</p><b>代表性错解</b><pre>{data.review.negative || '未修改的起点'}</pre>
-          <b>参考答案</b><pre>{data.review.positive}</pre><b>判分标准</b>
-          {data.review.grader.kind === 'rubric' ? <ol>{data.review.grader.criteria.map((c, i) => <li key={i}>{c}</li>)}</ol>
-            : <pre>{JSON.stringify(data.review.grader, null, 2)}</pre>}
-        </details>
-      </>}
-      {stage === 'drafts' && data && <>
-        {data.review.grader.kind === 'rubric' && <details><summary>编辑题面与判分标准</summary>
-          <RubricFields data={data} onChange={editRubric} />
-        </details>}
-        <details><summary>{data.review.grader.kind === 'rubric' ? '编辑完整 JSON' : '编辑题目与验收材料'}</summary>
-          <label className="distill-field">草稿 JSON<textarea rows={16} value={advanced} onChange={e => {
-            const text = e.target.value;
-            setAdvanced(text);
-            try { setData(caseSchema.parse(JSON.parse(text))); setInvalid(false); }
-            catch { setInvalid(true); }
-          }} /></label>
-        </details>
-        {invalid && <p role="alert">草稿格式或必填内容有误，请检查题面、参考答案和判分标准。</p>}
-        {data.review.grader.kind === 'rubric' && modelPicker}
-        <div className="bench-picks">
-          <button className="btn" disabled={invalid} onClick={() => void perform('保存草稿', () => saveDraft(caseSchema.parse(JSON.parse(advanced))))}>保存草稿</button>
-          <button className="btn primary" disabled={invalid || (data.review.grader.kind === 'rubric' && !model)} onClick={() => void publish()}>确认难点一致，校验并发布</button>
+
+  async function publishCurrentDraft() {
+    await perform('正在用错答与参考答对照校验并收录', async () => {
+      const c = caseSchema.parse(JSON.parse(advanced));
+      const publishedId = await unify.benchPublish(cwd, c, c.review.grader.kind === 'rubric' ? model : undefined);
+      setIndex(await unify.benchIndex(cwd));
+      resetDetail(); setView('case'); setId(publishedId); setData(c); setAdvanced(JSON.stringify(c, null, 2));
+      setNotice('对照校验已通过，案例已正式收录。');
+    });
+  }
+
+  async function runBench(caseIds: string[]) {
+    await perform(caseIds.length ? '正在运行本题模型对照' : '正在运行整库模型对照', async () => {
+      setResults([]);
+      const res = await unify.benchRun(cwd, caseIds, activeParticipants, needsJudge ? (model || undefined) : undefined);
+      setResults(res);
+      setNotice(`已完成 ${res.length} 份答卷评测。`);
+    });
+  }
+
+  const totalCount = index ? index.cases.length + index.drafts.length + index.candidates.length : 0;
+  const targetLabel = (tid: string) => targets.find(t => t.id === tid)?.label ?? tid;
+
+  if (!visible) return null;
+
+  const judgePicker = (label: string) => (
+    <label className="bench-inline-field">
+      <span>{label}</span>
+      <select className="bench-select" aria-label={label} value={model} onChange={e => setModel(e.target.value)}>
+        <option value="" disabled>选择模型</option>
+        {targets.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+      </select>
+    </label>
+  );
+
+  return (
+    <section ref={page} className="page bench-page" aria-label="案例集工作台">
+      {view !== 'home' && (
+        <nav className="bench-topbar" aria-label="案例导航">
+          <button type="button" className="bench-back" disabled={!!busy} onClick={goHome}>
+            <span className="bench-ico bench-ico-back" aria-hidden="true"><Icon name="chevron" /></span>
+            <span>返回案例集</span>
+          </button>
+          <span className="bench-crumb">
+            {view === 'candidate' && '收藏线索'}
+            {view === 'draft' && (dirty ? '草稿 · 未保存' : '草稿')}
+            {view === 'case' && (data ? `已收录 · ${KIND_LABEL[data.review.grader.kind]}` : '已收录案例')}
+            {view === 'suite' && `整库模型对照 · ${index?.cases.length ?? 0} 题`}
+          </span>
+        </nav>
+      )}
+
+      {pendingNav && (
+        <div className="bench-banner" data-tone="warn" role="alertdialog" aria-label="未保存的修改">
+          <span className="bench-ico" aria-hidden="true"><Icon name="alert" /></span>
+          <p>当前页面有尚未保存的改动，离开后将丢失这些修改。</p>
+          <div className="bench-banner-actions">
+            <button type="button" className="bench-btn" onClick={() => setPendingNav(null)}>继续编辑</button>
+            {view === 'draft' && !invalidMsg && (
+              <button type="button" className="bench-btn" data-variant="primary" onClick={() => void saveCurrentDraft().then(ok => {
+                if (ok) { const next = pendingNav; setPendingNav(null); next(); }
+              })}>保存并离开</button>
+            )}
+            <button type="button" className="bench-btn" data-variant="danger" onClick={() => {
+              const next = pendingNav; setDirty(false); setPendingNav(null); next();
+            }}>放弃改动</button>
+          </div>
         </div>
-      </>}
-      {stage === 'cases' && index.cases.length > 0 && <>
-        <div className="bench-field">参评模型<div className="bench-picks">{targets.map(t =>
-          <label key={t.id}><input type="checkbox" checked={participants.includes(t.id)} onChange={e => setParticipants(
-            e.target.checked ? [...participants, t.id] : participants.filter(x => x !== t.id))} /> {t.label}</label>)}</div></div>
-        {needsJudge && modelPicker}<button className="btn primary" disabled={!participants.length || (needsJudge && !model)} onClick={() => void run()}>运行评测</button>
-        {results.map(r => <details key={r.caseId + r.target}><summary>{r.title} · {r.target} · {({ pass: '通过', fail: '未通过', error: '运行错误' })[r.status]}</summary>
-          <p>{r.detail} · {(r.durationMs / 1000).toFixed(1)} 秒</p>
-          {r.checks && <ol>{r.checks.map((c, i) => <li key={i}><b>{c.pass ? '通过' : '未通过'}</b> · {c.criterion}<p>{c.reason}</p></li>)}</ol>}
-          <pre>{r.answer}</pre></details>)}
-      </>}
-    </fieldset>}
-    {busy && <p role="status"><Spinner /> {busy}…</p>}
-    {error && <div className="error block" role="alert">{error}</div>}
-  </section>;
+      )}
+
+      {busy && (
+        <div className="bench-banner" data-tone="busy" role="status" aria-live="polite">
+          <Spinner /><span>{busy}…</span>
+        </div>
+      )}
+      {error && (
+        <div className="bench-banner" data-tone="error" role="alert">
+          <span className="bench-ico" aria-hidden="true"><Icon name="alert" /></span>
+          <p>{error}</p>
+          {index ? <button type="button" className="bench-icon-btn" aria-label="关闭错误提示" onClick={() => setError('')}><Icon name="x" /></button>
+            : <button type="button" className="bench-btn" onClick={() => void perform('正在读取案例集', async () => setIndex(await unify.benchIndex(cwd)))}>重试</button>}
+        </div>
+      )}
+      {notice && !busy && !error && (
+        <div className="bench-banner" data-tone="ok" role="status" aria-live="polite">
+          <span className="bench-ico" aria-hidden="true"><Icon name="check" /></span>
+          <p>{notice}</p>
+          <button type="button" className="bench-icon-btn" aria-label="关闭提示" onClick={() => setNotice('')}><Icon name="x" /></button>
+        </div>
+      )}
+
+      {!index && !error && <div className="bench-loading"><Spinner /><span>正在整理案例集…</span></div>}
+
+      {index && view === 'home' && (
+        <div className="bench-home">
+          <header className="bench-masthead">
+            <div>
+              <p className="bench-eyebrow">{ws.name}</p>
+              <h1>团队案例集</h1>
+            </div>
+            <div className="bench-masthead-actions">
+              {totalCount > 0 && (
+                <button type="button" className="bench-btn" disabled={!!busy} onClick={() => setShowStarters(v => !v)}>
+                  <span className="bench-ico" aria-hidden="true"><Icon name="plus" /></span>
+                  <span>{showStarters ? '收起场景示例' : '从场景示例新建'}</span>
+                </button>
+              )}
+              {index.cases.length > 0 && (
+                <button type="button" className="bench-btn" data-variant="primary" disabled={!!busy} onClick={openSuite}>
+                  <span className="bench-ico" aria-hidden="true"><Icon name="run" /></span>
+                  <span>整库模型对照</span>
+                </button>
+              )}
+            </div>
+          </header>
+
+          {totalCount === 0 ? (
+            <div className="bench-empty">
+              <p className="bench-empty-lede">
+                遇到答偏的回复，在对话里点「留题」，把它收进案例集。也可以从下面的场景开始，写下你会如何判断一份回答。
+              </p>
+              <StarterGrid disabled={!!busy} onPick={createFromExample} />
+            </div>
+          ) : (
+            <>
+              <div className="bench-tabs" role="group" aria-label="按阶段筛选案例">
+                {([
+                  ['all', '全部', totalCount],
+                  ['cases', '已收录', index.cases.length],
+                  ['drafts', '草稿', index.drafts.length],
+                  ['candidates', '收藏线索', index.candidates.length],
+                ] as const).map(([key, label, count]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    aria-pressed={filter === key}
+                    className="bench-tab"
+                    data-active={filter === key || undefined}
+                    onClick={() => setFilter(key)}
+                  >
+                    <span>{label}</span>
+                    <span className="bench-count">{count}</span>
+                  </button>
+                ))}
+              </div>
+
+              {showStarters && (
+                <section className="bench-drawer" aria-label="从场景示例新建草稿">
+                  <div className="bench-group-head">
+                    <h2>从场景示例新建草稿</h2>
+                    <button type="button" className="bench-icon-btn" aria-label="收起场景示例" onClick={() => setShowStarters(false)}><Icon name="x" /></button>
+                  </div>
+                  <StarterGrid disabled={!!busy} onPick={createFromExample} />
+                </section>
+              )}
+
+              <div className="bench-sections">
+                {((filter === 'all' && index.cases.length > 0) || filter === 'cases') && (
+                  <section className="bench-group" aria-label="已收录案例">
+                    <div className="bench-group-head">
+                      <h2><span className="bench-ico" aria-hidden="true"><Icon name="layers" /></span>已收录案例</h2>
+                    </div>
+                    {index.cases.length > 0 ? (
+                      <ul className="bench-list">
+                        {index.cases.map(item => (
+                          <li key={item.id}>
+                            <button type="button" className="bench-row" disabled={!!busy} onClick={() => openCaseById(item.id)}>
+                              <span className="bench-row-title">{item.title}</span>
+                              <span className="bench-kind">{KIND_LABEL[item.kind]}</span>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : filter === 'cases' && <p className="bench-muted">草稿通过错答与参考答对照校验后，会正式收录在这里。</p>}
+                  </section>
+                )}
+
+                {((filter === 'all' && index.drafts.length > 0) || filter === 'drafts') && (
+                  <section className="bench-group" aria-label="整理中的草稿">
+                    <div className="bench-group-head">
+                      <h2><span className="bench-ico" aria-hidden="true"><Icon name="edit" /></span>草稿</h2>
+                    </div>
+                    {index.drafts.length > 0 ? (
+                      <ul className="bench-list">
+                        {index.drafts.map(item => (
+                          <li key={item.id}>
+                            <button type="button" className="bench-row" disabled={!!busy} onClick={() => openDraftById(item.id)}>
+                              <span className="bench-row-title">{item.title}</span>
+                              <span className="bench-kind">继续编辑</span>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : filter === 'drafts' && <p className="bench-muted">从收藏线索生成草稿，或点击上方「从场景示例新建」。</p>}
+                  </section>
+                )}
+
+                {((filter === 'all' && index.candidates.length > 0) || filter === 'candidates') && (
+                  <section className="bench-group" aria-label="收藏的失败线索">
+                    <div className="bench-group-head">
+                      <h2><span className="bench-ico" aria-hidden="true"><Icon name="bookmark" /></span>收藏线索</h2>
+                    </div>
+                    {index.candidates.length > 0 ? (
+                      <ul className="bench-list">
+                        {index.candidates.map(item => (
+                          <li key={item.id}>
+                            <button type="button" className="bench-row bench-row-clue" disabled={!!busy} onClick={() => openCandidate(item)}>
+                              <div className="bench-row-body">
+                                <span className="bench-row-title">{item.title}</span>
+                                {item.note.trim() && <span className="bench-row-note">{item.note}</span>}
+                              </div>
+                              <span className="bench-kind">查看线索</span>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : filter === 'candidates' && <p className="bench-muted">在对话回答上点「留题」，即可把不符合预期的回复收藏到这里。</p>}
+                  </section>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {index && view === 'candidate' && (
+        <fieldset disabled={!!busy} className="bench-sheet">
+          <div className="bench-cols">
+            <article className="bench-main">
+              <p className="bench-eyebrow">对话原题</p>
+              <h1 className="bench-doc-title">{evidence?.question ?? candidate?.title ?? '读取线索中'}</h1>
+              {evidence && (
+                <>
+                  <section className="bench-doc-block">
+                    <h2>当时不满意的回答</h2>
+                    <div className="bench-prose">{evidence.answer}</div>
+                  </section>
+                  {evidence.followUp && (
+                    <section className="bench-followup">
+                      <div className="bench-followup-head">
+                        <h2>你在下一轮的追问纠正</h2>
+                        <button type="button" className="bench-btn" onClick={() => { setNote(evidence.followUp); setDirty(true); }}>
+                          采纳为期望说明
+                        </button>
+                      </div>
+                      <p className="bench-prose">{evidence.followUp}</p>
+                    </section>
+                  )}
+                </>
+              )}
+            </article>
+
+            <aside className="bench-aside">
+              <h2>整理为评测草稿</h2>
+              <label className="bench-field">
+                <span>你期望模型怎么做？</span>
+                <textarea
+                  rows={5}
+                  value={note}
+                  placeholder="说明哪里答偏了、遗漏了什么边界，或你理想中的处理方式（可选）"
+                  onChange={e => { setNote(e.target.value); setDirty(true); }}
+                />
+              </label>
+
+              <details className="bench-fold">
+                <summary><span className="bench-ico" aria-hidden="true"><Icon name="branch" /></span>高级选项：引用 Git 仓库版本</summary>
+                <div className="bench-fold-body">
+                  <label className="bench-field">
+                    <span>完整 commit SHA</span>
+                    <input value={commit} placeholder="40 或 64 位十六进制提交哈希" onChange={e => { setCommit(e.target.value); setDirty(true); }} />
+                  </label>
+                  <label className="bench-field">
+                    <span>关联仓库文件路径（每行一个）</span>
+                    <textarea rows={3} value={paths} placeholder="例如：docs/release-notes.md" onChange={e => { setPaths(e.target.value); setDirty(true); }} />
+                  </label>
+                </div>
+              </details>
+
+              <div className="bench-action-stack">
+                {judgePicker('出题模型')}
+                <button type="button" className="bench-btn" data-variant="primary" disabled={!model || !evidence} onClick={() => void generateDraft()}>
+                  <span className="bench-ico" aria-hidden="true"><Icon name="spark" /></span>
+                  <span>生成案例草稿</span>
+                </button>
+              </div>
+            </aside>
+          </div>
+        </fieldset>
+      )}
+
+      {index && view === 'draft' && data && (
+        <fieldset disabled={!!busy} className="bench-sheet">
+          <DraftEditor
+            data={data}
+            advanced={advanced}
+            invalidMsg={invalidMsg}
+            modelPicker={data.review.grader.kind === 'rubric' ? judgePicker('校验与评审模型') : null}
+            canPublish={!invalidMsg && (data.review.grader.kind !== 'rubric' || !!model)}
+            onChangeForm={updateDraftForm}
+            onChangeJson={updateDraftJson}
+            onSave={() => void saveCurrentDraft()}
+            onPublish={() => void publishCurrentDraft()}
+          />
+        </fieldset>
+      )}
+
+      {index && (view === 'case' || view === 'suite') && (
+        <fieldset disabled={!!busy} className="bench-sheet">
+          {view === 'case' && data && (
+            <div className="bench-case-doc">
+              <header className="bench-doc-head">
+                <p className="bench-eyebrow">{KIND_LABEL[data.review.grader.kind]}</p>
+                <h1 className="bench-doc-title">{data.task.title}</h1>
+              </header>
+
+              <section className="bench-doc-block">
+                <h2>题面与材料（模型可见）</h2>
+                <div className="bench-prose">{data.task.prompt}</div>
+                <TaskMaterials task={data.task} />
+              </section>
+
+              <details className="bench-fold bench-review-panel">
+                <summary><span className="bench-ico" aria-hidden="true"><Icon name="sliders" /></span>评审参考（仅评审可见：参考答案与判分标准）</summary>
+                <div className="bench-fold-body">
+                  <p className="bench-skill"><strong>考察重点：</strong>{data.review.skill}</p>
+                  <div className="bench-contrast">
+                    <div className="bench-contrast-card" data-polarity="neg">
+                      <h3>代表性错答</h3>
+                      <div className="bench-prose">{data.review.negative || '沿用原始起点'}</div>
+                    </div>
+                    <div className="bench-contrast-card" data-polarity="pos">
+                      <h3>参考答案</h3>
+                      <div className="bench-prose">{data.review.positive}</div>
+                    </div>
+                  </div>
+                  <div className="bench-criteria-read">
+                    <h3>判分依据</h3>
+                    {data.review.grader.kind === 'rubric' ? (
+                      <ol>{data.review.grader.criteria.map((c, i) => <li key={i}>{c}</li>)}</ol>
+                    ) : data.review.grader.kind === 'exact' ? (
+                      <div className="bench-prose">{data.review.grader.expected}</div>
+                    ) : (
+                      <pre className="bench-code">{JSON.stringify(data.review.grader, null, 2)}</pre>
+                    )}
+                  </div>
+                </div>
+              </details>
+            </div>
+          )}
+
+          {view === 'suite' && (
+            <header className="bench-doc-head">
+              <p className="bench-eyebrow">{ws.name}</p>
+              <h1 className="bench-doc-title">整库模型对照</h1>
+              <p className="bench-muted">将对全部 {index.cases.length} 道已收录案例逐题运行所选模型，并按题并排展示答卷与逐条评审理由。</p>
+            </header>
+          )}
+
+          <section className="bench-runner" aria-label="模型对照配置">
+            <div className="bench-runner-group">
+              <span className="bench-runner-label">参评模型</span>
+              <div className="bench-chips" role="group" aria-label="选择参评模型">
+                {targets.map(t => {
+                  const checked = activeParticipants.includes(t.id);
+                  return (
+                    <label key={t.id} className="bench-chip" data-checked={checked || undefined}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={e => setParticipants(e.target.checked ? [...activeParticipants, t.id] : activeParticipants.filter(id => id !== t.id))}
+                      />
+                      <span>{t.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="bench-runner-bar">
+              {needsJudge && judgePicker('开放题评审模型')}
+              <button
+                type="button"
+                className="bench-btn"
+                data-variant="primary"
+                disabled={!activeParticipants.length || (needsJudge && !model) || (view === 'case' && !data)}
+                onClick={() => void runBench(view === 'case' ? [id] : [])}
+              >
+                <span className="bench-ico" aria-hidden="true"><Icon name="run" /></span>
+                <span>{view === 'case' ? '运行本题对照' : '开始整库对照'}</span>
+              </button>
+            </div>
+          </section>
+
+          {results.length > 0 && (
+            <ResultsBoard
+              results={results}
+              targetLabel={targetLabel}
+              onOpenCase={view === 'suite' ? openCaseById : undefined}
+            />
+          )}
+        </fieldset>
+      )}
+    </section>
+  );
 }
 
-function RubricFields({ data, onChange }: { data: BenchCase; onChange(c: BenchCase): void }) {
-  const { task, review } = data, grader = review.grader;
-  if (grader.kind !== 'rubric') return null;
+function StarterGrid({ disabled, onPick }: { disabled: boolean; onPick: (key: string) => void }) {
+  return (
+    <div className="bench-starters">
+      {examples.map(ex => {
+        return (
+          <button
+            key={ex.key}
+            type="button"
+            className="bench-starter"
+            data-scene={ex.key}
+            disabled={disabled}
+            onClick={() => onPick(ex.key)}
+          >
+            <div className="bench-starter-top">
+              <span className="bench-starter-scene">
+                <span className="bench-ico" aria-hidden="true"><Icon name={SCENE_ICON[ex.key] ?? 'spark'} /></span>
+                {ex.label}
+              </span>
+              <span className="bench-starter-next" aria-hidden="true"><Icon name="chevron" size={14} /></span>
+            </div>
+            <h3 className="bench-starter-title">{ex.task.title}</h3>
+            <blockquote className="bench-specimen">{materialExcerpt(ex.task.prompt)}</blockquote>
+            <p className="bench-starter-skill">{ex.review.skill}</p>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function TaskMaterials({ task }: { task: BenchCase['task'] }) {
   return <>
-    <label className="bench-field">标题<input value={task.title} onChange={e => onChange({ ...data, task: { ...task, title: e.target.value } })} /></label>
-    <label className="distill-field">考生可见的任务与材料<textarea rows={6} value={task.prompt} onChange={e => onChange({ ...data, task: { ...task, prompt: e.target.value } })} /></label>
-    {([['skill', '想测什么'], ['negative', '代表性错答'], ['positive', '参考答案']] as const).map(([key, label]) =>
-      <label className="distill-field" key={key}>{label}<textarea rows={2} value={review[key]} onChange={e =>
-        onChange({ ...data, review: { ...review, [key]: e.target.value } })} /></label>)}
-    <label className="distill-field">判分标准，每行一项<textarea rows={4} value={grader.criteria.join('\n')} onChange={e =>
-      onChange({ ...data, review: { ...review, grader: { ...grader, criteria: e.target.value.split('\n') } } })} /></label>
+    {task.files.map(file => (
+      <details className="bench-fold" key={file.path}>
+        <summary>附件：{file.path}</summary>
+        <pre className="bench-code">{file.content}</pre>
+      </details>
+    ))}
+    {task.repository && (
+      <details className="bench-fold">
+        <summary><span className="bench-ico"><Icon name="branch" /></span>Git 版本 {task.repository.commit.slice(0, 12)}</summary>
+        <pre className="bench-code">{[task.repository.commit, ...task.repository.paths].join('\n')}</pre>
+      </details>
+    )}
   </>;
+}
+
+function DraftEditor({
+  data, advanced, invalidMsg, modelPicker, canPublish, onChangeForm, onChangeJson, onSave, onPublish,
+}: {
+  data: BenchCase;
+  advanced: string;
+  invalidMsg: string;
+  modelPicker: React.ReactNode;
+  canPublish: boolean;
+  onChangeForm: (next: BenchCase) => void;
+  onChangeJson: (text: string) => void;
+  onSave: () => void;
+  onPublish: () => void;
+}) {
+  const { task, review } = data;
+  const grader = review.grader;
+  const isCodeGrader = grader.kind === 'javascript' || grader.kind === 'patch';
+
+  function updateCriterion(idx: number, text: string) {
+    if (grader.kind !== 'rubric') return;
+    const next = grader.criteria.map((c, i) => (i === idx ? text : c));
+    onChangeForm({ ...data, review: { ...review, grader: { ...grader, criteria: next } } });
+  }
+
+  function addCriterion() {
+    if (grader.kind !== 'rubric') return;
+    onChangeForm({ ...data, review: { ...review, grader: { ...grader, criteria: [...grader.criteria, ''] } } });
+  }
+
+  function removeCriterion(idx: number) {
+    if (grader.kind !== 'rubric' || grader.criteria.length <= 1) return;
+    const next = grader.criteria.filter((_, i) => i !== idx);
+    onChangeForm({ ...data, review: { ...review, grader: { ...grader, criteria: next } } });
+  }
+
+  return (
+    <div className="bench-editor">
+      <div className="bench-editor-head">
+        <span className="bench-kind">{KIND_LABEL[grader.kind]}</span>
+        <div className="bench-editor-actions">
+          {modelPicker}
+          <button type="button" className="bench-btn" disabled={!!invalidMsg} onClick={onSave}>保存草稿</button>
+          <button type="button" className="bench-btn" data-variant="primary" disabled={!canPublish} onClick={onPublish}>
+            <span className="bench-ico" aria-hidden="true"><Icon name="check" /></span>
+            <span>对照校验并收录</span>
+          </button>
+        </div>
+      </div>
+
+      {invalidMsg && <p className="bench-inline-alert" role="alert">{invalidMsg}</p>}
+
+      <div className="bench-cols bench-editor-cols">
+        <section className="bench-main" aria-label="题面文稿">
+          <p className="bench-eyebrow">题面文稿 · 参评模型可见</p>
+          <label className="bench-field">
+            <span className="bench-sr-only">案例标题</span>
+            <input
+              className="bench-title-input"
+              aria-label="案例标题"
+              placeholder="输入清晰描述场景的案例标题"
+              value={task.title}
+              onChange={e => onChangeForm({ ...data, task: { ...task, title: e.target.value } })}
+            />
+          </label>
+          <label className="bench-field">
+            <span>任务要求与原始材料</span>
+            <textarea
+              rows={11}
+              value={task.prompt}
+              placeholder="写明要求并附上真实上下文材料（对话、工单、文档摘录等）"
+              onChange={e => onChangeForm({ ...data, task: { ...task, prompt: e.target.value } })}
+            />
+          </label>
+          <TaskMaterials task={task} />
+        </section>
+
+        <section className="bench-aside bench-review-zone" aria-label="评审区">
+          <p className="bench-eyebrow">评审手册 · 仅评审与校验使用</p>
+          <label className="bench-field">
+            <span>这道案例考察什么判断力？</span>
+            <textarea
+              rows={2}
+              value={review.skill}
+              placeholder="一句话说明最关键的考察点"
+              onChange={e => onChangeForm({ ...data, review: { ...review, skill: e.target.value } })}
+            />
+          </label>
+
+          <div className="bench-contrast">
+            <label className="bench-field bench-contrast-card" data-polarity="neg">
+              <span>审阅用代表性错答</span>
+              <textarea
+                rows={4}
+                value={review.negative}
+                placeholder="容易踩坑的典型错误回答，用于验证标准能拦住错答"
+                onChange={e => onChangeForm({ ...data, review: { ...review, negative: e.target.value } })}
+              />
+            </label>
+            <label className="bench-field bench-contrast-card" data-polarity="pos">
+              <span>参考答案</span>
+              <textarea
+                rows={4}
+                value={review.positive}
+                placeholder="符合团队预期的理想回答，用于验证标准能放行好答"
+                onChange={e => onChangeForm({ ...data, review: { ...review, positive: e.target.value } })}
+              />
+            </label>
+          </div>
+
+          {grader.kind === 'rubric' && (
+            <div className="bench-criteria">
+              <div className="bench-criteria-head">
+                <span>逐条评审标准</span>
+                <button type="button" className="bench-btn" onClick={addCriterion}>
+                  <span className="bench-ico" aria-hidden="true"><Icon name="plus" /></span>
+                  <span>添加标准</span>
+                </button>
+              </div>
+              <ol className="bench-criteria-list">
+                {grader.criteria.map((line, i) => (
+                  <li key={i} className="bench-criterion">
+                    <span className="bench-criterion-num" aria-hidden="true">{i + 1}</span>
+                    <textarea
+                      rows={2}
+                      aria-label={`第 ${i + 1} 条评审标准`}
+                      placeholder="写明一条可清晰判断通过或未通过的标准"
+                      value={line}
+                      onChange={e => updateCriterion(i, e.target.value)}
+                    />
+                    {grader.criteria.length > 1 && (
+                      <button
+                        type="button"
+                        className="bench-icon-btn"
+                        aria-label={`删除第 ${i + 1} 条评审标准`}
+                        onClick={() => removeCriterion(i)}
+                      >
+                        <Icon name="x" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+
+          {grader.kind === 'exact' && (
+            <label className="bench-field">
+              <span>期望的精确输出</span>
+              <textarea
+                rows={3}
+                value={grader.expected}
+                onChange={e => onChangeForm({ ...data, review: { ...review, grader: { kind: 'exact', expected: e.target.value } } })}
+              />
+            </label>
+          )}
+
+          {isCodeGrader && (
+            <p className="bench-muted">
+              当前为「{KIND_LABEL[grader.kind]}」类型，请在下方高级 JSON 中编辑测试用例、镜像、执行命令或附件文件。
+            </p>
+          )}
+        </section>
+      </div>
+
+      <details className="bench-fold" open={isCodeGrader}>
+        <summary><span className="bench-ico" aria-hidden="true"><Icon name="sliders" /></span>{isCodeGrader ? '验收配置与完整 JSON' : '高级选项：编辑完整 JSON'}</summary>
+        <div className="bench-fold-body">
+          <label className="bench-field">
+            <span>案例完整 JSON</span>
+            <textarea
+              className="bench-code-input"
+              rows={14}
+              spellCheck={false}
+              value={advanced}
+              onChange={e => onChangeJson(e.target.value)}
+            />
+          </label>
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function ResultsBoard({
+  results, targetLabel, onOpenCase,
+}: {
+  results: BenchResult[];
+  targetLabel: (id: string) => string;
+  onOpenCase?: (caseId: string) => void;
+}) {
+  const board = useRef<HTMLElement>(null);
+  useLayoutEffect(() => { board.current?.scrollIntoView({ block: 'start' }); }, [results]);
+  const groups: { caseId: string; title: string; items: BenchResult[] }[] = [];
+  for (const r of results) {
+    let g = groups.find(x => x.caseId === r.caseId);
+    if (!g) { g = { caseId: r.caseId, title: r.title, items: [] }; groups.push(g); }
+    g.items.push(r);
+  }
+
+  return (
+    <section ref={board} className="bench-results" aria-label="模型对照结果">
+      {groups.map(group => {
+        const passed = group.items.filter(r => r.status === 'pass').length;
+        return (
+          <article key={group.caseId} className="bench-case-compare">
+            <header className="bench-compare-head">
+              <div>
+                <h2>{group.title}</h2>
+                <p className="bench-muted">{passed} / {group.items.length} 个模型通过</p>
+              </div>
+              {onOpenCase && (
+                <button type="button" className="bench-btn" onClick={() => onOpenCase(group.caseId)}>
+                  <span className="bench-ico" aria-hidden="true"><Icon name="open" /></span>
+                  <span>查看案例详情</span>
+                </button>
+              )}
+            </header>
+            <div className="bench-model-grid">
+              {group.items.map(r => (
+                <div key={r.caseId + ':' + r.target} className="bench-model-card" data-status={r.status}>
+                  <div className="bench-model-head">
+                    <div>
+                      <strong>{targetLabel(r.target)}</strong>
+                      {r.model && <span className="bench-model-sub">{r.model}</span>}
+                    </div>
+                    <div className="bench-model-meta">
+                      <span className="bench-status" data-status={r.status}>{STATUS_LABEL[r.status]}</span>
+                      <span className="bench-duration">{(r.durationMs / 1000).toFixed(1)} 秒</span>
+                    </div>
+                  </div>
+                  {r.answer && (
+                    <div className="bench-answer">
+                      <span className="bench-section-cap">模型答卷</span>
+                      <div className="bench-prose">{r.answer}</div>
+                    </div>
+                  )}
+                  {r.checks && r.checks.length > 0 ? (
+                    <div className="bench-checks">
+                      <span className="bench-section-cap">评审标准 · {r.checks.filter(check => check.pass).length} / {r.checks.length} 项通过</span>
+                      <ol>
+                        {r.checks.map((c, i) => (
+                          <li key={i} className="bench-check" data-pass={c.pass || undefined}>
+                            <span className="bench-ico" aria-hidden="true"><Icon name={c.pass ? 'check' : 'x'} /></span>
+                            <div>
+                              <p className="bench-check-criterion"><span className="bench-sr-only">{c.pass ? '通过' : '未通过'}：</span>{c.criterion}</p>
+                              <p className="bench-check-reason">{c.reason}</p>
+                            </div>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  ) : r.detail && (
+                    <p className="bench-detail">{r.detail}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </article>
+        );
+      })}
+    </section>
+  );
 }

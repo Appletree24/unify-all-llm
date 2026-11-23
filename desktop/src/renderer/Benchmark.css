@@ -1,0 +1,1911 @@
+/* ==========================================================================
+   Unify Desktop — Benchmark Casebook Workbench (Benchmark.css)
+   Quiet editorial dossier aesthetic, strictly scoped under .bench-page.
+   ========================================================================== */
+
+.page.bench-page {
+  /* Scoped editorial surface & semantic tokens (Light) */
+  --b-paper: #faf9f6;
+  --b-paper-2: #f4f2ec;
+  --b-card: #ffffff;
+  --b-inset: #f6f6f8;
+  --b-rule: color-mix(in srgb, var(--line-2) 72%, transparent);
+  --b-primary-bg: #2f55d4;
+  --b-primary-hover: #2546b8;
+  --b-primary-ink: #ffffff;
+  --b-ok-soft: rgba(29, 127, 73, 0.085);
+  --b-warn-soft: rgba(168, 90, 8, 0.09);
+  --b-busy-soft: rgba(47, 85, 212, 0.065);
+  --b-elev: 0 1px 2px rgba(16, 18, 24, 0.04), 0 6px 18px rgba(16, 18, 24, 0.045);
+  --b-elev-hover: 0 2px 6px rgba(16, 18, 24, 0.06), 0 12px 28px rgba(16, 18, 24, 0.08);
+  --b-serif-mix: "Songti SC", "STSong", "Noto Serif CJK SC", "Source Han Serif SC", Georgia, serif;
+
+  /* Four scenario editorial inks (Light) */
+  --b-scene-meeting: #2f4f9e;
+  --b-scene-meeting-bg: #f6f8fc;
+  --b-scene-meeting-line: rgba(47, 79, 158, 0.13);
+
+  --b-scene-support: #196960;
+  --b-scene-support-bg: #f5faf9;
+  --b-scene-support-line: rgba(25, 105, 96, 0.15);
+
+  --b-scene-research: #8f4e14;
+  --b-scene-research-bg: #fbf8f2;
+  --b-scene-research-line: rgba(143, 78, 20, 0.16);
+
+  --b-scene-copy: #852d53;
+  --b-scene-copy-bg: #fbf6f8;
+  --b-scene-copy-line: rgba(133, 45, 83, 0.16);
+
+  position: relative;
+  height: 100%;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  background: var(--bg);
+  color: var(--ink);
+  container-type: inline-size;
+  container-name: bench;
+  padding: 0 0 48px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .page.bench-page {
+    --b-paper: #191b20;
+    --b-paper-2: #14161a;
+    --b-card: #1b1d22;
+    --b-inset: #131418;
+    --b-rule: color-mix(in srgb, var(--line-2) 85%, transparent);
+    --b-primary-bg: #8ea5ff;
+    --b-primary-hover: #a5b8ff;
+    --b-primary-ink: #0f1322;
+    --b-ok-soft: rgba(92, 201, 138, 0.11);
+    --b-warn-soft: rgba(224, 164, 92, 0.12);
+    --b-busy-soft: rgba(142, 165, 255, 0.1);
+    --b-elev: 0 1px 2px rgba(0, 0, 0, 0.28), 0 6px 18px rgba(0, 0, 0, 0.22);
+    --b-elev-hover: 0 4px 12px rgba(0, 0, 0, 0.36), 0 14px 32px rgba(0, 0, 0, 0.32);
+
+    --b-scene-meeting: #96b2ff;
+    --b-scene-meeting-bg: #171a24;
+    --b-scene-meeting-line: rgba(150, 178, 255, 0.15);
+
+    --b-scene-support: #6fd1c4;
+    --b-scene-support-bg: #151e1e;
+    --b-scene-support-line: rgba(111, 209, 196, 0.16);
+
+    --b-scene-research: #eab074;
+    --b-scene-research-bg: #201b16;
+    --b-scene-research-line: rgba(234, 176, 116, 0.16);
+
+    --b-scene-copy: #ea98bc;
+    --b-scene-copy-bg: #20171c;
+    --b-scene-copy-line: rgba(234, 152, 188, 0.16);
+  }
+}
+
+/* ── Shared editorial primitives ───────────────────────────────────────── */
+
+.bench-page .bench-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.bench-page .bench-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  color: currentColor;
+}
+
+.bench-page .bench-ico svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.bench-page .bench-ico-back svg {
+  transform: rotate(90deg);
+  transition: transform 0.16s ease;
+}
+
+.bench-page .bench-eyebrow {
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin: 0 0 6px;
+}
+
+.bench-page .bench-muted {
+  color: var(--dim);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.bench-page .bench-kind {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--dim);
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--b-paper);
+  white-space: nowrap;
+}
+
+.bench-page .bench-prose {
+  font-size: 13.75px;
+  line-height: 1.75;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.bench-page .bench-code {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--b-inset);
+  border: 1px solid var(--line);
+  font: 12.25px/1.6 var(--mono);
+  color: var(--ink-2);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Buttons & form controls ───────────────────────────────────────────── */
+
+.bench-page .bench-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 13px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: var(--b-card);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.25;
+  white-space: nowrap;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.12s ease, box-shadow 0.14s ease;
+}
+
+.bench-page .bench-btn:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: var(--faint);
+}
+
+.bench-page .bench-btn:active:not(:disabled) {
+  background: var(--active);
+  transform: translateY(0.5px);
+}
+
+.bench-page .bench-btn[data-variant="primary"] {
+  background: var(--b-primary-bg);
+  border-color: var(--b-primary-bg);
+  color: var(--b-primary-ink);
+  box-shadow: 0 1px 2px rgba(16, 18, 24, 0.12);
+}
+
+.bench-page .bench-btn[data-variant="primary"]:hover:not(:disabled) {
+  background: var(--b-primary-hover);
+  border-color: var(--b-primary-hover);
+}
+
+.bench-page .bench-btn[data-variant="danger"] {
+  background: var(--err-soft);
+  border-color: color-mix(in srgb, var(--err) 35%, transparent);
+  color: var(--err);
+}
+
+.bench-page .bench-btn[data-variant="danger"]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--err) 15%, transparent);
+  border-color: var(--err);
+}
+
+.bench-page .bench-btn:disabled {
+  opacity: 0.44;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.bench-page .bench-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 7px;
+  color: var(--dim);
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.bench-page .bench-icon-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.bench-page .bench-icon-btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.bench-page .bench-icon-btn:active:not(:disabled) {
+  background: var(--active);
+}
+
+.bench-page .bench-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.bench-page .bench-inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--dim);
+  min-width: 0;
+}
+
+.bench-page .bench-inline-field > span {
+  white-space: nowrap;
+  flex: none;
+}
+
+.bench-page .bench-select {
+  min-height: 34px;
+  max-width: 220px;
+  padding: 5px 28px 5px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background-color: var(--b-card);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--dim) 50%),
+    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 52%,
+    calc(100% - 9px) 52%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  appearance: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.75px;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background-color 0.14s ease;
+}
+
+.bench-page .bench-select:hover:not(:disabled) {
+  border-color: var(--faint);
+}
+
+.bench-page .bench-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.bench-page .bench-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+.bench-page .bench-field > span {
+  font-size: 12.25px;
+  font-weight: 500;
+  color: var(--dim);
+  letter-spacing: 0.01em;
+}
+
+.bench-page .bench-field input:not(.bench-title-input),
+.bench-page .bench-field textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line-2);
+  background: var(--b-card);
+  color: var(--ink);
+  font: 13.5px/1.65 var(--sans);
+  resize: vertical;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease, background-color 0.14s ease;
+}
+
+.bench-page .bench-field input:not(.bench-title-input):hover:not(:disabled),
+.bench-page .bench-field textarea:hover:not(:disabled) {
+  border-color: var(--faint);
+}
+
+.bench-page .bench-field input:not(.bench-title-input):focus,
+.bench-page .bench-field textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+.bench-page .bench-field input::placeholder,
+.bench-page .bench-field textarea::placeholder {
+  color: var(--faint);
+}
+
+/* ── Sticky Top Navigation (Detail Views) ──────────────────────────────── */
+
+.bench-page .bench-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px clamp(20px, 3.8cqi, 44px);
+  background: var(--bg);
+  max-width: 1120px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px 5px 6px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-2);
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.bench-page .bench-back:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.bench-page .bench-back:hover:not(:disabled) .bench-ico-back svg {
+  transform: translateX(-2px) rotate(90deg);
+}
+
+.bench-page .bench-back:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.bench-page .bench-crumb {
+  position: relative;
+  padding-left: 13px;
+  font-size: 12.5px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bench-page .bench-crumb::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 1px;
+  height: 13px;
+  transform: translateY(-50%);
+  background: var(--line-2);
+}
+
+/* ── Status & Confirmation Banners ─────────────────────────────────────── */
+
+.bench-page .bench-banner {
+  max-width: 1120px;
+  margin: 14px auto 0;
+  width: calc(100% - clamp(40px, 7.6cqi, 88px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  font-size: 13px;
+  line-height: 1.5;
+  animation: bench-reveal 0.18s ease-out;
+}
+
+.bench-page .bench-banner > p {
+  flex: 1 1 220px;
+  margin: 0;
+}
+
+.bench-page .bench-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.bench-page .bench-banner[data-tone="warn"] {
+  background: var(--b-warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 28%, transparent);
+  border-left-color: var(--warn);
+  color: var(--ink);
+}
+
+.bench-page .bench-banner[data-tone="warn"] .bench-ico {
+  color: var(--warn);
+}
+
+.bench-page .bench-banner[data-tone="busy"] {
+  background: var(--b-busy-soft);
+  border-color: color-mix(in srgb, var(--accent) 26%, transparent);
+  border-left-color: var(--accent);
+  color: var(--ink-2);
+}
+
+.bench-page .bench-banner[data-tone="busy"] .spinner {
+  color: var(--accent);
+}
+
+.bench-page .bench-banner[data-tone="error"] {
+  background: var(--err-soft);
+  border-color: color-mix(in srgb, var(--err) 30%, transparent);
+  border-left-color: var(--err);
+  color: var(--err);
+}
+
+.bench-page .bench-banner[data-tone="ok"] {
+  background: var(--b-ok-soft);
+  border-color: color-mix(in srgb, var(--ok) 28%, transparent);
+  border-left-color: var(--ok);
+  color: var(--ok);
+}
+
+.bench-page .bench-loading {
+  min-height: 46vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--dim);
+  font-size: 13.5px;
+}
+
+/* ── Home View & Editorial Masthead ────────────────────────────────────── */
+
+.bench-page .bench-home {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: clamp(24px, 3.8cqi, 42px) clamp(20px, 3.8cqi, 44px) 24px;
+}
+
+.bench-page .bench-masthead {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px 24px;
+  flex-wrap: wrap;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-masthead h1 {
+  font-family: var(--b-serif-mix);
+  font-size: clamp(27px, 3.2cqi, 36px);
+  font-weight: 620;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.bench-page .bench-masthead-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+/* ── Empty State & Four Bespoke Material Scenario Cards ────────────────── */
+
+.bench-page .bench-empty {
+  padding-top: 22px;
+}
+
+.bench-page .bench-empty-lede {
+  max-width: 62ch;
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--dim);
+  margin: 0 0 24px;
+}
+
+.bench-page .bench-starters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.bench-page .bench-starter {
+  --scene-ink: var(--accent);
+  --scene-bg: var(--b-paper);
+  --scene-line: var(--line);
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  text-align: left;
+  padding: 18px 20px 16px;
+  border-radius: 13px;
+  border: 1px solid var(--line);
+  background: var(--b-card);
+  box-shadow: var(--b-elev);
+  overflow: hidden;
+  transition: transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), border-color 0.18s ease, box-shadow 0.2s ease, background-color 0.18s ease;
+}
+
+/* Crisp top editorial ink bar */
+.bench-page .bench-starter::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: var(--scene-ink);
+  opacity: 0.72;
+  transition: opacity 0.18s ease, height 0.18s ease;
+}
+
+.bench-page .bench-starter:hover:not(:disabled) {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--scene-ink) 44%, var(--line-2));
+  box-shadow: var(--b-elev-hover);
+}
+
+.bench-page .bench-starter:hover:not(:disabled)::before {
+  opacity: 1;
+}
+
+.bench-page .bench-starter:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.bench-page .bench-starter:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bench-page .bench-starter:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.bench-page .bench-starter-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.bench-page .bench-starter-scene {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.25px;
+  font-weight: 600;
+  color: var(--scene-ink);
+  letter-spacing: 0.02em;
+}
+
+.bench-page .bench-starter-next {
+  color: var(--scene-ink);
+  transform: rotate(-90deg);
+}
+
+.bench-page .bench-starter-title {
+  font-size: 15.75px;
+  font-weight: 610;
+  line-height: 1.42;
+  color: var(--ink);
+  margin: 0 0 13px;
+  letter-spacing: -0.01em;
+}
+
+/* Base specimen sheet (material excerpt) */
+.bench-page .bench-specimen {
+  position: relative;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  flex: 1 1 auto;
+  border-radius: 8px;
+  background: var(--scene-bg);
+  border: 1px solid var(--scene-line);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.72;
+  white-space: pre-line;
+  word-break: break-word;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  max-height: 132px;
+}
+
+.bench-page .bench-starter-skill {
+  margin-top: auto;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+  font-size: 12.25px;
+  line-height: 1.55;
+  color: var(--dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Scene 1: 纪要摘录 — Ruled notebook folio with margin rule & dog-ear fold */
+.bench-page .bench-starter[data-scene="meeting-notes"] {
+  --scene-ink: var(--b-scene-meeting);
+  --scene-bg: var(--b-scene-meeting-bg);
+  --scene-line: var(--b-scene-meeting-line);
+}
+
+.bench-page .bench-starter[data-scene="meeting-notes"] .bench-specimen {
+  padding-left: 20px;
+  border-radius: 3px 10px 6px 3px;
+  border-left: 3px solid color-mix(in srgb, var(--scene-ink) 55%, transparent);
+  background-color: var(--scene-bg);
+  background-image:
+    linear-gradient(225deg, var(--b-card) 9px, color-mix(in srgb, var(--scene-ink) 18%, transparent) 9px, color-mix(in srgb, var(--scene-ink) 18%, transparent) 10px, transparent 10px),
+    repeating-linear-gradient(to bottom, transparent 0, transparent 21px, color-mix(in srgb, var(--scene-ink) 10%, transparent) 21px, color-mix(in srgb, var(--scene-ink) 10%, transparent) 22px);
+  background-position: top right, 0 11px;
+  background-size: 16px 16px, 100% 22px;
+  background-repeat: no-repeat, repeat;
+}
+
+/* Scene 2: 客服往来 — Correspondence / dialogue ticket slip with perforation */
+.bench-page .bench-starter[data-scene="customer-support"] {
+  --scene-ink: var(--b-scene-support);
+  --scene-bg: var(--b-scene-support-bg);
+  --scene-line: var(--b-scene-support-line);
+}
+
+.bench-page .bench-starter[data-scene="customer-support"] .bench-specimen {
+  padding: 14px 14px 12px 18px;
+  border-radius: 10px;
+  border-top: 1px dashed color-mix(in srgb, var(--scene-ink) 40%, transparent);
+  background-image:
+    linear-gradient(to bottom, color-mix(in srgb, var(--scene-ink) 42%, transparent) 0 42%, transparent 42% 54%, color-mix(in srgb, var(--scene-ink) 22%, transparent) 54% 90%, transparent 90%);
+  background-size: 3px calc(100% - 24px);
+  background-position: 8px 12px;
+  background-repeat: no-repeat;
+}
+
+/* Scene 3: 访谈引文 — Archival transcript quote card with editorial bar */
+.bench-page .bench-starter[data-scene="research-summary"] {
+  --scene-ink: var(--b-scene-research);
+  --scene-bg: var(--b-scene-research-bg);
+  --scene-line: var(--b-scene-research-line);
+}
+
+.bench-page .bench-starter[data-scene="research-summary"] .bench-specimen {
+  padding: 13px 16px 12px 22px;
+  border-radius: 6px;
+  border-color: color-mix(in srgb, var(--scene-ink) 18%, transparent);
+  font-family: var(--b-serif-mix);
+  font-size: 12.75px;
+  line-height: 1.76;
+  background-image:
+    linear-gradient(to bottom, var(--scene-ink), var(--scene-ink)),
+    linear-gradient(to right, color-mix(in srgb, var(--scene-ink) 32%, transparent) 0 100%);
+  background-size: 3px 34px, 14px 1.5px;
+  background-position: 10px 14px, 10px 14px;
+  background-repeat: no-repeat;
+}
+
+/* Scene 4: 文案校样 — Editorial galley proof sheet with corner crop marks */
+.bench-page .bench-starter[data-scene="brand-copy"] {
+  --scene-ink: var(--b-scene-copy);
+  --scene-bg: var(--b-scene-copy-bg);
+  --scene-line: var(--b-scene-copy-line);
+}
+
+.bench-page .bench-starter[data-scene="brand-copy"] .bench-specimen {
+  padding: 14px 16px;
+  border-radius: 2px;
+  border-color: color-mix(in srgb, var(--scene-ink) 22%, transparent);
+  letter-spacing: 0.015em;
+  background-image:
+    linear-gradient(to right, var(--scene-ink) 0 8px, transparent 8px),
+    linear-gradient(to bottom, var(--scene-ink) 0 8px, transparent 8px),
+    linear-gradient(to left, var(--scene-ink) 0 8px, transparent 8px),
+    linear-gradient(to bottom, var(--scene-ink) 0 8px, transparent 8px),
+    linear-gradient(to right, var(--scene-ink) 0 8px, transparent 8px),
+    linear-gradient(to top, var(--scene-ink) 0 8px, transparent 8px),
+    linear-gradient(to left, var(--scene-ink) 0 8px, transparent 8px),
+    linear-gradient(to top, var(--scene-ink) 0 8px, transparent 8px);
+  background-position:
+    5px 5px, 5px 5px,
+    calc(100% - 5px) 5px, calc(100% - 5px) 5px,
+    5px calc(100% - 5px), 5px calc(100% - 5px),
+    calc(100% - 5px) calc(100% - 5px), calc(100% - 5px) calc(100% - 5px);
+  background-size: 8px 1.5px, 1.5px 8px;
+  background-repeat: no-repeat;
+}
+
+/* ── Index Filter Tabs & Starter Drawer ────────────────────────────────── */
+
+.bench-page .bench-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 16px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.bench-page .bench-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.bench-page .bench-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 12px 11px;
+  font-size: 13.25px;
+  font-weight: 500;
+  color: var(--dim);
+  white-space: nowrap;
+  border-radius: 7px 7px 0 0;
+  transition: color 0.14s ease, background-color 0.14s ease;
+}
+
+.bench-page .bench-tab:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+
+.bench-page .bench-tab[data-active] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.bench-page .bench-tab[data-active]::after {
+  content: "";
+  position: absolute;
+  inset: auto 8px -1px 8px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--accent);
+}
+
+.bench-page .bench-count {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--sunken);
+  color: var(--dim);
+}
+
+.bench-page .bench-tab[data-active] .bench-count {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.bench-page .bench-drawer {
+  margin-top: 20px;
+  padding: 18px 20px 20px;
+  border-radius: 14px;
+  background: var(--b-paper);
+  border: 1px solid var(--line);
+  animation: bench-reveal 0.2s ease-out;
+}
+
+.bench-page .bench-drawer .bench-group-head {
+  margin-bottom: 14px;
+}
+
+/* ── Grouped Casebook Sections & Catalog Lists ─────────────────────────── */
+
+.bench-page .bench-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  margin-top: 24px;
+}
+
+.bench-page .bench-group {
+  min-width: 0;
+}
+
+.bench-page .bench-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.bench-page .bench-group-head h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.75px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+
+.bench-page .bench-group-head h2 .bench-ico {
+  width: 14px;
+  height: 14px;
+  color: var(--faint);
+}
+
+.bench-page .bench-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--line);
+}
+
+.bench-page .bench-list > li {
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-row {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 14px 13px 16px;
+  text-align: left;
+  border-radius: 0;
+  transition: background-color 0.14s ease, padding-left 0.16s ease;
+}
+
+.bench-page .bench-row::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2.5px;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transform: scaleY(0.5);
+  transition: opacity 0.15s ease, transform 0.16s ease;
+}
+
+.bench-page .bench-row:hover:not(:disabled) {
+  background: var(--hover);
+  padding-left: 19px;
+}
+
+.bench-page .bench-row:hover:not(:disabled)::before,
+.bench-page .bench-row:focus-visible::before {
+  opacity: 1;
+  transform: scaleY(1);
+}
+
+.bench-page .bench-row:active:not(:disabled) {
+  background: var(--active);
+}
+
+.bench-page .bench-row:hover:not(:disabled) .bench-kind {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--line));
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.bench-page .bench-row:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.bench-page .bench-row-clue {
+  align-items: flex-start;
+}
+
+.bench-page .bench-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.bench-page .bench-row-title {
+  font-size: 14.25px;
+  font-weight: 540;
+  line-height: 1.48;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.bench-page .bench-row-note {
+  font-size: 12.75px;
+  line-height: 1.55;
+  color: var(--dim);
+  padding-left: 10px;
+  border-left: 2px solid var(--line-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── Detail Sheet Wrapper & Two-Column Workbench ───────────────────────── */
+
+.bench-page .bench-sheet {
+  border: 0;
+  margin: 0 auto;
+  padding: clamp(22px, 3.2cqi, 34px) clamp(20px, 3.8cqi, 44px) 24px;
+  min-inline-size: 0;
+  max-width: 1120px;
+  width: 100%;
+}
+
+.bench-page .bench-sheet:disabled .bench-btn,
+.bench-page .bench-sheet:disabled .bench-select,
+.bench-page .bench-sheet:disabled .bench-chip {
+  opacity: 0.55;
+}
+
+.bench-page .bench-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.18fr) minmax(290px, 0.82fr);
+  gap: clamp(22px, 3.4cqi, 40px);
+  align-items: start;
+}
+
+.bench-page .bench-main {
+  min-width: 0;
+}
+
+.bench-page .bench-aside {
+  min-width: 0;
+  position: sticky;
+  top: 66px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 20px 22px;
+  border-radius: 13px;
+  background: var(--b-paper);
+  border: 1px solid var(--line);
+}
+
+.bench-page .bench-aside > h2 {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-action-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.bench-page .bench-action-stack .bench-inline-field {
+  justify-content: space-between;
+  width: 100%;
+}
+
+.bench-page .bench-action-stack .bench-select {
+  flex: 1 1 auto;
+  max-width: none;
+}
+
+.bench-page .bench-action-stack .bench-btn {
+  width: 100%;
+  min-height: 38px;
+}
+
+/* ── Document Reading Blocks (Candidate & Published Case) ──────────────── */
+
+.bench-page .bench-doc-head {
+  margin-bottom: 22px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-doc-head .bench-muted {
+  margin-top: 8px;
+  max-width: 66ch;
+}
+
+.bench-page .bench-doc-title {
+  font-size: clamp(20px, 2.3cqi, 25px);
+  font-weight: 620;
+  line-height: 1.35;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.bench-page .bench-doc-block {
+  margin-top: 20px;
+}
+
+.bench-page .bench-doc-block > h2 {
+  font-size: 12.25px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  margin: 0 0 10px;
+}
+
+.bench-page .bench-doc-block > .bench-prose {
+  padding: 18px 20px;
+  border-radius: 11px;
+  background: var(--b-paper);
+  border: 1px solid var(--line);
+}
+
+.bench-page .bench-followup {
+  margin-top: 20px;
+  padding: 16px 18px 18px;
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--b-paper));
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+  border-left: 3px solid var(--accent);
+}
+
+.bench-page .bench-followup-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.bench-page .bench-followup-head h2 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* ── Disclosure Folds (<details class="bench-fold">) ───────────────────── */
+
+.bench-page .bench-fold {
+  margin-top: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--b-card);
+  overflow: hidden;
+}
+
+.bench-page .bench-fold > summary {
+  position: relative;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 34px 11px 13px;
+  font-size: 12.75px;
+  font-weight: 550;
+  color: var(--ink-2);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.bench-page .bench-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.bench-page .bench-fold > summary::after {
+  content: "";
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid var(--dim);
+  border-bottom: 1.5px solid var(--dim);
+  transform: translateY(-65%) rotate(45deg);
+  transition: transform 0.18s ease;
+}
+
+.bench-page .bench-fold[open] > summary::after {
+  transform: translateY(-35%) rotate(-135deg);
+}
+
+.bench-page .bench-fold > summary:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.bench-page .bench-fold > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.bench-page .bench-fold[open] > summary {
+  border-bottom: 1px solid var(--line);
+  background: var(--b-paper);
+}
+
+.bench-page .bench-fold-body {
+  padding: 15px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.bench-page .bench-fold > .bench-code {
+  border: 0;
+  border-radius: 0;
+}
+
+.bench-page .bench-review-panel {
+  margin-top: 18px;
+}
+
+.bench-page .bench-skill {
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  padding: 10px 13px;
+  border-radius: 8px;
+  background: var(--b-paper);
+  border-left: 2.5px solid var(--accent);
+}
+
+.bench-page .bench-skill strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ── Negative vs Positive Contrast Cards ───────────────────────────────── */
+
+.bench-page .bench-contrast {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 215px), 1fr));
+  gap: 12px;
+}
+
+.bench-page .bench-contrast-card {
+  position: relative;
+  padding: 12px 13px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  border-top-width: 2.5px;
+  background: var(--b-card);
+  min-width: 0;
+}
+
+.bench-page .bench-contrast-card[data-polarity="neg"] {
+  border-top-color: var(--err);
+  background: color-mix(in srgb, var(--err-soft) 45%, var(--b-card));
+}
+
+.bench-page .bench-contrast-card[data-polarity="pos"] {
+  border-top-color: var(--ok);
+  background: color-mix(in srgb, var(--b-ok-soft) 45%, var(--b-card));
+}
+
+.bench-page .bench-contrast-card > h3,
+.bench-page .bench-contrast-card > span {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  margin: 0 0 8px;
+}
+
+.bench-page .bench-contrast-card[data-polarity="neg"] > h3,
+.bench-page .bench-contrast-card[data-polarity="neg"] > span {
+  color: var(--err);
+}
+
+.bench-page .bench-contrast-card[data-polarity="pos"] > h3,
+.bench-page .bench-contrast-card[data-polarity="pos"] > span {
+  color: var(--ok);
+}
+
+.bench-page .bench-contrast-card textarea {
+  background: var(--b-card);
+  font-size: 13px;
+}
+
+.bench-page .bench-criteria-read h3 {
+  font-size: 12.25px;
+  font-weight: 600;
+  color: var(--dim);
+  margin: 0 0 9px;
+}
+
+.bench-page .bench-criteria-read ol {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+/* ── Draft Editor Workbench ────────────────────────────────────────────── */
+
+.bench-page .bench-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.bench-page .bench-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  flex-wrap: wrap;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.bench-page .bench-inline-alert {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 9px;
+  background: var(--err-soft);
+  border: 1px solid color-mix(in srgb, var(--err) 30%, transparent);
+  border-left: 3px solid var(--err);
+  color: var(--err);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.bench-page .bench-editor-cols {
+  grid-template-columns: minmax(0, 1.03fr) minmax(0, 0.97fr);
+  gap: clamp(20px, 3cqi, 32px);
+}
+
+.bench-page .bench-editor-cols .bench-main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 22px 22px;
+  border-radius: 13px;
+  background: var(--b-card);
+  border: 1px solid var(--line);
+  box-shadow: var(--b-elev);
+}
+
+.bench-page .bench-editor-cols .bench-aside.bench-review-zone {
+  position: static;
+  padding: 20px 22px 22px;
+  border-radius: 13px;
+  background: var(--b-paper);
+  border: 1px solid var(--line);
+  gap: 16px;
+}
+
+/* Editorial manuscript title input */
+.bench-page .bench-title-input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 2px 10px;
+  border: 0;
+  border-bottom: 1.5px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 620 clamp(18px, 2cqi, 22px)/1.35 var(--sans);
+  letter-spacing: -0.015em;
+  transition: border-color 0.16s ease;
+}
+
+.bench-page .bench-title-input:hover:not(:disabled) {
+  border-bottom-color: var(--faint);
+}
+
+.bench-page .bench-title-input:focus {
+  border-bottom-color: var(--accent);
+  outline: none;
+}
+
+/* Rubric criteria builder */
+.bench-page .bench-criteria {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.bench-page .bench-criteria-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.bench-page .bench-criteria-head > span {
+  font-size: 12.25px;
+  font-weight: 600;
+  color: var(--dim);
+}
+
+.bench-page .bench-criteria-head .bench-btn {
+  min-height: 29px;
+  padding: 4px 10px;
+  font-size: 12.25px;
+}
+
+.bench-page .bench-criteria-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.bench-page .bench-criterion {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+}
+
+.bench-page .bench-criterion-num {
+  margin-top: 8px;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--b-card);
+  border: 1px solid var(--line-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--dim);
+}
+
+.bench-page .bench-criterion textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: var(--b-card);
+  color: var(--ink);
+  font: 13px/1.58 var(--sans);
+  resize: vertical;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.bench-page .bench-criterion textarea:hover:not(:disabled) {
+  border-color: var(--faint);
+}
+
+.bench-page .bench-criterion textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+.bench-page .bench-criterion .bench-icon-btn {
+  margin-top: 5px;
+}
+
+.bench-page .bench-criterion .bench-icon-btn:hover:not(:disabled) {
+  color: var(--err);
+  background: var(--err-soft);
+}
+
+.bench-page .bench-code-input {
+  font-family: var(--mono) !important;
+  font-size: 12.25px !important;
+  line-height: 1.62 !important;
+  background: var(--b-inset) !important;
+  tab-size: 2;
+}
+
+/* ── Published Case & Model Comparison Runner Bar ──────────────────────── */
+
+.bench-page .bench-case-doc {
+  margin-bottom: 24px;
+}
+
+.bench-page .bench-runner {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px 20px;
+  border-radius: 13px;
+  background: var(--b-paper);
+  border: 1px solid var(--line);
+}
+
+.bench-page .bench-runner-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.bench-page .bench-runner-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+
+.bench-page .bench-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.bench-page .bench-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 5px 12px 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: var(--b-card);
+  color: var(--ink-2);
+  font-size: 12.75px;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.bench-page .bench-chip:hover {
+  border-color: var(--faint);
+  color: var(--ink);
+}
+
+.bench-page .bench-chip:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bench-page .bench-chip input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  margin: 0;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border-radius: 4px;
+  border: 1.5px solid var(--line-2);
+  background: var(--b-card);
+  position: relative;
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease;
+}
+
+.bench-page .bench-chip input[type="checkbox"]:focus-visible {
+  outline: none;
+}
+
+.bench-page .bench-chip[data-checked] {
+  border-color: color-mix(in srgb, var(--accent) 52%, transparent);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.bench-page .bench-chip[data-checked] input[type="checkbox"] {
+  background: var(--b-primary-bg);
+  border-color: var(--b-primary-bg);
+}
+
+.bench-page .bench-chip[data-checked] input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  left: 3.5px;
+  top: 1px;
+  width: 4px;
+  height: 7px;
+  border-right: 1.8px solid var(--b-primary-ink);
+  border-bottom: 1.8px solid var(--b-primary-ink);
+  transform: rotate(42deg);
+}
+
+.bench-page .bench-runner-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  flex-wrap: wrap;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.bench-page .bench-runner-bar .bench-btn[data-variant="primary"] {
+  margin-left: auto;
+  min-height: 36px;
+  padding: 6px 16px;
+}
+
+/* ── Results Comparison Board ──────────────────────────────────────────── */
+
+.bench-page .bench-results {
+  scroll-margin-top: 64px;
+  margin-top: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+}
+
+.bench-page .bench-case-compare {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.bench-page .bench-compare-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px 18px;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-compare-head h2 {
+  font-size: 16.5px;
+  font-weight: 610;
+  line-height: 1.38;
+  color: var(--ink);
+  margin: 0 0 3px;
+}
+
+.bench-page .bench-compare-head .bench-muted {
+  font-variant-numeric: tabular-nums;
+}
+
+.bench-page .bench-model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.bench-page .bench-model-card {
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--line-2);
+  background: var(--b-card);
+  box-shadow: var(--b-elev);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.bench-page .bench-model-card[data-status="pass"] {
+  border-top-color: var(--ok);
+}
+
+.bench-page .bench-model-card[data-status="fail"] {
+  border-top-color: var(--err);
+}
+
+.bench-page .bench-model-card[data-status="error"] {
+  border-top-color: var(--warn);
+}
+
+.bench-page .bench-model-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--b-paper);
+}
+
+.bench-page .bench-model-head > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bench-page .bench-model-head strong {
+  font-size: 14px;
+  font-weight: 610;
+  color: var(--ink);
+  line-height: 1.35;
+}
+
+.bench-page .bench-model-sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bench-page .bench-model-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.bench-page .bench-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.bench-page .bench-status[data-status="pass"] {
+  background: var(--b-ok-soft);
+  color: var(--ok);
+}
+
+.bench-page .bench-status[data-status="fail"] {
+  background: var(--err-soft);
+  color: var(--err);
+}
+
+.bench-page .bench-status[data-status="error"] {
+  background: var(--b-warn-soft);
+  color: var(--warn);
+}
+
+.bench-page .bench-duration {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.bench-page .bench-section-cap {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--dim);
+  margin-bottom: 8px;
+}
+
+.bench-page .bench-answer {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bench-page .bench-answer .bench-prose {
+  font-size: 13.25px;
+  line-height: 1.72;
+  max-height: 400px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.bench-page .bench-checks {
+  padding: 14px 16px 16px;
+  background: var(--b-paper-2);
+}
+
+.bench-page .bench-checks ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.bench-page .bench-check {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.bench-page .bench-check:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.bench-page .bench-check .bench-ico {
+  margin-top: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  padding: 2.5px;
+  background: var(--err-soft);
+  color: var(--err);
+}
+
+.bench-page .bench-check[data-pass] .bench-ico {
+  background: var(--b-ok-soft);
+  color: var(--ok);
+}
+
+.bench-page .bench-check-criterion {
+  font-size: 12.75px;
+  font-weight: 560;
+  line-height: 1.48;
+  color: var(--ink);
+  margin: 0 0 3px;
+}
+
+.bench-page .bench-check-reason {
+  font-size: 12.25px;
+  line-height: 1.58;
+  color: var(--dim);
+  margin: 0;
+}
+
+.bench-page .bench-detail {
+  margin: 0;
+  padding: 13px 16px 15px;
+  font-size: 12.75px;
+  line-height: 1.6;
+  color: var(--dim);
+  background: var(--b-paper-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Container Queries (Adaptive from 550px narrow pane to wide monitors) ─ */
+
+@container bench (max-width: 840px) {
+  .bench-page .bench-cols,
+  .bench-page .bench-editor-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bench-page .bench-aside {
+    position: static;
+  }
+
+  .bench-page .bench-editor-cols .bench-main,
+  .bench-page .bench-editor-cols .bench-aside.bench-review-zone {
+    padding: 16px 16px 18px;
+  }
+}
+
+@container bench (max-width: 660px) {
+  .bench-page .bench-home,
+  .bench-page .bench-sheet {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .bench-page .bench-topbar {
+    padding-left: 14px;
+    padding-right: 18px;
+  }
+
+  .bench-page .bench-banner {
+    width: calc(100% - 36px);
+  }
+
+  .bench-page .bench-starters {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+
+  .bench-page .bench-masthead {
+    align-items: flex-start;
+  }
+
+  .bench-page .bench-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 12px 12px 12px 14px;
+  }
+
+  .bench-page .bench-row:hover:not(:disabled) {
+    padding-left: 16px;
+  }
+
+  .bench-page .bench-runner {
+    padding: 15px 15px 16px;
+  }
+
+  .bench-page .bench-runner-bar {
+    align-items: stretch;
+  }
+
+  .bench-page .bench-runner-bar .bench-inline-field {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .bench-page .bench-runner-bar .bench-btn[data-variant="primary"] {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .bench-page .bench-editor-head {
+    align-items: flex-start;
+  }
+
+  .bench-page .bench-editor-actions {
+    width: 100%;
+  }
+
+  .bench-page .bench-editor-actions .bench-inline-field {
+    width: 100%;
+    justify-content: space-between;
+  }
+}
+
+/* ── Subtle Entrance Motion & Reduced Motion Respect ───────────────────── */
+
+@keyframes bench-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bench-page,
+  .bench-page *,
+  .bench-page *::before,
+  .bench-page *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
