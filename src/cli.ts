@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { benchCommand } from './bench/command.js';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
@@ -29,6 +30,7 @@ const HELP = `unify — 同时提问多个模型，再汇总与实施
   unify show [记录id]            查看结果及部分输出
   unify list                    查看记录
   unify doctor                  检查目标及能力
+  unify bench help              留题、出题、校验及运行项目评测集
   unify quota [--watch] [--json] 查看各目标剩余额度，--watch 每分钟刷新
   unify memory                  查看和管理各工具的记忆（网页；--tui 为终端界面）
 
@@ -375,6 +377,7 @@ async function main(): Promise<number> {
                 process.stdout.write(`${id} · ${run.kind} · ${run.status} · ${run.question.replace(/\s+/g, ' ').slice(0, 70)}\n`);
             }
             return 0;
+        case 'bench': return benchCommand(cwd, rest, abort.signal);
         case 'memory': return cmdMemory(rest);
         case 'quota': return cmdQuota(rest);
         case 'doctor': {

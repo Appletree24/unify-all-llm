@@ -16,6 +16,8 @@
     "dev": "tsc -p . --watch"
   },
   "dependencies": {
+    "@jitl/quickjs-singlefile-cjs-release-sync": "0.32.0",
+    "quickjs-emscripten-core": "0.32.0",
     "zod": "^4.1.12"
   },
   "engines": {

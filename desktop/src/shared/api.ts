@@ -1,3 +1,6 @@
+import type { BenchIndex, BenchCase, Candidate, Repository } from '../../../src/bench/cases.js';
+import type { BenchResult } from '../../../src/bench/workflow.js';
+export type { BenchIndex, BenchCase, Candidate, Repository, BenchResult };
 // The contract between the Electron main process and the renderer. Types only.
 import type { Config, ReasoningEffort } from '../../../src/core/config.js';
 import type { InteractionOption, InteractionQuestion, InteractionRequest, InteractionResponse, PendingInteraction } from '../../../src/core/types.js';
@@ -155,6 +158,13 @@ export interface UnifyApi {
   setSetting(key: keyof Config, value: unknown, entry?: string): Promise<WorkspaceInfo>;
   saveApi(id: string, model: string, apiKey?: string): Promise<WorkspaceInfo>;
   memoryUrl(): Promise<string>;
+  captureBench(cwd: string, turn: string, call?: string): Promise<Candidate>;
+  benchIndex(cwd: string): Promise<BenchIndex>;
+  benchEvidence(cwd: string, id: string): Promise<{ question: string; answer: string; followUp: string }>;
+  benchDraft(cwd: string, id: string, target: string, note: string, repo?: Repository): Promise<{ id: string; data: BenchCase }>;
+  benchRead(cwd: string, id: string, published: boolean): Promise<BenchCase>;
+  benchPublish(cwd: string, data: BenchCase, judge?: string): Promise<string>;
+  benchRun(cwd: string, ids: string[], targets: string[], judge?: string): Promise<BenchResult[]>;
   prepareDistill(source: DistillSourceRef): Promise<DistillPreparation>;
   distillCandidates(source: DistillSourceRef, targetId?: string): Promise<DistillCandidate[]>;
   checkDistillDuplicate(targetPath: string, text: string): Promise<DuplicateCheckResult>;

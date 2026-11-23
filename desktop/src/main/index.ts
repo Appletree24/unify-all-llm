@@ -1,3 +1,4 @@
+import { candidateEvidence, capture, getCase, getDraft, listBench } from '../../../src/bench/cases.js';
 import type { MenuItemConstructorOptions } from 'electron';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, Notification, screen, shell } from 'electron';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -211,6 +212,13 @@ const api: UnifyApi = {
   async cancel(turnId) { need().cancel(turnId); },
   async cancelTarget(turnId, targetId) { return need().cancelTarget(turnId, targetId); },
   async respondInteraction(turnId, interactionId, response) { return need().respondInteraction(turnId, interactionId, response); },
+  async captureBench(cwd, turn, call) { return capture(currentWorkspace(cwd).cwd, turn, call); },
+  async benchIndex(cwd) { return listBench(currentWorkspace(cwd).cwd); },
+  async benchEvidence(cwd, id) { return candidateEvidence(currentWorkspace(cwd).cwd, id); },
+  async benchDraft(cwd, id, target, note, repo) { return currentWorkspace(cwd).benchDraft(id, target, note, repo); },
+  async benchRead(cwd, id, published) { return (published ? getCase : getDraft)(currentWorkspace(cwd).cwd, id); },
+  async benchPublish(cwd, data, judge) { return currentWorkspace(cwd).benchPublish(data, judge); },
+  async benchRun(cwd, ids, targets, judge) { return currentWorkspace(cwd).benchRun(ids, targets, judge); },
   async previewExec(turnId, from, executor) { return need().previewExec(turnId, from, executor); },
   async exec(turnId, from, executor) { return need().exec(turnId, from, executor); },
   async quota(force) { return need().quota(force); },

@@ -1,3 +1,4 @@
+import { capture } from '../bench/cases.js';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename } from 'node:path';
@@ -84,6 +85,7 @@ export class App {
   private question = '';
   private turn = 0;
   private lastRun?: RunRecord;
+  private lastExecution?: RunRecord;
   private active?: WorkflowHandle;
   private detecting = new AbortController();
 
@@ -291,6 +293,7 @@ export class App {
     this.synth = undefined;
     this.exec = undefined;
     this.lastRun = undefined;
+    this.lastExecution = undefined;
     this.zoomId = undefined;
     this.focus = 'input';
     this.activeAnswer = 0;
@@ -342,7 +345,8 @@ export class App {
         cwd: this.cwd, config: this.cfg, targets: this.all, executor, source, from, signal: ctl.signal,
         onEvent: (ev) => { if (ev.type === 'provider') this.apply(pane, ev.event); },
       });
-      this.addUsage(await this.active.done);
+      this.lastExecution = await this.active.done;
+      this.addUsage(this.lastExecution);
       if (pane.status === 'ok') this.say('实施完成，请用 git diff 检查改动', GOLD);
     } catch (err) {
       this.say(`实施失败: ${err instanceof Error ? err.message : err}`, RED);
@@ -424,6 +428,7 @@ export class App {
     this.panes = [];
     this.synth = this.exec = undefined;
     this.lastRun = undefined;
+    this.lastExecution = undefined;
     this.continueFrom = undefined;
     this.question = '';
     this.turn = 0;
@@ -529,6 +534,18 @@ export class App {
         },
         () => { this.settings = undefined; },
       );
+    }
+    else if (name === 'bench') {
+      if (this.busy || !this.lastRun) return this.say('请先完成一轮问答', YELLOW);
+      try {
+        const pane = this.findPane(this.focus);
+        const source = pane?.kind === 'exec' ? this.lastExecution : this.lastRun;
+        if (!source) return this.say('没有可保存的实施记录', YELLOW);
+        const call = pane?.kind === 'synth' ? source.synthesis?.result.runId
+          : source.results.find(r => r.targetId === pane?.targetId)?.runId;
+        const item = capture(this.cwd, source.id, call, line.slice('/bench'.length).trim());
+        this.say('已留作评测候选 ' + item.id + ' · unify bench help 查看出题用法', GOLD);
+      } catch (e) { this.say(e instanceof Error ? e.message : String(e), RED); }
     }
     else if (name === 'exec') this.startExec(arg || undefined);
     else if (name === 'use') {
@@ -774,6 +791,7 @@ export class App {
     } else if (k.name === 'end' || ch === 'G') p.follow = true;
     else if (k.name === 'enter' || ch === 'z') this.zoomId = this.zoomId ? undefined : p.id;
     else if (ch === 'y') this.copy();
+    else if (ch === 'b') this.command('/bench');
     else if (ch === 'u' && (p.kind === 'answer' || p.kind === 'synth')) {
       if (p.status !== 'ok' || !p.text.trim()) return this.say('该回答尚未完成，无法作为追问上下文', YELLOW);
       this.continueFrom = p.kind === 'synth' ? 'synthesis' : p.targetId;
@@ -1047,7 +1065,7 @@ export class App {
         ? this.panes.length
           ? ['Tab 切换面板', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+R 思考', 'Ctrl+N 新对话', '/help 帮助']
           : ['Enter 发送', 'Shift+Enter/Ctrl+J 换行', '/quota 套餐余量', '/ 命令', '@ 文件', '/help 帮助']
-        : ['↑↓/滚轮 滚动', 'Enter 放大', 'u 沿此继续', 'y 复制', 'Ctrl+E 按此实施', 'Esc 返回'];
+        : ['↑↓/滚轮 滚动', 'Enter 放大', 'u 沿此继续', 'b 留题', 'y 复制', 'Ctrl+E 按此实施', 'Esc 返回'];
     let x = 1;
     for (const h of hints) {
       if (x + textWidth(h) + 3 > s.cols) break;

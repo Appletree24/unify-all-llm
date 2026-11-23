@@ -1,7 +1,9 @@
+import { repoSchema, type Repository } from '../../../src/bench/cases.js';
+import { draftCase, publish, runBench } from '../../../src/bench/workflow.js';
 import { lstatSync, mkdtempSync, realpathSync, renameSync, rmdirSync, statSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { atomicWrite } from '../../../src/core/atomic-write.js';
-import { loadConfig, parseConfig, readJson, type Config } from '../../../src/core/config.js';
+import { loadConfig, parseConfig, timeoutMillis, readJson, type Config } from '../../../src/core/config.js';
 import { currentGitBranch, listGitBranches, switchGitBranch } from '../../../src/core/git-branches.js';
 import { projectConfigPath, userConfigPath, writeSetting } from '../../../src/core/settings.js';
 import { listRunIds, loadRun, type RunRecord } from '../../../src/core/store.js';
@@ -46,6 +48,7 @@ export class Workspace {
   private quotaRun?: AbortController;
   private readonly quotaTimer: NodeJS.Timeout;
   private disposed = false;
+  private readonly benchAbort = new AbortController();
   private memory?: Promise<MemoryServer>;
   private readonly modelTests: ModelTests;
 
@@ -477,6 +480,24 @@ export class Workspace {
     return this.memory.then((m) => m.url, (err) => { this.memory = undefined; throw err; });
   }
 
+  private benchModel(id: string) {
+    const target = this.targets.find(t => t.id === id);
+    if (!target) throw new Error('评测目标不可用：' + id);
+    return { target, signal: this.benchAbort.signal, timeoutMs: timeoutMillis(this.cfg.timeoutSec ?? 600) };
+  }
+
+  benchDraft(id: string, target: string, note: string, repo?: Repository) {
+    return draftCase(this.cwd, id, this.benchModel(target), note, repo && repoSchema.parse(repo));
+  }
+
+  benchPublish(data: unknown, judge?: string) {
+    return publish(this.cwd, data, judge ? this.benchModel(judge) : undefined, this.benchAbort.signal);
+  }
+
+  benchRun(ids: string[], targets: string[], judge?: string) {
+    return runBench(this.cwd, ids, targets.map(id => this.benchModel(id)), judge ? this.benchModel(judge) : undefined, this.benchAbort.signal);
+  }
+
   prepareDistill(source: DistillSourceRef): DistillPreparation {
     return buildDistillPrep(defaultContext(this.cwd), source);
   }
@@ -505,6 +526,7 @@ export class Workspace {
   /** Cancel everything and wait for cleanup and the final record writes. */
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.benchAbort.abort();
     clearInterval(this.quotaTimer);
     const quota = this.quotaCache?.value.catch(() => undefined);
     this.invalidateQuota();

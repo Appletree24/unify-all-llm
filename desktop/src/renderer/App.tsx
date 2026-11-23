@@ -2,11 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import type { ComposerSelection, DistillPreparation, DistillSourceRef, ExecPreview, OpenedWorkspace, Push, QuotaNotice, RunRecord, SessionChanges, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
+import { BenchmarkPage } from './Benchmark.js';
 import { SessionList } from './Sessions.js';
 import { Card, Composer, DistillDialog, ExecDialog, Turn, type ComposerState, type FollowUpChoice, type PendingInteractionItem, type TurnActions } from './Thread.js';
 import { Icon, Spinner, hue, isActive } from './ui.js';
 
-type View = 'chat' | 'quota' | 'memory' | 'settings';
+type View = 'bench' | 'chat' | 'quota' | 'memory' | 'settings';
 interface Toast { id: number; msg: string; kind: 'ok' | 'err' | 'info' }
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 const darkTheme = window.matchMedia('(prefers-color-scheme: dark)');
@@ -263,6 +264,9 @@ export function App() {
       void unify.respondInteraction(turnId, interactionId, response).catch((err) => notify(errText(err), 'err'));
     },
     followUp: (choice) => setFollowUp(choice),
+    benchmark: (turn, call) => {
+      if (ws) void unify.captureBench(ws.cwd, turn, call).then(() => notify('已留作评测候选，可在侧栏「评测集」整理'), err => notify(errText(err), 'err'));
+    },
     distill: (source) => {
       unify.prepareDistill(source).then((prep) => setDistillModal({ source, prep }), (err) => notify(errText(err), 'err'));
     },
@@ -358,6 +362,7 @@ export function App() {
           <SessionList key={ws.cwd} sessions={sessions} current={view === 'chat' ? current : null} live={liveSessions}
             open={(id) => void openSession(id)} update={updateSession} remove={deleteSession} onError={(msg) => notify(msg, 'err')} />
           <nav className="side-nav">
+            <button className={view === 'bench' ? 'on' : ''} onClick={() => setView('bench')}><Icon name="bookmark" />评测集</button>
             <button className={view === 'quota' ? 'on' : ''} onClick={openQuota}><Icon name="gauge" />额度</button>
             <button className={view === 'memory' ? 'on' : ''} onClick={() => setView('memory')}><Icon name="layers" />记忆</button>
             <button className={view === 'settings' ? 'on' : ''} onClick={() => setView('settings')}><Icon name="sliders" />设置<kbd>Ctrl ,</kbd></button>
@@ -383,6 +388,7 @@ export function App() {
           </div>
         )}
         {!ws ? <Welcome onOpen={(d) => void openWorkspace(d)} />
+          : view === 'bench' ? <BenchmarkPage key={ws.cwd} ws={ws} />
           : view === 'quota' ? <QuotaPage quota={quota} loading={quotaLoading} refresh={() => refreshQuota(true)} />
           : view === 'memory' ? <MemoryPage cwd={ws.cwd} notify={notify} />
           : view === 'settings' ? <SettingsPage ws={ws} onChange={setWs} notify={notify} />

@@ -30,6 +30,7 @@ export interface TurnActions {
   cancelTarget(turnId: string, targetId: string): void;
   respondInteraction?(turnId: string, interactionId: string, response: InteractionResponse): void;
   followUp?(choice?: FollowUpChoice): void;
+  benchmark?(turnId: string, call?: string): void;
   distill?(source: DistillSourceRef): void;
 }
 
@@ -315,6 +316,7 @@ export function Card({ record, result, kind, showReasoning, interactions, action
             <button title="取消这个模型，其余继续" onClick={() => actions.cancelTarget(record.id, result.targetId)}><Icon name="x" /></button>
           )}
           {text && <button title="复制" onClick={() => void unify.copy(text)}><Icon name="copy" /></button>}
+          {!turnRunning && !running && actions.benchmark && <button title="这次不符合预期，留作评测题" onClick={() => actions.benchmark!(record.id, result.runId)}>留题</button>}
           {result.ok && !turnRunning && text && actions.distill && (
             <button
               title="存为记忆…（可先划选一段文字）"
@@ -420,6 +422,7 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
         ) : (
           <>
             {anyOk && <button className="ghost" onClick={() => actions.exec(record.id)}><Icon name="run" size={14} />实施方案…</button>}
+            {actions.benchmark && <button className="ghost" onClick={() => actions.benchmark!(record.id)}>整轮留题</button>}
             {failed.length > 0 && <button className="ghost" onClick={() => actions.retry(record.id)}><Icon name="retry" size={14} />重试未成功的 {failed.length} 个</button>}
             <button className="ghost subtle" onClick={() => void unify.reveal('run', record.id)}><Icon name="folder" size={14} />记录</button>
           </>
