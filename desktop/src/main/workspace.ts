@@ -276,7 +276,6 @@ export class Workspace {
     };
     route = (e) => {
       if (e.type === 'provider') {
-        if (e.event.type === 'tool') this.push({ type: 'activity', turnId: e.turnId, runId: e.callId, name: e.event.name, detail: e.event.detail });
         if (e.event.type === 'done' || e.event.type === 'error') flush();
         else timer ??= setTimeout(flush, PUSH_INTERVAL_MS);
       } else if (e.type === 'interaction') {

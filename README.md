@@ -191,6 +191,8 @@ Gemini 必须支持 `--approval-mode plan`。该模式允许写计划文件，�
 
 个人 Google AI Pro 订阅使用 `gemini-pro`。首次在终端运行 `agy`，用订阅对应的 Google 账号登录。打开 Unify 后输入 `/models gemini-pro`，即可在同一对话里连续追问。桌面端可以在模型选择器里选择 Gemini Pro。可用型号用 `agy models` 查看，通过 `models.gemini-pro` 指定。[Google 登录指南](https://antigravity.google/docs/cli/install/)
 
+桌面端通过 Antigravity 的 ACP 在计划模式下处理权限请求，工具记录可展开查看命令及路径。旧版 CLI 若无法初始化 ACP，会使用无交互模式，并在工具记录中标明被拦截的操作。[Antigravity ACP](https://antigravity.google/docs/cli/acp/)
+
 ## 交互与重试
 
 ### 查看套餐剩余额度

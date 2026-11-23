@@ -3,7 +3,7 @@ import type { ComposerSelection, DistillPreparation, DistillSourceRef, ExecPrevi
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
 import { SessionList } from './Sessions.js';
-import { Card, Composer, DistillDialog, ExecDialog, Turn, type Activity, type ComposerState, type FollowUpChoice, type PendingInteractionItem, type TurnActions } from './Thread.js';
+import { Card, Composer, DistillDialog, ExecDialog, Turn, type ComposerState, type FollowUpChoice, type PendingInteractionItem, type TurnActions } from './Thread.js';
 import { Icon, Spinner, hue, isActive } from './ui.js';
 
 type View = 'chat' | 'quota' | 'memory' | 'settings';
@@ -23,7 +23,6 @@ export function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [current, setCurrent] = useState<string | null>(null);
   const [records, setRecords] = useState<Record<string, RunRecord>>({});
-  const [activity, setActivity] = useState<Record<string, Activity[]>>({});
   const [interactions, setInteractions] = useState<Record<string, PendingInteractionItem[]>>({});
   const [notices, setNotices] = useState<Record<string, string[]>>({});
   const [view, setView] = useState<View>(() => new URLSearchParams(window.location.search).get('view') === 'quota' ? 'quota' : 'chat');
@@ -82,7 +81,6 @@ export function App() {
     void unify.workspace().then(showWorkspace);
     return onPush((p: Push) => {
       if (p.type === 'run') setRecords((r) => ({ ...r, [p.record.id]: p.record }));
-      else if (p.type === 'activity') setActivity((a) => ({ ...a, [p.runId]: [...(a[p.runId] ?? []), { name: p.name, detail: p.detail }] }));
       else if (p.type === 'interaction') {
         setInteractions((prev) => {
           const list = prev[p.callId] ?? [];
@@ -131,7 +129,6 @@ export function App() {
     setPendingMemoryUpdates([]);
     setDistillModal(undefined);
     setRecords({});
-    setActivity({});
     setInteractions({});
     setNotices({});
     setQuota(undefined);
@@ -226,7 +223,6 @@ export function App() {
     setSessions((list) => list.filter((session) => session.id !== id));
     setRecords((all) => Object.fromEntries(Object.entries(all).filter(([, record]) => record.sessionId !== id)));
     setNotices((all) => Object.fromEntries(Object.entries(all).filter(([turnId]) => !turnIds.has(turnId))));
-    setActivity((all) => Object.fromEntries(Object.entries(all).filter(([callId]) => !callIds.has(callId))));
     setInteractions((all) => Object.fromEntries(Object.entries(all).filter(([callId]) => !callIds.has(callId))));
     if (current === id) {
       openSessionRequest.current++;
@@ -412,7 +408,7 @@ export function App() {
                   </div>
                 ) : turns.map((r) => (
                   <Turn
-                    key={r.id} record={r} notices={notices[r.id] ?? []} activity={activity} interactions={interactions} showReasoning={ws.showReasoning} actions={actions}
+                    key={r.id} record={r} notices={notices[r.id] ?? []} interactions={interactions} showReasoning={ws.showReasoning} actions={actions}
                     isLatestComparison={r.id === latestComparisonId} followUp={activeFollowUp}
                   />
                 ))}
@@ -445,7 +441,7 @@ export function App() {
         {zoomed && zoomResult && (
           <div className="zoom-back" onMouseDown={(e) => { if (e.target === e.currentTarget) setZoom(undefined); }}>
             <Card
-              record={zoomed} result={zoomResult} zoomed showReasoning={ws?.showReasoning ?? false} activity={activity[zoomResult.runId]} interactions={interactions[zoomResult.runId]} actions={actions}
+              record={zoomed} result={zoomResult} zoomed showReasoning={ws?.showReasoning ?? false} interactions={interactions[zoomResult.runId]} actions={actions}
               kind={zoomed.synthesis?.result.runId === zoomResult.runId ? 'synthesis' : zoomed.kind === 'execution' ? 'exec' : 'answer'}
             />
           </div>

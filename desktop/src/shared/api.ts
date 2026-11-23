@@ -121,7 +121,6 @@ export interface SettingsInfo {
 
 export type Push =
   | { type: 'run'; record: RunRecord }
-  | { type: 'activity'; turnId: string; runId: string; name: string; detail?: string }
   | { type: 'interaction'; turnId: string; callId: string; scope: CallRecord['scope']; targetId: string; targetLabel: string; request: PendingInteraction }
   | { type: 'interaction-resolved'; turnId: string; callId: string; interactionId: string }
   | { type: 'notice'; turnId: string; message: string }

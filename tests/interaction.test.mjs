@@ -291,17 +291,19 @@ import { createInterface } from 'node:readline';
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 let picked = null;
+let promptId;
 rl.on('line', (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
   if (msg.method === 'initialize') send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
   else if (msg.method === 'session/new') send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess_1' } });
   else if (msg.method === 'session/prompt') {
+    promptId = msg.id;
     send({ jsonrpc: '2.0', id: 77, method: 'session/request_permission', params: { sessionId: 'sess_1', toolCall: { title: 'Run shell', kind: 'execute', rawInput: { command: 'echo hi' } }, options: [{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' }, { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }] } });
   } else if (msg.id === 77) {
     picked = msg.result.outcome;
     send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess_1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP:' + JSON.stringify(picked) } } } });
-    send({ jsonrpc: '2.0', id: 3, result: { stopReason: 'end_turn' } });
+    send({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'end_turn' } });
   }
 });
 `);
@@ -349,7 +351,7 @@ let scenario;
 for await (const line of lines) {
   const { message: { content } } = JSON.parse(line);
   if (!scenario) {
-    scenario = content;
+    scenario = content.split('\\n')[0];
     send({ event: 'step_update', step_update: { step_type: 'tool', state: 'ACTIVE', tool_name: 'read_file' } });
     if (scenario === 'streamed') send({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'streamed answer' } });
     send({ event: 'result', result: { status: 'SUCCESS', response: ' ' } });
@@ -385,11 +387,65 @@ for await (const line of lines) {
     });
   });
 
+  it('Gemini Pro keeps Plan mode, streams command details, and forwards real ACP permission outcomes', async () => {
+    await withTempDir(async (cwd) => {
+      const fixture = join(cwd, 'agy-acp.mjs');
+      writeFileSync(fixture, `
+import assert from 'node:assert/strict';
+import { createInterface } from 'node:readline';
+assert.ok(process.argv.includes('acp'));
+const send = (payload) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...payload }) + '\\n');
+const update = (payload) => send({ method: 'session/update', params: { update: payload } });
+let promptId;
+let mode;
+let model;
+for await (const line of createInterface({ input: process.stdin })) {
+  const req = JSON.parse(line);
+  if (req.method === 'initialize') send({ id: req.id, result: { protocolVersion: 1 } });
+  else if (req.method === 'session/new') send({ id: req.id, result: { sessionId: 'test-session' } });
+  else if (req.method === 'session/set_mode') { mode = req.params.modeId; send({ id: req.id, result: {} }); }
+  else if (req.method === 'session/set_model') { model = req.params.modelId; send({ id: req.id, result: {} }); }
+  else if (req.method === 'session/prompt') {
+    assert.equal(mode, 'plan');
+    assert.equal(model, 'custom-model');
+    promptId = req.id;
+    const toolCall = { toolCallId: 'call-1', kind: 'execute', title: 'List directory', rawInput: { CommandLine: 'Get-ChildItem src' } };
+    update({ sessionUpdate: 'tool_call', ...toolCall, status: 'pending' });
+    send({ id: 'perm-1', method: 'session/request_permission', params: {
+      toolCall, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' }],
+    } });
+  } else if (req.id === 'perm-1') {
+    const allowed = req.result.outcome.optionId === 'allow';
+    update({ sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: allowed ? 'completed' : 'failed' });
+    update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: allowed ? 'item.txt' : 'Access denied' } });
+    send({ id: promptId, result: { stopReason: 'end_turn' } });
+  }
+}
+`);
+      const adapter = createAntigravityAdapter({ cmd: process.execPath, prefixArgs: [fixture], nativeExecutable: true });
+      for (const allowed of [true, false]) {
+        let prompt;
+        const result = await runOne({ id: adapter.id, adapter, model: 'custom-model' }, {
+          cwd, mode: 'ask', prompt: 'Inspect src', timeoutMs: 5000,
+          interact: async (request) => { prompt = request; return { optionId: allowed ? 'allow' : 'deny' }; },
+        });
+        assert.equal(result.status, 'succeeded');
+        assert.equal(prompt.detail, 'Get-ChildItem src');
+        assert.equal(result.text, allowed ? 'item.txt' : 'Access denied');
+        assert.deepEqual(result.tools, [{
+          id: 'call-1', name: 'run_command', detail: 'Get-ChildItem src', status: allowed ? 'completed' : 'denied',
+          ...(!allowed && { error: '用户拒绝了此操作' }),
+        }]);
+      }
+    });
+  });
+
   it('Antigravity (agy) and custom interactive command bridge mid-turn interactions cleanly', async () => {
     await withTempDir(async (cwd) => {
       const agyFixture = join(cwd, 'agy-mock.mjs');
       writeFileSync(agyFixture, `
 import { createInterface } from 'node:readline';
+if (process.argv.includes('acp')) process.exit(2);
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 rl.on('line', (line) => {

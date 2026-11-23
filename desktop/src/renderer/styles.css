@@ -172,10 +172,17 @@ kbd { font: 11px var(--sans); color: var(--faint); margin-left: auto; }
 .think summary span { color: var(--faint); }
 .think-text { white-space: pre-wrap; font-size: 12.5px; line-height: 1.65; color: var(--dim); margin-top: 6px; max-height: 280px; overflow-y: auto; }
 .tools { list-style: none; margin: 4px 0 12px; padding: 8px 10px; background: var(--sunken); border-radius: 8px; font: 12px/1.75 var(--mono); color: var(--dim); max-height: 220px; overflow-y: auto; }
-.tools li { display: flex; gap: 6px; align-items: center; white-space: nowrap; min-width: 0; }
+.tools li { min-width: 0; }
+.tools summary, .tool-label { display: flex; gap: 6px; align-items: center; white-space: nowrap; min-width: 0; }
+.tools summary { cursor: pointer; }
+.tools summary::-webkit-details-marker { display: none; }
 .tools .icon { transform: rotate(-90deg); color: var(--faint); }
+.tools details[open] .icon { transform: none; }
 .tools b { color: var(--ink-2); font-weight: 500; }
 .tools span { overflow: hidden; text-overflow: ellipsis; }
+.tools small { flex: none; margin-left: auto; color: var(--dim); }
+.tools small.failed, .tools small.denied, .tools .tool-error { color: var(--err); }
+.tools pre { margin: 3px 0 7px; padding-left: 18px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; user-select: text; }
 .skeleton { display: flex; flex-direction: column; gap: 10px; padding: 10px 0 4px; }
 .skeleton i { height: 9px; border-radius: 5px; background: linear-gradient(90deg, var(--sunken) 0%, var(--active) 50%, var(--sunken) 100%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
 .skeleton i:nth-child(1) { width: 92%; } .skeleton i:nth-child(2) { width: 76%; } .skeleton i:nth-child(3) { width: 52%; }

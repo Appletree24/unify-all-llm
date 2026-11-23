@@ -1,3 +1,4 @@
+import { TOOL_STATUSES } from './types.js';
 import { atomicWrite } from './atomic-write.js';
 import { formatMemoryReferences } from '../memory/report.js';
 import { extractFinalPlan, synthesisFormatter } from './synth.js';
@@ -15,7 +16,10 @@ const capabilities = z.object({
   exec: z.boolean(),
 });
 const targetSchema = z.object({ id: safeId, label: z.string(), provider: safeId, model: z.string().optional(), reasoningEffort: effortSchema.optional(), capabilities, configuration: customSchema.optional() });
-const toolUseSchema = z.object({ name: z.string(), detail: z.string().optional() });
+const toolUseSchema = z.object({
+  id: z.string().optional(), name: z.string(), detail: z.string().optional(),
+  status: z.enum(TOOL_STATUSES).optional(), error: z.string().optional(),
+});
 const chatMessageSchema = z.object({ role: z.enum(['system', 'user', 'assistant']), content: z.string() });
 const memorySnapshotItemSchema = z.object({
   scope: z.enum(['user', 'project']),

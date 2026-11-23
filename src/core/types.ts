@@ -17,26 +17,47 @@ export interface ChatMessage {
   content: string;
 }
 
+export const TOOL_STATUSES = ['pending', 'in_progress', 'completed', 'failed', 'denied'] as const;
+
 export interface ToolUse {
+  id?: string;
   name: string;
   detail?: string;
+  status?: typeof TOOL_STATUSES[number];
+  error?: string;
 }
 
 const MAX_TOOL_RECORDS = 200;
-const MAX_TOOL_DETAIL = 500;
+const MAX_TOOL_DETAIL = 4000;
+
+function toolDetail(value?: string): string | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  return text.length > MAX_TOOL_DETAIL ? text.slice(0, MAX_TOOL_DETAIL - 1) + '…' : text;
+}
 
 export function appendToolUse(result: RunResult, tool: ToolUse): void {
   const list = (result.tools ??= []);
-  if (list.length >= MAX_TOOL_RECORDS) return;
-  const detail = tool.detail?.trim();
-  list.push({ name: tool.name, ...(detail ? { detail: detail.slice(0, MAX_TOOL_DETAIL) } : {}) });
+  const current = tool.id ? list.find((item) => item.id === tool.id) : undefined;
+  if (!current && list.length >= MAX_TOOL_RECORDS) return;
+  const detail = toolDetail(tool.detail);
+  const error = toolDetail(tool.error);
+  const next = {
+    name: tool.name,
+    ...(tool.id && { id: tool.id }),
+    ...(tool.status && { status: tool.status }),
+    ...(detail && { detail }),
+    ...(error && { error }),
+  };
+  if (current) Object.assign(current, next);
+  else list.push(next);
 }
 
 /** The single event vocabulary every provider is translated into. */
 export type ProviderEvent =
   | { type: 'reasoning'; text: string }
   | { type: 'delta'; text: string }
-  | { type: 'tool'; name: string; detail?: string }
+  | ({ type: 'tool' } & ToolUse)
   | { type: 'done'; text: string; usage?: Usage; memoryReferences?: MemoryReference[] }
   | { type: 'error'; message: string; status?: 'failed' | 'cancelled' | 'timed_out' };
 

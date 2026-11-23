@@ -4,7 +4,6 @@ import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillS
 import { unify } from './api.js';
 import { Icon, Markdown, Spinner, hue, isActive, kilo, quotaSummary, seconds, statusText, useTicker } from './ui.js';
 
-export interface Activity { name: string; detail?: string }
 export interface PendingInteractionItem {
   turnId: string;
   callId: string;
@@ -198,10 +197,12 @@ function InteractionPrompt({ item, onRespond }: {
   );
 }
 
+const toolStatuses = { pending: '待执行', in_progress: '执行中', completed: '完成', failed: '失败', denied: '权限受限' };
+
 // ── a single model's output ───────────────────────────────────────────────
-export function Card({ record, result, kind, showReasoning, activity, interactions, actions, zoomed, canFollowUp, followUpSelected }: {
+export function Card({ record, result, kind, showReasoning, interactions, actions, zoomed, canFollowUp, followUpSelected }: {
   record: RunRecord; result: RunResultRecord; kind: CardKind; showReasoning: boolean;
-  activity?: Activity[]; interactions?: PendingInteractionItem[]; actions: TurnActions; zoomed?: boolean; canFollowUp?: boolean; followUpSelected?: boolean;
+  interactions?: PendingInteractionItem[]; actions: TurnActions; zoomed?: boolean; canFollowUp?: boolean; followUpSelected?: boolean;
 }) {
   const emptyAnswer = kind !== 'exec' && result.ok && !result.text.trim();
   const status = emptyAnswer ? 'failed' : result.status;
@@ -222,14 +223,14 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
   useLayoutEffect(() => {
     const el = body.current;
     if (el && (running || needsInput) && stick.current) el.scrollTop = el.scrollHeight;
-  }, [result.text, result.reasoning, activity?.length, interactions?.length, running, needsInput]);
+  }, [result.text, result.reasoning, result.tools, interactions?.length, running, needsInput]);
 
   const [thinkOpen, setThinkOpen] = useState(showReasoning);
   const waiting = running && !result.text && !result.reasoning && !needsInput;
   const format = kind === 'synthesis' ? synthesisFormatter(record) : undefined;
   const text = format?.(result.text) ?? result.text;
   const reasoning = format?.(result.reasoning) ?? result.reasoning;
-  const tools = activity?.length ? activity : result.tools;
+  const tools = result.tools;
 
   return (
     <article className={`card ${kind} ${status}${needsInput ? ' needs-input' : ''}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
@@ -276,9 +277,21 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
         )}
         {tools && tools.length > 0 && (
           <ul className="tools">
-            {tools.slice(-40).map((a, i) => (
-              <li key={i}><Icon name="chevron" size={12} /><b>{a.name}</b>{a.detail && <span>{a.detail}</span>}</li>
-            ))}
+            {tools.map((tool, index) => {
+              const label = <><b>{tool.name}</b>{tool.detail && <span>{tool.detail}</span>}
+                {tool.status && <small className={tool.status}>{toolStatuses[tool.status]}</small>}</>;
+              return (
+                <li key={tool.id ?? index}>
+                  {tool.detail || tool.error ? (
+                    <details>
+                      <summary><Icon name="chevron" size={12} />{label}</summary>
+                      {tool.detail && <pre>{tool.detail}</pre>}
+                      {tool.error && <pre className="tool-error">{tool.error}</pre>}
+                    </details>
+                  ) : <div className="tool-label">{label}</div>}
+                </li>
+              );
+            })}
           </ul>
         )}
         {waiting ? (
@@ -344,8 +357,8 @@ export function Card({ record, result, kind, showReasoning, activity, interactio
 }
 
 // ── one round: question, answers, synthesis ───────────────────────────────
-export function Turn({ record, notices, activity, interactions, showReasoning, actions, isLatestComparison, followUp }: {
-  record: RunRecord; notices: string[]; activity: Record<string, Activity[]>; interactions?: Record<string, PendingInteractionItem[]>; showReasoning: boolean; actions: TurnActions;
+export function Turn({ record, notices, interactions, showReasoning, actions, isLatestComparison, followUp }: {
+  record: RunRecord; notices: string[]; interactions?: Record<string, PendingInteractionItem[]>; showReasoning: boolean; actions: TurnActions;
   isLatestComparison?: boolean; followUp?: FollowUpChoice;
 }) {
   const active = isActive(record);
@@ -359,7 +372,7 @@ export function Turn({ record, notices, activity, interactions, showReasoning, a
         <div className="q small">
           <div className="q-kicker"><Icon name="run" size={13} />实施方案{srcLabel && <> · 依据「{srcLabel}」</>}<span>{time}</span></div>
         </div>
-        {result ? <Card record={record} result={result} kind="exec" showReasoning={showReasoning} activity={activity[result.runId]} interactions={interactions?.[result.runId]} actions={actions} />
+        {result ? <Card record={record} result={result} kind="exec" showReasoning={showReasoning} interactions={interactions?.[result.runId]} actions={actions} />
           : <div className="pending"><Spinner />正在准备实施…</div>}
         {record.error && <div className="error"><Icon name="alert" size={14} /><span>{record.error}</span></div>}
         <div className="turn-foot">
@@ -392,7 +405,7 @@ export function Turn({ record, notices, activity, interactions, showReasoning, a
           {answers.map((r) => (
             <Card
               key={r.runId} record={record} result={r} kind="answer" showReasoning={showReasoning}
-              activity={activity[r.runId]} interactions={interactions?.[r.runId]} actions={actions}
+              interactions={interactions?.[r.runId]} actions={actions}
               canFollowUp={isLatestComparison}
               followUpSelected={followUp?.turnId === record.id && followUp.targetId === r.targetId}
             />
