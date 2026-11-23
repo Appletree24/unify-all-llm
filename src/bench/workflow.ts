@@ -1,5 +1,6 @@
+import { findCollection, readCatalog } from './catalog.js';
 import { loadRun } from '../core/store.js';
-import { caseSchema, getCandidate, getCase, publishedIds, reviewSchema, saveDraft, sourceAnswer, storeValidated, taskSchema, type BenchCase, type Repository } from './cases.js';
+import { caseSchema, getCandidate, getCase, publishedIds, reviewSchema, saveDraft, sourceAnswer, storeValidated, taskSchema, type BenchCase, type Publication, type Repository } from './cases.js';
 import { ask, grade, materials, publicPrompt, temporary, unfence, writeFiles, type BenchModel, type RubricCheck } from './grading.js';
 
 function authored(text: string) {
@@ -53,16 +54,17 @@ export async function validateCase(cwd: string, raw: unknown, judge?: BenchModel
   }
   return c;
 }
-export async function publish(cwd: string, raw: unknown, judge?: BenchModel, signal?: AbortSignal) {
-  return storeValidated(cwd, await validateCase(cwd, raw, judge, signal));
+export async function publish(cwd: string, raw: unknown, judge?: BenchModel, signal?: AbortSignal, options?: Publication) {
+  return storeValidated(cwd, await validateCase(cwd, raw, judge, signal), options);
 }
 export interface BenchResult {
   caseId: string; title: string; target: string; model?: string; effort?: string; judge?: string;
   status: 'pass' | 'fail' | 'error'; detail: string; checks?: RubricCheck[]; answer?: string; durationMs: number;
 }
-export async function runBench(cwd: string, ids: string[], models: BenchModel[], judge?: BenchModel, signal?: AbortSignal) {
+export async function runBench(cwd: string, ids: string[], models: BenchModel[], judge?: BenchModel, signal?: AbortSignal, collectionId?: string) {
   if (!models.length) throw new Error('请选择参评模型');
-  const selected = ids.length ? ids : publishedIds(cwd);
+  if (collectionId && ids.length) throw new Error('请选择案例集或具体题目中的一种');
+  const selected = collectionId ? findCollection(readCatalog(cwd).collections, collectionId).caseIds : ids.length ? ids : publishedIds(cwd);
   if (!selected.length) throw new Error('题集为空，请先发布题目');
   const results: BenchResult[] = [];
   for (const id of selected) {

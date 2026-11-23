@@ -1,4 +1,5 @@
-import { candidateEvidence, capture, getCase, getDraft, listBench, saveDraft } from '../../../src/bench/cases.js';
+import { deleteCollection, saveCollection } from '../../../src/bench/catalog.js';
+import { candidateEvidence, capture, deleteEntry, getCase, getDraft, listBench, saveDraft } from '../../../src/bench/cases.js';
 import type { MenuItemConstructorOptions } from 'electron';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, Notification, screen, shell } from 'electron';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -214,12 +215,15 @@ const api: UnifyApi = {
   async respondInteraction(turnId, interactionId, response) { return need().respondInteraction(turnId, interactionId, response); },
   async captureBench(cwd, turn, call) { return capture(currentWorkspace(cwd).cwd, turn, call); },
   async benchIndex(cwd) { return listBench(currentWorkspace(cwd).cwd); },
-  async benchSaveDraft(cwd, data) { return saveDraft(currentWorkspace(cwd).cwd, data); },
+  async benchSaveCollection(cwd, name, ids, previous) { return saveCollection(currentWorkspace(cwd).cwd, name, ids, previous); },
+  async benchDeleteCollection(cwd, previous) { deleteCollection(currentWorkspace(cwd).cwd, previous); },
+  async benchDeleteEntry(cwd, kind, id) { deleteEntry(currentWorkspace(cwd).cwd, kind, id); },
+  async benchSaveDraft(cwd, data, previous) { return saveDraft(currentWorkspace(cwd).cwd, data, previous); },
   async benchEvidence(cwd, id) { return candidateEvidence(currentWorkspace(cwd).cwd, id); },
   async benchDraft(cwd, id, target, note, repo) { return currentWorkspace(cwd).benchDraft(id, target, note, repo); },
   async benchRead(cwd, id, published) { return (published ? getCase : getDraft)(currentWorkspace(cwd).cwd, id); },
-  async benchPublish(cwd, data, judge) { return currentWorkspace(cwd).benchPublish(data, judge); },
-  async benchRun(cwd, ids, targets, judge) { return currentWorkspace(cwd).benchRun(ids, targets, judge); },
+  async benchPublish(cwd, data, judge, options) { return currentWorkspace(cwd).benchPublish(data, judge, options); },
+  async benchRun(cwd, ids, targets, judge, collection) { return currentWorkspace(cwd).benchRun(ids, targets, judge, collection); },
   async previewExec(turnId, from, executor) { return need().previewExec(turnId, from, executor); },
   async exec(turnId, from, executor) { return need().exec(turnId, from, executor); },
   async quota(force) { return need().quota(force); },

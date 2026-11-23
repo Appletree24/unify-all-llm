@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { BenchCase, BenchIndex, BenchResult, WorkspaceInfo } from '../shared/api.js';
+import type { BenchCase, BenchIndex, BenchResult, Collection, WorkspaceInfo } from '../shared/api.js';
 import { caseSchema } from '../../../src/bench/schema.js';
 import { exampleCase, examples } from '../../../src/bench/examples.js';
 import { unify } from './api.js';
 import { Icon, Spinner } from './ui.js';
+import { CollectionEditor } from './CollectionEditor.js';
 import './Benchmark.css';
 
-type View = 'home' | 'candidate' | 'draft' | 'case' | 'suite';
+type View = 'home' | 'candidate' | 'draft' | 'case' | 'suite' | 'revision';
 type Filter = 'all' | 'cases' | 'drafts' | 'candidates';
 type BenchKind = BenchCase['review']['grader']['kind'];
 type CandidateItem = BenchIndex['candidates'][number];
@@ -59,6 +60,12 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   const [index, setIndex] = useState<BenchIndex>();
   const [view, setView] = useState<View>('home');
   const [filter, setFilter] = useState<Filter>('all');
+  const [scopeId, setScopeId] = useState('');
+  const [destination, setDestination] = useState('');
+  const [query, setQuery] = useState('');
+  const [collectionEditor, setCollectionEditor] = useState<Collection | 'new'>();
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const originalDraft = useRef<BenchCase>(undefined);
   const [showStarters, setShowStarters] = useState(false);
   const [id, setId] = useState('');
   const [selectedModel, setModel] = useState<string>();
@@ -91,17 +98,29 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   }, [pendingNav, error]);
 
   useEffect(() => {
+    if (view === 'home' && index && scopeId && !index.collections.some(c => c.id === scopeId)) setScopeId('');
+  }, [index, view, scopeId]);
+
+  useEffect(() => {
     if (!dirty) return;
     const onUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ''; };
     window.addEventListener('beforeunload', onUnload);
     return () => window.removeEventListener('beforeunload', onUnload);
   }, [dirty]);
 
+  if (!visible) return null;
+
   const model = [selectedModel ?? ws.synthesizer, ...ws.defaults, targets[0]?.id].find(id => targets.some(t => t.id === id)) ?? '';
   const activeParticipants = (participants ?? ws.defaults).filter(p => targets.some(t => t.id === p));
-  const needsJudge = view === 'case' ? data?.review.grader.kind === 'rubric' : !!index?.cases.some(c => c.kind === 'rubric');
+  const collection = index?.collections.find(c => c.id === scopeId);
+  const members = new Set(collection?.caseIds);
+  const scopeCases = (index?.cases ?? []).filter(c => !scopeId || members.has(c.id));
+  const suiteLabel = scopeId ? '案例集模型对照' : '整库模型对照';
+  const needsJudge = view === 'case' ? data?.review.grader.kind === 'rubric' : scopeCases.some(c => c.kind === 'rubric');
 
   function resetDetail() {
+    originalDraft.current = undefined;
+    setConfirmDelete(false); setDestination(scopeId);
     setId(''); setCandidate(undefined); setEvidence(undefined); setNote(''); setCommit(''); setPaths('');
     setData(undefined); setAdvanced(''); setInvalidMsg(''); setResults([]); setDirty(false); setError(''); setNotice('');
   }
@@ -121,7 +140,11 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   }
 
   function goHome() {
-    guardNav(() => { resetDetail(); setView('home'); });
+    guardNav(() => { resetDetail(); setView('home'); refreshIndex(); });
+  }
+
+  function refreshIndex() {
+    void unify.benchIndex(cwd).then(setIndex, e => setError(e instanceof Error ? e.message : String(e)));
   }
 
   function openCandidate(item: CandidateItem) {
@@ -136,6 +159,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
       resetDetail(); setView('draft'); setId(draftId);
       void perform('正在读取草稿', async () => {
         const c = await unify.benchRead(cwd, draftId, false);
+        originalDraft.current = c;
         setData(c); setAdvanced(JSON.stringify(c, null, 2));
       });
     });
@@ -157,6 +181,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
 
   async function loadSavedDraft(savedId: string, c: BenchCase, msg: string) {
     resetDetail();
+    originalDraft.current = c;
     setView('draft'); setId(savedId); setData(c); setAdvanced(JSON.stringify(c, null, 2));
     setIndex(await unify.benchIndex(cwd));
     setShowStarters(false);
@@ -170,6 +195,29 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
         const savedId = await unify.benchSaveDraft(cwd, c);
         await loadSavedDraft(savedId, c, '已从场景示例创建草稿，可直接修改题面与评审标准。');
       });
+    });
+  }
+
+  function newCase() {
+    const blank: BenchCase = {
+      version: 1, task: { title: '', prompt: '', files: [] },
+      review: { skill: '', negative: '', positive: '', grader: { kind: 'rubric', criteria: [''], perCriterion: true } },
+    };
+    resetDetail(); setView('draft'); setData(blank); setAdvanced(JSON.stringify(blank, null, 2));
+    setInvalidMsg('请填写标题、任务、考察重点、参考答案和至少一条标准。');
+  }
+
+  function selectCollection(next: string) {
+    setNotice(''); setError(''); setScopeId(next); setFilter('all'); setQuery(''); setShowStarters(false);
+  }
+
+  async function removeEntry() {
+    if (view !== 'case' && view !== 'draft' && view !== 'candidate') return;
+    await perform('正在删除', async () => {
+      await unify.benchDeleteEntry(cwd, view, id);
+      resetDetail(); setView('home');
+      setIndex(await unify.benchIndex(cwd));
+      setNotice(view === 'case' ? '案例已从题库和所属案例集中移除。' : '条目已删除。');
     });
   }
 
@@ -204,7 +252,9 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   async function saveCurrentDraft(): Promise<boolean> {
     return perform('正在保存草稿', async () => {
       const parsed = caseSchema.parse(JSON.parse(advanced));
-      const savedId = await unify.benchSaveDraft(cwd, parsed);
+      const previous = id && originalDraft.current ? { id, data: originalDraft.current } : undefined;
+      const savedId = await unify.benchSaveDraft(cwd, parsed, previous);
+      originalDraft.current = parsed;
       setId(savedId); setData(parsed); setAdvanced(JSON.stringify(parsed, null, 2));
       setDirty(false); setInvalidMsg('');
       setIndex(await unify.benchIndex(cwd));
@@ -215,26 +265,39 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   async function publishCurrentDraft() {
     await perform('正在用错答与参考答对照校验并收录', async () => {
       const c = caseSchema.parse(JSON.parse(advanced));
-      const publishedId = await unify.benchPublish(cwd, c, c.review.grader.kind === 'rubric' ? model : undefined);
+      const options = view === 'revision' ? { previousId: id } : { collectionId: destination || undefined };
+      const publishedId = await unify.benchPublish(cwd, c, c.review.grader.kind === 'rubric' ? model : undefined, options);
       setIndex(await unify.benchIndex(cwd));
       resetDetail(); setView('case'); setId(publishedId); setData(c); setAdvanced(JSON.stringify(c, null, 2));
-      setNotice('对照校验已通过，案例已正式收录。');
+      setNotice(view === 'revision' ? '新版已通过校验，所属案例集已更新。' : '对照校验已通过，案例已正式收录。');
     });
   }
 
   async function runBench(caseIds: string[]) {
     await perform(caseIds.length ? '正在运行本题模型对照' : '正在运行整库模型对照', async () => {
       setResults([]);
-      const res = await unify.benchRun(cwd, caseIds, activeParticipants, needsJudge ? (model || undefined) : undefined);
+      const res = await unify.benchRun(cwd, caseIds, activeParticipants, needsJudge ? (model || undefined) : undefined, view === 'suite' ? scopeId || undefined : undefined);
       setResults(res);
       setNotice(`已完成 ${res.length} 份答卷评测。`);
     });
   }
 
   const totalCount = index ? index.cases.length + index.drafts.length + index.candidates.length : 0;
+  const term = query.trim().toLowerCase();
+  const matches = (item: { id: string; title: string; note?: string }) =>
+    [item.title, item.id, item.note].some(value => value?.toLowerCase().includes(term));
+  type Row = { id: string; title: string; note?: string; action: string; open: () => void };
+  const groups: { key: Filter; title: string; icon: string; items: Row[]; empty: string }[] = view !== 'home' ? [] : [
+    { key: 'cases', title: '已收录案例', icon: 'layers', empty: '收录后的案例会出现在这里。',
+      items: scopeCases.filter(matches).map(c => ({ ...c, action: KIND_LABEL[c.kind], open: () => openCaseById(c.id) })) },
+    { key: 'drafts', title: '草稿', icon: 'edit', empty: '从收藏线索、新建案例或场景示例开始一份草稿。',
+      items: (index?.drafts ?? []).filter(matches).map(d => ({ ...d, action: '继续编辑', open: () => openDraftById(d.id) })) },
+    { key: 'candidates', title: '收藏线索', icon: 'bookmark', empty: '在对话回复旁点「留题」，即可收藏线索。',
+      items: (index?.candidates ?? []).filter(matches).map(c => ({ ...c, action: '查看线索', open: () => openCandidate(c) })) },
+  ];
+  const visibleGroups = groups.filter(group => scopeId ? group.key === 'cases' : filter === 'all' || group.key === filter);
+  const collectionHits = !scopeId && term ? index?.collections.filter(c => c.name.toLowerCase().includes(term) || c.id.includes(term)) ?? [] : [];
   const targetLabel = (tid: string) => targets.find(t => t.id === tid)?.label ?? tid;
-
-  if (!visible) return null;
 
   const judgePicker = (label: string) => (
     <label className="bench-inline-field">
@@ -256,11 +319,40 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
           </button>
           <span className="bench-crumb">
             {view === 'candidate' && '收藏线索'}
+            {view === 'revision' && '修订已收录案例'}
             {view === 'draft' && (dirty ? '草稿 · 未保存' : '草稿')}
             {view === 'case' && (data ? `已收录 · ${KIND_LABEL[data.review.grader.kind]}` : '已收录案例')}
-            {view === 'suite' && `整库模型对照 · ${index?.cases.length ?? 0} 题`}
+            {view === 'suite' && `${suiteLabel} · ${scopeCases.length} 题`}
           </span>
+          {id && (view === 'case' || view === 'draft' || view === 'candidate') && (
+            <button type="button" className="bench-btn bench-delete-entry" disabled={!!busy} onClick={() => { setConfirmDelete(true); page.current?.scrollTo(0, 0); }}>
+              <Icon name="trash" size={14} />删除{view === 'case' ? '案例' : view === 'draft' ? '草稿' : '线索'}
+            </button>
+          )}
         </nav>
+      )}
+
+      {confirmDelete && (
+        <div className="bench-banner" data-tone="warn" role="alertdialog" aria-label="确认删除条目">
+          <p>删除「{data?.task.title ?? candidate?.title ?? id}」？{view === 'case' ? '它会从所有案例集中移除，历史版本仍可按 ID 读取。' : '删除后无法从此列表恢复。'}</p>
+          <button className="bench-btn" disabled={!!busy} onClick={() => setConfirmDelete(false)}>取消</button>
+          <button className="bench-btn" data-variant="danger" disabled={!!busy} onClick={() => void removeEntry()}>确认删除</button>
+        </div>
+      )}
+
+      {index && collectionEditor && (
+        <CollectionEditor initial={collectionEditor === 'new' ? undefined : collectionEditor} cases={index.cases}
+          onClose={() => { setCollectionEditor(undefined); refreshIndex(); }}
+          onSave={async (name, ids) => {
+            const saved = await unify.benchSaveCollection(cwd, name, ids, collectionEditor === 'new' ? undefined : collectionEditor);
+            setIndex(current => current && { ...current, collections: [...current.collections.filter(c => c.id !== saved.id), saved] });
+            selectCollection(saved.id); setCollectionEditor(undefined); setNotice('案例集已保存。'); refreshIndex();
+          }}
+          onDelete={collectionEditor === 'new' ? undefined : async () => {
+            await unify.benchDeleteCollection(cwd, collectionEditor);
+            selectCollection(''); setCollectionEditor(undefined); setNotice('案例集已删除，题库中的案例已保留。'); refreshIndex();
+          }}
+        />
       )}
 
       {pendingNav && (
@@ -309,25 +401,36 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
           <header className="bench-masthead">
             <div>
               <p className="bench-eyebrow">{ws.name}</p>
-              <h1>团队案例集</h1>
+              <h1>{collection?.name ?? '团队案例集'}</h1>
             </div>
             <div className="bench-masthead-actions">
-              {totalCount > 0 && (
+              <button className="bench-btn" disabled={!!busy} onClick={newCase}><Icon name="plus" size={15} />新建案例</button>
+              {(totalCount > 0 || !!scopeId) && (
                 <button type="button" className="bench-btn" disabled={!!busy} onClick={() => setShowStarters(v => !v)}>
                   <span className="bench-ico" aria-hidden="true"><Icon name="plus" /></span>
                   <span>{showStarters ? '收起场景示例' : '从场景示例新建'}</span>
                 </button>
               )}
-              {index.cases.length > 0 && (
+              {scopeCases.length > 0 && (
                 <button type="button" className="bench-btn" data-variant="primary" disabled={!!busy} onClick={openSuite}>
                   <span className="bench-ico" aria-hidden="true"><Icon name="run" /></span>
-                  <span>整库模型对照</span>
+                  <span>{suiteLabel}</span>
                 </button>
               )}
             </div>
           </header>
 
-          {totalCount === 0 ? (
+          <div className="bench-library-tools">
+            <select className="bench-select" aria-label="选择案例集" value={scopeId} disabled={!!busy} onChange={e => selectCollection(e.target.value)}>
+              <option value="">整个项目</option>
+              {index.collections.map(c => <option key={c.id} value={c.id}>{c.name}（{c.caseIds.length}）</option>)}
+            </select>
+            <button className="bench-btn" disabled={!!busy} onClick={() => setCollectionEditor('new')}><Icon name="plus" size={14} />新建案例集</button>
+            {collection && <button className="bench-btn" disabled={!!busy} onClick={() => setCollectionEditor(collection)}><Icon name="edit" size={14} />编辑案例集</button>}
+            <label className="bench-library-search"><Icon name="search" size={15} /><input type="search" aria-label="搜索案例" placeholder={scopeId ? '搜索当前案例集' : '搜索案例、线索或案例集'} value={query} onChange={e => setQuery(e.target.value)} /></label>
+          </div>
+
+          {totalCount === 0 && !scopeId && !term ? (
             <div className="bench-empty">
               <p className="bench-empty-lede">
                 遇到答偏的回复，在对话里点「留题」，把它收进案例集。也可以从下面的场景开始，写下你会如何判断一份回答。
@@ -336,7 +439,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
             </div>
           ) : (
             <>
-              <div className="bench-tabs" role="group" aria-label="按阶段筛选案例">
+              {!scopeId && <div className="bench-tabs" role="group" aria-label="按阶段筛选案例">
                 {([
                   ['all', '全部', totalCount],
                   ['cases', '已收录', index.cases.length],
@@ -355,7 +458,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
                     <span className="bench-count">{count}</span>
                   </button>
                 ))}
-              </div>
+              </div>}
 
               {showStarters && (
                 <section className="bench-drawer" aria-label="从场景示例新建草稿">
@@ -368,68 +471,25 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
               )}
 
               <div className="bench-sections">
-                {((filter === 'all' && index.cases.length > 0) || filter === 'cases') && (
-                  <section className="bench-group" aria-label="已收录案例">
-                    <div className="bench-group-head">
-                      <h2><span className="bench-ico" aria-hidden="true"><Icon name="layers" /></span>已收录案例</h2>
-                    </div>
-                    {index.cases.length > 0 ? (
-                      <ul className="bench-list">
-                        {index.cases.map(item => (
-                          <li key={item.id}>
-                            <button type="button" className="bench-row" disabled={!!busy} onClick={() => openCaseById(item.id)}>
-                              <span className="bench-row-title">{item.title}</span>
-                              <span className="bench-kind">{KIND_LABEL[item.kind]}</span>
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : filter === 'cases' && <p className="bench-muted">草稿通过错答与参考答对照校验后，会正式收录在这里。</p>}
-                  </section>
-                )}
-
-                {((filter === 'all' && index.drafts.length > 0) || filter === 'drafts') && (
-                  <section className="bench-group" aria-label="整理中的草稿">
-                    <div className="bench-group-head">
-                      <h2><span className="bench-ico" aria-hidden="true"><Icon name="edit" /></span>草稿</h2>
-                    </div>
-                    {index.drafts.length > 0 ? (
-                      <ul className="bench-list">
-                        {index.drafts.map(item => (
-                          <li key={item.id}>
-                            <button type="button" className="bench-row" disabled={!!busy} onClick={() => openDraftById(item.id)}>
-                              <span className="bench-row-title">{item.title}</span>
-                              <span className="bench-kind">继续编辑</span>
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : filter === 'drafts' && <p className="bench-muted">从收藏线索生成草稿，或点击上方「从场景示例新建」。</p>}
-                  </section>
-                )}
-
-                {((filter === 'all' && index.candidates.length > 0) || filter === 'candidates') && (
-                  <section className="bench-group" aria-label="收藏的失败线索">
-                    <div className="bench-group-head">
-                      <h2><span className="bench-ico" aria-hidden="true"><Icon name="bookmark" /></span>收藏线索</h2>
-                    </div>
-                    {index.candidates.length > 0 ? (
-                      <ul className="bench-list">
-                        {index.candidates.map(item => (
-                          <li key={item.id}>
-                            <button type="button" className="bench-row bench-row-clue" disabled={!!busy} onClick={() => openCandidate(item)}>
-                              <div className="bench-row-body">
-                                <span className="bench-row-title">{item.title}</span>
-                                {item.note.trim() && <span className="bench-row-note">{item.note}</span>}
-                              </div>
-                              <span className="bench-kind">查看线索</span>
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : filter === 'candidates' && <p className="bench-muted">在对话回答上点「留题」，即可把不符合预期的回复收藏到这里。</p>}
-                  </section>
-                )}
+                {collectionHits.length > 0 && <section className="bench-group" aria-label="匹配的案例集">
+                  <h2>案例集</h2>
+                  {collectionHits.map(c => <button className="bench-row" key={c.id} onClick={() => selectCollection(c.id)}><span>{c.name}</span><span className="bench-kind">{c.caseIds.length} 题</span></button>)}
+                </section>}
+                {term && !collectionHits.length && visibleGroups.every(g => !g.items.length) && <p className="bench-muted">没有找到与「{query.trim()}」匹配的条目。</p>}
+                {visibleGroups.map(group => {
+                  if (!group.items.length && (term || (filter === 'all' && !scopeId))) return null;
+                  return <section className="bench-group" key={group.key} aria-label={group.title}>
+                    <div className="bench-group-head"><h2><Icon name={group.icon} />{group.title}</h2></div>
+                    {group.items.length > 0 ? <ul className="bench-list">{group.items.map(item => (
+                      <li key={item.id}><button className="bench-row" disabled={!!busy} onClick={item.open}>
+                        <span className="bench-row-body"><span className="bench-row-title">{item.title}</span>
+                          {item.note && <span className="bench-row-note">{item.note}</span>}
+                        </span>
+                        <span className="bench-kind">{item.action}</span>
+                      </button></li>
+                    ))}</ul> : <p className="bench-muted">{scopeId ? '这个案例集还是空的。点「编辑案例集」选择已有案例，或新建第一道题。' : group.empty}</p>}
+                  </section>;
+                })}
               </div>
             </>
           )}
@@ -501,7 +561,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
         </fieldset>
       )}
 
-      {index && view === 'draft' && data && (
+      {index && (view === 'draft' || view === 'revision') && data && (
         <fieldset disabled={!!busy} className="bench-sheet">
           <DraftEditor
             data={data}
@@ -511,7 +571,12 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
             canPublish={!invalidMsg && (data.review.grader.kind !== 'rubric' || !!model)}
             onChangeForm={updateDraftForm}
             onChangeJson={updateDraftJson}
-            onSave={() => void saveCurrentDraft()}
+            destinationPicker={view === 'draft' && index.collections.length > 0 && (
+              <label className="bench-inline-field">收录到<select className="bench-select" value={destination} onChange={e => setDestination(e.target.value)}>
+                <option value="">项目题库</option>{index.collections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select></label>
+            )}
+            onSave={view === 'draft' ? () => void saveCurrentDraft() : undefined}
             onPublish={() => void publishCurrentDraft()}
           />
         </fieldset>
@@ -523,7 +588,9 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
             <div className="bench-case-doc">
               <header className="bench-doc-head">
                 <p className="bench-eyebrow">{KIND_LABEL[data.review.grader.kind]}</p>
-                <h1 className="bench-doc-title">{data.task.title}</h1>
+                <div className="bench-case-heading"><h1 className="bench-doc-title">{data.task.title}</h1>
+                  <button className="bench-btn" onClick={() => { setConfirmDelete(false); setView('revision'); }}><Icon name="edit" size={14} />编辑案例</button>
+                </div>
               </header>
 
               <section className="bench-doc-block">
@@ -564,8 +631,8 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
           {view === 'suite' && (
             <header className="bench-doc-head">
               <p className="bench-eyebrow">{ws.name}</p>
-              <h1 className="bench-doc-title">整库模型对照</h1>
-              <p className="bench-muted">将对全部 {index.cases.length} 道已收录案例逐题运行所选模型，并按题并排展示答卷与逐条评审理由。</p>
+              <h1 className="bench-doc-title">{collection?.name ?? suiteLabel}</h1>
+              <p className="bench-muted">将对{scopeId ? '本集' : '全部'} {scopeCases.length} 道已收录案例逐题运行所选模型，并按题并排展示答卷与逐条评审理由。</p>
             </header>
           )}
 
@@ -594,11 +661,11 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
                 type="button"
                 className="bench-btn"
                 data-variant="primary"
-                disabled={!activeParticipants.length || (needsJudge && !model) || (view === 'case' && !data)}
+                disabled={!activeParticipants.length || (needsJudge && !model) || (view === 'suite' && !scopeCases.length) || (view === 'case' && !data)}
                 onClick={() => void runBench(view === 'case' ? [id] : [])}
               >
                 <span className="bench-ico" aria-hidden="true"><Icon name="run" /></span>
-                <span>{view === 'case' ? '运行本题对照' : '开始整库对照'}</span>
+                <span>{view === 'case' ? '运行本题对照' : scopeId ? '开始案例集对照' : '开始整库对照'}</span>
               </button>
             </div>
           </section>
@@ -664,7 +731,7 @@ function TaskMaterials({ task }: { task: BenchCase['task'] }) {
 }
 
 function DraftEditor({
-  data, advanced, invalidMsg, modelPicker, canPublish, onChangeForm, onChangeJson, onSave, onPublish,
+  data, advanced, invalidMsg, modelPicker, canPublish, destinationPicker, onChangeForm, onChangeJson, onSave, onPublish,
 }: {
   data: BenchCase;
   advanced: string;
@@ -673,7 +740,8 @@ function DraftEditor({
   canPublish: boolean;
   onChangeForm: (next: BenchCase) => void;
   onChangeJson: (text: string) => void;
-  onSave: () => void;
+  destinationPicker: React.ReactNode;
+  onSave?: () => void;
   onPublish: () => void;
 }) {
   const { task, review } = data;
@@ -702,11 +770,12 @@ function DraftEditor({
       <div className="bench-editor-head">
         <span className="bench-kind">{KIND_LABEL[grader.kind]}</span>
         <div className="bench-editor-actions">
+          {destinationPicker}
           {modelPicker}
-          <button type="button" className="bench-btn" disabled={!!invalidMsg} onClick={onSave}>保存草稿</button>
+          {onSave && <button type="button" className="bench-btn" disabled={!!invalidMsg} onClick={onSave}>保存草稿</button>}
           <button type="button" className="bench-btn" data-variant="primary" disabled={!canPublish} onClick={onPublish}>
             <span className="bench-ico" aria-hidden="true"><Icon name="check" /></span>
-            <span>对照校验并收录</span>
+            <span>{onSave ? '对照校验并收录' : '校验并更新案例'}</span>
           </button>
         </div>
       </div>

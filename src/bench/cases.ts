@@ -1,9 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { listRunIds, loadRun, type RunRecord } from '../core/store.js';
 
+import { atomicWrite } from '../core/atomic-write.js';
+import { caseId, deleteCase, getCase, publishedIds, readCatalog, type Collection } from './catalog.js';
+import { filename, ids, insert, read, withWriteLock } from './storage.js';
+export { caseId, getCase, publishedIds, storeValidated } from './catalog.js';
+export type { Collection, Publication } from './catalog.js';
 import { caseSchema, type BenchCase, type BenchKind } from './schema.js';
 export { caseSchema, repoSchema, reviewSchema, taskSchema, type BenchCase, type BenchKind, type BenchTask, type Repository } from './schema.js';
 
@@ -11,31 +16,10 @@ const nonempty = z.string().min(1);
 const sourceSchema = z.object({ turn: nonempty, call: z.string().optional() });
 const candidateSchema = z.object({ version: z.literal(1), id: nonempty, source: sourceSchema, title: nonempty, note: z.string() });
 export type Candidate = z.infer<typeof candidateSchema>;
-export type BenchIndex = { candidates: Candidate[]; drafts: { id: string; title: string }[]; cases: { id: string; title: string; kind: BenchKind }[] };
+export type BenchIndex = { collections: Collection[]; candidates: Candidate[]; drafts: { id: string; title: string }[]; cases: { id: string; title: string; kind: BenchKind }[] };
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
-export const caseId = (c: BenchCase) => digest(JSON.stringify(caseSchema.parse(c))).slice(0, 24);
 const inbox = (cwd: string) => join(cwd, '.unify', 'bench', 'inbox');
 export const draftsDir = (cwd: string) => join(cwd, '.unify', 'bench', 'drafts');
-const library = (cwd: string) => join(cwd, 'unify-bench');
-const read = (path: string): unknown => JSON.parse(readFileSync(path, 'utf8'));
-function filename(dir: string, id: string) {
-  if (!/^[a-f0-9]{24}$/.test(id)) throw new Error('无效的评测 ID');
-  return join(dir, id + '.json');
-}
-function ids(dir: string) {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter(f => /^[a-f0-9]{24}\.json$/.test(f)).sort().map(f => f.slice(0, -5));
-}
-
-// Publish complete, immutable files; concurrent captures and publications are idempotent.
-function insert(dir: string, id: string, data: unknown) {
-  mkdirSync(dir, { recursive: true });
-  const tmp = join(dir, randomUUID() + '.tmp');
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-  try { linkSync(tmp, filename(dir, id)); }
-  catch (err) { if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err; }
-  finally { unlinkSync(tmp); }
-}
 export function sourceAnswer(run: RunRecord, call?: string) {
   const results = [...run.results, ...(run.synthesis ? [run.synthesis.result] : [])];
   if (!call) return results.map(r => r.text || r.error || '').filter(Boolean).join('\n\n');
@@ -56,34 +40,39 @@ export function capture(cwd: string, turn: string | undefined, call?: string, no
 export function getCandidate(cwd: string, id: string) {
   return candidateSchema.parse(read(filename(inbox(cwd), id)));
 }
-export function getCase(cwd: string, id: string) {
-  const data = caseSchema.parse(read(filename(library(cwd), id)));
-  if (caseId(data) !== id) throw new Error('题目内容已改变，请重新校验并发布新版本');
-  return data;
-}
-export function publishedIds(cwd: string) {
-  return ids(library(cwd));
-}
 export function listBench(cwd: string): BenchIndex {
-  return { candidates: ids(inbox(cwd)).map(id => getCandidate(cwd, id)),
+  const catalog = readCatalog(cwd);
+  return { collections: catalog.collections, candidates: ids(inbox(cwd)).map(id => getCandidate(cwd, id)),
     drafts: ids(draftsDir(cwd)).map(id => {
       try { return { id, title: getDraft(cwd, id).task.title }; }
       catch { return { id, title: '草稿格式有误 · ' + id }; }
     }),
-    cases: ids(library(cwd)).map(id => { const c = getCase(cwd, id); return { id, title: c.task.title, kind: c.review.grader.kind }; }) };
+    cases: publishedIds(cwd, catalog).map(id => { const c = getCase(cwd, id); return { id, title: c.task.title, kind: c.review.grader.kind }; }) };
 }
-export function storeValidated(cwd: string, c: BenchCase) {
-  const id = caseId(c);
-  insert(library(cwd), id, caseSchema.parse(c));
-  getCase(cwd, id);
-  return id;
+export function saveDraft(cwd: string, data: BenchCase, previous?: { id: string; data: BenchCase }) {
+  const value = caseSchema.parse(data);
+  const dir = draftsDir(cwd);
+  return withWriteLock(dir, () => {
+    if (previous) {
+      const path = filename(dir, previous.id);
+      if (!existsSync(path) || caseId(getDraft(cwd, previous.id)) !== caseId(previous.data)) throw new Error('草稿已被修改或删除，请重新打开');
+      atomicWrite(path, JSON.stringify(value, null, 2) + '\n');
+      return previous.id;
+    }
+    let id = caseId(value);
+    if (existsSync(filename(dir, id)) && caseId(getDraft(cwd, id)) !== id) id = digest(randomUUID()).slice(0, 24);
+    insert(dir, id, value);
+    return id;
+  });
 }
 
-export function saveDraft(cwd: string, data: BenchCase) {
-  const id = caseId(data);
-  insert(draftsDir(cwd), id, caseSchema.parse(data));
-  return id;
+export function deleteEntry(cwd: string, kind: 'case' | 'draft' | 'candidate', id: string) {
+  if (kind === 'case') return deleteCase(cwd, id);
+  if (kind !== 'draft' && kind !== 'candidate') throw new Error('无效的条目类型');
+  const dir = kind === 'draft' ? draftsDir(cwd) : inbox(cwd);
+  withWriteLock(dir, () => unlinkSync(filename(dir, id)));
 }
+
 export function getDraft(cwd: string, id: string) {
   return caseSchema.parse(read(filename(draftsDir(cwd), id)));
 }

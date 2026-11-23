@@ -118,6 +118,13 @@ test('CLI publishes a reviewed draft, lists a shareable case and compares two ta
   assert.equal(run('check', '--file', path).status, 0);
   const publication = run('publish', '--file', path); assert.equal(publication.status, 0, publication.stderr);
   assert.equal(JSON.parse(run('list', '--json').stdout).cases[0].id, caseId(c));
+  const group = run('collection', 'create', '结算回归', caseId(c)).stdout.trim();
+  assert.match(group, /^[a-f0-9]{24}$/);
+  assert.equal(run('collection', 'update', group, '--name', '账单回归').status, 0);
+  assert.deepEqual(JSON.parse(run('list', '--search', '账单', '--json').stdout).collections[0].caseIds, [caseId(c)]);
+  assert.deepEqual(JSON.parse(run('show', caseId(c)).stdout), c);
+  assert.deepEqual(JSON.parse(run('run', '--collection', group, '--models', 'good', '--json').stdout).map(r => r.caseId), [caseId(c)]);
+  assert.equal(run('collection', 'delete', group).status, 0);
   const res = run('run', '--models', 'bad,good', '--json');
   assert.equal(res.status, 1, res.stderr);
   assert.deepEqual(JSON.parse(res.stdout).map(r => r.status), ['fail', 'pass']);
@@ -240,4 +247,62 @@ test('authored open-ended tasks retain the original format and pass only when ev
     assert.equal(r.status, 'error');
     assert.equal(r.checks, undefined);
   }
+});
+
+test('named collections share content, follow validated revisions and still resolve historical results', async t => {
+  const { saveCollection, deleteCollection } = await import('../dist/bench/catalog.js');
+  const { deleteEntry } = await import('../dist/bench/cases.js');
+  const cwd = workspace(t);
+  const original = await publish(cwd, item);
+  const a = saveCollection(cwd, '上线复盘', [original, original]);
+  const b = saveCollection(cwd, '订单回归', [original]);
+  const empty = saveCollection(cwd, '空集', []);
+  assert.deepEqual(a.caseIds, [original]);
+  assert.throws(() => saveCollection(cwd, ' 上线复盘 ', []), /同名/);
+  assert.throws(() => saveCollection(cwd, '', []));
+  assert.throws(() => saveCollection(cwd, '无效引用', ['0'.repeat(24)]));
+  assert.throws(() => saveCollection(cwd, '无效路径', ['../']));
+  const renamed = saveCollection(cwd, '结算回归', [original], b);
+  assert.equal(renamed.id, b.id);
+  assert.throws(() => deleteCollection(cwd, b), /已被修改/);
+  const solver = model('solver', () => positive);
+  await assert.rejects(runBench(cwd, [], [solver], undefined, undefined, empty.id), /题集为空/);
+  const [historicalResult] = await runBench(cwd, [], [solver], undefined, undefined, a.id);
+  const options = { previousId: original };
+  await assert.rejects(publish(cwd, { ...item, review: { ...review, positive: negative } }, undefined, undefined, options));
+  assert.deepEqual(listBench(cwd).collections[0].caseIds, [original]);
+  const revised = { ...item, task: { ...task, title: '重复订单第二版' } };
+  const next = await publish(cwd, revised, undefined, undefined, options);
+  assert.equal(getCase(cwd, historicalResult.caseId).task.title, task.title);
+  assert.deepEqual(listBench(cwd).cases.map(c => c.id), [next]);
+  assert.deepEqual(listBench(cwd).collections.map(c => c.caseIds), [[next], [next], []]);
+  await assert.rejects(publish(cwd, item, undefined, undefined, options), /已被修订/);
+  deleteCollection(cwd, listBench(cwd).collections[0]);
+  assert.equal((await runBench(cwd, [], [solver], undefined, undefined, b.id))[0].caseId, next);
+  deleteEntry(cwd, 'case', next);
+  assert.deepEqual(listBench(cwd).cases, []);
+  assert.deepEqual(listBench(cwd).collections.map(c => c.caseIds), [[], []]);
+  assert.equal(getCase(cwd, next).task.title, revised.task.title);
+  assert.equal((await runBench(cwd, [next], [solver]))[0].status, 'pass');
+  assert.equal(await publish(cwd, revised, undefined, undefined, { collectionId: b.id }), next);
+  assert.deepEqual(listBench(cwd).collections[0].caseIds, [next]);
+});
+
+test('editing a draft keeps its ID and the original scenario can still be used independently', async t => {
+  const { saveDraft, getDraft, deleteEntry } = await import('../dist/bench/cases.js');
+  const cwd = workspace(t), id = saveDraft(cwd, item);
+  const revised = { ...item, task: { ...task, title: '新标题' } };
+  assert.equal(saveDraft(cwd, revised, { id, data: item }), id);
+  assert.deepEqual(listBench(cwd).drafts, [{ id, title: '新标题' }]);
+  assert.throws(() => saveDraft(cwd, item, { id, data: item }), /已被修改/);
+  const copy = saveDraft(cwd, item);
+  assert.notEqual(copy, id);
+  assert.deepEqual(getDraft(cwd, copy), item);
+  deleteEntry(cwd, 'draft', id);
+  assert.throws(() => saveDraft(cwd, item, { id, data: revised }), /已被修改或删除/);
+  record(cwd, 'turn', '问题');
+  const clue = capture(cwd, 'turn');
+  deleteEntry(cwd, 'candidate', clue.id);
+  assert.deepEqual(listBench(cwd).candidates, []);
+  assert.equal(capture(cwd, 'turn').id, clue.id);
 });

@@ -1,4 +1,4 @@
-import { repoSchema, type Repository } from '../../../src/bench/cases.js';
+import { repoSchema, type Publication, type Repository } from '../../../src/bench/cases.js';
 import { draftCase, publish, runBench } from '../../../src/bench/workflow.js';
 import { lstatSync, mkdtempSync, realpathSync, renameSync, rmdirSync, statSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
@@ -490,12 +490,12 @@ export class Workspace {
     return draftCase(this.cwd, id, this.benchModel(target), note, repo && repoSchema.parse(repo));
   }
 
-  benchPublish(data: unknown, judge?: string) {
-    return publish(this.cwd, data, judge ? this.benchModel(judge) : undefined, this.benchAbort.signal);
+  benchPublish(data: unknown, judge?: string, options?: Publication) {
+    return publish(this.cwd, data, judge ? this.benchModel(judge) : undefined, this.benchAbort.signal, options);
   }
 
-  benchRun(ids: string[], targets: string[], judge?: string) {
-    return runBench(this.cwd, ids, targets.map(id => this.benchModel(id)), judge ? this.benchModel(judge) : undefined, this.benchAbort.signal);
+  benchRun(ids: string[], targets: string[], judge?: string, collectionId?: string) {
+    return runBench(this.cwd, ids, targets.map(id => this.benchModel(id)), judge ? this.benchModel(judge) : undefined, this.benchAbort.signal, collectionId);
   }
 
   prepareDistill(source: DistillSourceRef): DistillPreparation {

@@ -1909,3 +1909,50 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Collection navigation and membership editing */
+.bench-library-tools, .bench-case-heading, .collection-editor-head, .collection-members-head,
+.collection-actions, .collection-actions-end, .collection-delete-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.bench-library-tools { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.bench-library-tools > select { max-width: 100%; text-overflow: ellipsis; }
+.bench-library-search { display: flex; align-items: center; gap: 6px; margin-left: auto; color: var(--dim); }
+.bench-library-search input { min-width: 0; width: 195px; }
+.bench-case-heading, .collection-editor-head, .collection-members-head { justify-content: space-between; }
+.bench-case-heading h1 { min-width: 0; overflow-wrap: anywhere; }
+.bench-delete-entry { margin-left: auto; }
+.bench-page dialog.collection-editor {
+  width: min(480px, calc(100vw - 32px));
+  max-height: min(82vh, 680px);
+  padding: 0;
+  margin: auto;
+  border: 1px solid var(--line-2);
+  border-radius: 16px;
+  color: var(--ink);
+  background: var(--raised);
+  box-shadow: var(--shadow-lg);
+}
+.collection-editor::backdrop { background: rgba(18, 22, 31, .40); }
+.collection-editor-form { padding: 22px; display: grid; gap: 12px; }
+.collection-editor-head h2 { font: 600 22px/1.35 var(--b-serif-mix); }
+.collection-editor-head { margin-bottom: 4px; }
+.collection-field { display: grid; gap: 5px; }
+.collection-field > span, .collection-members-head { font-weight: 550; }
+.collection-members-head { margin-top: 5px; }
+.collection-editor .collection-filter, .collection-field input { width: 100%; min-width: 0; }
+.collection-members { max-height: 225px; overflow: auto; border-block: 1px solid var(--line); }
+.collection-member { display: flex; align-items: center; gap: 10px; padding: 9px 4px; cursor: pointer; overflow-wrap: anywhere; }
+.collection-member + .collection-member { border-top: 1px solid var(--line); }
+.collection-member input { flex: none; accent-color: var(--accent); }
+.collection-empty { padding: 14px 0; }
+.collection-delete-confirm, .collection-error { padding: 10px 12px; background: var(--err-soft); border-radius: 8px; color: var(--err); }
+.collection-delete-actions { justify-content: end; margin-top: 8px; }
+.collection-actions-end { margin-left: auto; }
+@container bench (max-width: 650px) {
+  .bench-library-search { flex: 1 1 100%; margin-left: 0; }
+  .bench-library-search input { flex: 1; }
+}

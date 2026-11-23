@@ -1,6 +1,6 @@
-import type { BenchIndex, BenchCase, Candidate, Repository } from '../../../src/bench/cases.js';
+import type { BenchIndex, BenchCase, Candidate, Collection, Publication, Repository } from '../../../src/bench/cases.js';
 import type { BenchResult } from '../../../src/bench/workflow.js';
-export type { BenchIndex, BenchCase, Candidate, Repository, BenchResult };
+export type { BenchIndex, BenchCase, Candidate, Collection, Publication, Repository, BenchResult };
 // The contract between the Electron main process and the renderer. Types only.
 import type { Config, ReasoningEffort } from '../../../src/core/config.js';
 import type { InteractionOption, InteractionQuestion, InteractionRequest, InteractionResponse, PendingInteraction } from '../../../src/core/types.js';
@@ -160,12 +160,15 @@ export interface UnifyApi {
   memoryUrl(): Promise<string>;
   captureBench(cwd: string, turn: string, call?: string): Promise<Candidate>;
   benchIndex(cwd: string): Promise<BenchIndex>;
-  benchSaveDraft(cwd: string, data: BenchCase): Promise<string>;
+  benchSaveDraft(cwd: string, data: BenchCase, previous?: { id: string; data: BenchCase }): Promise<string>;
+  benchSaveCollection(cwd: string, name: string, caseIds: string[], previous?: Collection): Promise<Collection>;
+  benchDeleteCollection(cwd: string, previous: Collection): Promise<void>;
+  benchDeleteEntry(cwd: string, kind: 'case' | 'draft' | 'candidate', id: string): Promise<void>;
   benchEvidence(cwd: string, id: string): Promise<{ question: string; answer: string; followUp: string }>;
   benchDraft(cwd: string, id: string, target: string, note: string, repo?: Repository): Promise<{ id: string; data: BenchCase }>;
   benchRead(cwd: string, id: string, published: boolean): Promise<BenchCase>;
-  benchPublish(cwd: string, data: BenchCase, judge?: string): Promise<string>;
-  benchRun(cwd: string, ids: string[], targets: string[], judge?: string): Promise<BenchResult[]>;
+  benchPublish(cwd: string, data: BenchCase, judge?: string, options?: Publication): Promise<string>;
+  benchRun(cwd: string, ids: string[], targets: string[], judge?: string, collectionId?: string): Promise<BenchResult[]>;
   prepareDistill(source: DistillSourceRef): Promise<DistillPreparation>;
   distillCandidates(source: DistillSourceRef, targetId?: string): Promise<DistillCandidate[]>;
   checkDistillDuplicate(targetPath: string, text: string): Promise<DuplicateCheckResult>;
