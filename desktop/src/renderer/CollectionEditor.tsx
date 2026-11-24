@@ -61,7 +61,7 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
     if (busy || confirmDelete) return;
     const trimmed = name.trim();
     if (!trimmed) {
-      setError('请输入案例集名称');
+      setError('请输入分组名称');
       nameRef.current?.focus();
       return;
     }
@@ -77,13 +77,13 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
     >
       <form className="collection-editor-form" onSubmit={handleSave} aria-busy={busy}>
         <header className="collection-editor-head">
-          <h2 id="collection-editor-title">{initial ? '编辑案例集' : '新建案例集'}</h2>
+          <h2 id="collection-editor-title">{initial ? '编辑分组' : '新建分组'}</h2>
           <button type="button" className="bench-icon-btn" aria-label="关闭" disabled={busy} onClick={close}>×</button>
         </header>
 
         <label className="collection-field">
           <span>名称</span>
-          <input ref={nameRef} maxLength={100} className="bench-field" value={name} disabled={busy} placeholder="输入案例集名称" onChange={(e) => setName(e.target.value)} />
+          <input ref={nameRef} maxLength={100} className="collection-input" value={name} disabled={busy} placeholder="输入分组名称" onChange={(e) => setName(e.target.value)} />
         </label>
 
         <div className="collection-members-head">
@@ -91,11 +91,11 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
           <span className="bench-muted">已选 {selected.size} / {cases.length}</span>
         </div>
 
-        <input type="search" className="bench-field collection-filter" value={query} disabled={busy} placeholder="按标题过滤案例…" aria-label="按标题过滤案例" onChange={(e) => setQuery(e.target.value)} />
+        <input type="search" className="collection-input collection-filter" value={query} disabled={busy} placeholder="按标题过滤案例…" aria-label="按标题过滤案例" onChange={(e) => setQuery(e.target.value)} />
 
         <div className="collection-members" role="group" aria-label="案例列表">
           {visibleCases.length === 0 ? (
-            <p className="bench-muted collection-empty">{cases.length === 0 ? '暂无案例，可直接保存为空案例集' : '没有匹配的案例'}</p>
+            <p className="bench-muted collection-empty">{cases.length === 0 ? '暂无案例，可直接保存为空分组' : '没有匹配的案例'}</p>
           ) : visibleCases.map((c) => (
             <label key={c.id} className="collection-member">
               <input type="checkbox" checked={selected.has(c.id)} disabled={busy} onChange={() => toggle(c.id)} />
@@ -108,7 +108,7 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
 
         {initial && onDelete && confirmDelete && (
           <div className="collection-delete-confirm" role="alert">
-            <p>确认删除「{initial.name}」？此操作仅删除案例集分组，库中所有案例均会完整保留。</p>
+            <p>确认删除「{initial.name}」？此操作仅删除分组，库中所有案例均会完整保留。</p>
             <div className="collection-delete-actions">
               <button type="button" className="bench-btn" disabled={busy} onClick={() => setConfirmDelete(false)}>取消</button>
               <button type="button" className="bench-btn" data-variant="danger" disabled={busy} onClick={() => { if (!busy) void run('delete', onDelete, '删除'); }}>
@@ -121,7 +121,7 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
         <footer className="collection-actions">
           {initial && onDelete && !confirmDelete && (
             <button type="button" className="bench-btn" data-variant="danger" disabled={busy} onClick={() => { setError(null); setConfirmDelete(true); }}>
-              删除案例集
+              删除分组
             </button>
           )}
           {!confirmDelete && <div className="collection-actions-end">

@@ -1,10 +1,11 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parseConfig, readJson, type Config } from '../core/config.js';
-import { userField, writeSetting, type SettingField } from '../core/settings.js';
+import { projectConfigPath, userField, writeSetting, type SettingField } from '../core/settings.js';
 import type { ModelTarget } from '../core/types.js';
 import type { ModelTests } from '../core/model-tests.js';
-import { targetModelIds } from '../providers/models.js';
+import { isAgyProvider, modelSettings, type AgyModel } from '../providers/agy-models.js';
+import { readAgyModels, targetModelIds } from '../providers/models.js';
 import { effortChoices } from '../providers/effort.js';
 import { Editor } from './editor.js';
 import type { Key } from './keys.js';
@@ -33,6 +34,9 @@ export class SettingsView {
   private pages: Page[];
   private input?: Input;
   private message = '';
+  private agyCatalog?: AgyModel[];
+  private agyLoading = false;
+  private agyError = '';
   private visible?: { page: Page; first: number; count: number };
 
   constructor(
@@ -42,6 +46,7 @@ export class SettingsView {
     private save: (field: Field, value: unknown, entry?: string) => void,
     private api: () => void,
     private close: () => void,
+    private redraw: () => void,
   ) {
     this.pages = [{ title: '设置', rows: () => this.main(), index: 0 }];
   }
@@ -70,44 +75,63 @@ export class SettingsView {
   }
 
   private targetRows(): Row[] {
-    return this.state().targets.map(t => ({
-      label: t.id, value: t.reasoningEffort ?? '默认',
-      open: () => this.page(t.id, () => this.targetOptions(t.id)),
+    const { targets } = this.state();
+    return targets.map(t => ({
+      label: t.id, value: isAgyProvider(t.adapter.id, t.adapter.capabilities.askPolicy) ? t.model : t.reasoningEffort ?? '默认',
+      open: () => {
+        if (isAgyProvider(t.adapter.id, t.adapter.capabilities.askPolicy)) void this.loadAgyCatalog();
+        const models = targetModelIds(t, targets);
+        this.page(t.id, () => this.targetOptions(t.id, models));
+      },
     }));
   }
 
-  private targetOptions(id: string): Row[] {
+  private async loadAgyCatalog(): Promise<void> {
+    if (this.agyLoading || this.agyCatalog) return;
+    this.agyLoading = true;
+    this.agyError = '';
+    try { this.agyCatalog = await readAgyModels(this.cwd); }
+    catch (err) { this.agyError = err instanceof Error ? err.message : String(err); }
+    finally { this.agyLoading = false; this.redraw(); }
+  }
+
+  private targetOptions(id: string, models: string[]): Row[] {
     const { targets } = this.state();
     const target = targets.find(t => t.id === id)!;
     const config = target.adapter.configuration;
-    const model = target.model ?? (config?.type === 'openai' ? config.model : '默认');
-    const choices = effortChoices(target);
+    const model = target.model ?? (config?.type === 'openai' ? config.model : undefined);
+    const agy = isAgyProvider(target.adapter.id, target.adapter.capabilities.askPolicy);
+    const options = modelSettings({
+      model, models, efforts: effortChoices(target), reasoningEffort: target.reasoningEffort,
+    }, agy ? this.agyCatalog ?? [] : undefined);
+    const loading = agy && this.agyLoading;
     const test = this.tests.state(target);
     return [
       {
-        label: '模型 ID', value: model,
+        label: '模型', value: options.models.find(m => m.value === model)?.label ?? model ?? '默认',
         open: () => {
-          const ids = [undefined, ...targetModelIds(target, targets)];
-          const selected = Math.max(0, ids.indexOf(target.model));
-          this.page(id + ' · 选择模型', () => ids.map((choice, index) => ({
-            label: choice ?? '继承配置',
+          if (loading) return;
+          const override = parseConfig(readJson(projectConfigPath(this.cwd)) ?? {}).models?.[id];
+          const inherit = model && !override ? `继承配置（${model}）` : '继承配置';
+          const choices = [{ value: '', label: inherit }, ...options.models];
+          const selected = Math.max(0, choices.findIndex(m => m.value === (override ?? '')));
+          this.page(id + ' · 选择模型', () => choices.map((choice, index) => ({
+            label: choice.label,
             value: index === selected ? '●' : '',
-            open: () => { this.save('models', choice, id); this.pages.pop(); },
+            open: () => { this.save('models', choice.value || undefined, id); this.pages.pop(); },
           })), selected);
         },
       },
       {
-        label: '思考强度', value: choices.length ? target.reasoningEffort ?? '默认' : '此接口不支持',
+        label: '思考强度', value: options.efforts.find(e => e.value === options.effortValue)?.label ??
+          (loading ? '加载中…' : options.storedEffort ?? (agy && this.agyError ? '未获取' : '无档位')),
         open: () => {
-          if (!choices.length) {
-            this.message = '此模型或接口未提供可配置的思考档位';
-            return;
-          }
-          this.page('思考强度 · ' + id, () => ['default', ...choices].map(level => ({
-            label: level === 'default' ? '默认（由模型决定）' : level,
-            value: level === (target.reasoningEffort ?? 'default') ? '●' : '',
-            open: () => { this.save('reasoningEffort', level, id); this.pages.pop(); },
-          })));
+          if (!options.efforts.length) return;
+          const selected = Math.max(0, options.efforts.findIndex(e => e.value === options.effortValue));
+          this.page('思考强度 · ' + id, () => options.efforts.map((effort, index) => ({
+            label: effort.label, value: index === selected ? '●' : '',
+            open: () => { this.save(options.effortField, effort.value, id); this.pages.pop(); },
+          })), selected);
         },
       },
       {
@@ -115,6 +139,7 @@ export class SettingsView {
         detail: test?.status === 'failed' ? test.message : undefined,
         open: () => { void this.tests.run(target, this.state().cfg.timeoutSec); },
       },
+      ...(agy && this.agyError ? [{ label: '重试模型列表', detail: this.agyError, open: () => { void this.loadAgyCatalog(); } }] : []),
     ];
   }
 
@@ -144,7 +169,7 @@ export class SettingsView {
 
   private advanced(): Row[] {
     const { cfg } = this.state();
-    const rows: Row[] = [{ label: '禁用 Claude Code', value: cfg.disableClaude ? '开' : '关', open: () => this.save('disableClaude', !cfg.disableClaude) }];
+    const rows: Row[] = [{ label: '全局禁用 Claude Code', value: cfg.disableClaude ? '开' : '关', open: () => this.save('disableClaude', !cfg.disableClaude) }];
     for (const [key, label] of [['targets', '目标别名'], ['custom', '自定义端点与命令'], ['quotaCommands', '额度查询命令']] as const) {
       rows.push({ label, value: userField(key) ? '用户配置' : '项目配置', open: () => {
         const path = userField(key) ? join(homedir(), '.unify', 'config.json') : join(this.cwd, 'unify.config.json');
@@ -209,6 +234,7 @@ export class SettingsView {
     } else {
       const rows = page.rows();
       const room = s.rows - 6;
+      page.index = Math.min(page.index, Math.max(0, rows.length - 1));
       const first = Math.max(0, page.index - room + 1);
       this.visible = { page, first, count: Math.min(room, rows.length - first) };
       rows.slice(first, first + room).forEach((r, i) => {

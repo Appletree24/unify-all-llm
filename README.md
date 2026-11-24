@@ -27,8 +27,13 @@ node dist/cli.js exec --with codex
 
 `desktop/` 是基于 Electron 的桌面应用，与 CLI、TUI 共用 `src/core` 的同一套流程：决策、并排回答、匿名汇总、实施、记录和配置都由同样的代码处理，记录也写进同一个 `.unify/runs/`，三种界面可以互相查看。
 
+点击桌面端汇总正文中的模型引用，可以查看该轮回答，并高亮被引用的原文段落。按 Esc 返回汇总的原阅读位置。旧汇总中只标明模型的引用会打开完整回答。
+
+汇总会对齐各回答讨论的输入、处理阶段和适用条件，并说明分歧何时会改变最终结果。能查阅仓库的汇总模型直接沿实际路径核实关键判断。纯文本汇总模型遇到本轮有成功回答的只读工具模型时，会先做一次分歧判断，必要时把一个具体问题交给其中一个模型取证。Unify 按项目相对路径、行号和原文逐行匹配，把匹配的片段交给最终汇总，并保存在本轮记录里。桌面端可在汇总卡的「源码证据」中查看。证据不足时，汇总应说明成立条件和待核实之处。
+
 - **对话**：问题同时发给所选模型，每个模型一列实时流式输出，可展开思考过程、放大阅读、复制、单独取消或重试某个模型。多个回答成功后在下方显示汇总。同一对话里继续提问会带上之前的上下文。
 - **实施**：在一轮结束后选择「实施方案…」或某个回答上的实施按钮，确认来源与执行模型后才开始，执行过程中的工具调用逐条显示。
+- **组合模版**：打开「设置 → 组合模版」，点「新建模版」创建自己的模型组合。拖节点调整位置，拖空白处平移画布，点「自动排列」按执行顺序整理布局。点模型节点换人，点「＋ 并行」添加方案分支，点连线的「＋」增加复核。分工和布局自动保存到当前项目，也可以另存为模版。在输入框选择模版即可使用。方案就绪后可以继续修改、终止或确认实施。纯文本复核模型依据方案和实施报告评审，支持读取仓库的模型还可查阅实际改动。实施结束或停止后，点「带回方案讨论」可以把已采纳方案和实施记录交还给方案模型。
 - **侧栏**：按时间分组的对话记录、套餐额度、记忆管理（内嵌 `unify memory` 网页界面）和设置（官方 API 接入、模型与思考强度、汇总/执行/决策模型、并发与超时、高级 JSON 配置）。
 - **项目**：可从标题栏切换项目文件夹，点击分支名可切换本地 Git 分支。配置按项目读取。快捷键 `Ctrl/⌘+N` 新对话，`Ctrl/⌘+,` 设置，`Ctrl/⌘+B` 侧栏，`Esc` 停止当前轮。
 
@@ -109,7 +114,7 @@ unify bench remove case <案例ID>
 用户配置放在 `~/.unify/config.json`，项目配置放在 `./unify.config.json`。项目覆盖用户配置，`models`、`targets` 和 `reasoningEffort` 按键合并。以下两个例外固定生效：
 
 - `custom` 和 `quotaCommands` 只从用户配置加载，项目不能配置新的命令或服务器。
-- 任一配置设置 `disableClaude: true`，都会完全禁用内置 Claude Code，包括版本检测和基于 Claude 的目标。
+- `disableClaude` 只从用户配置加载，默认关闭。设为 `true` 后，所有项目都会禁用内置 Claude Code、它的版本检测和使用它的目标别名。
 
 配置在启动调用前校验：未知字段、未知引用、重复目标、错误类型、不合理的超时或并发数都会报错。`timeoutSec`、`decisionTimeoutSec`、`execTimeoutSec` 必须是有限正数，最大 2147483 秒；`concurrency` 是 1–64 的整数。
 
@@ -119,7 +124,6 @@ unify bench remove case <案例ID>
 
 ```json
 {
-  "disableClaude": true,
   "targets": {
     "fast": { "provider": "codex", "model": "<已支持的模型名>", "label": "快速模型" },
     "deep": { "provider": "codex", "model": "<另一个模型名>", "label": "深度模型" }
@@ -160,7 +164,7 @@ unify bench remove case <案例ID>
 }
 ```
 
-界面把选择保存在 `reasoningEffort.<目标 ID>`，优先于该目标别名中的 `reasoningEffort`。旧配置继续使用原有默认行为。Codex CLI 使用 `model_reasoning_effort`，Claude Code 使用 `--effort`。已有的模型 ID 和目标别名会保留在列表里。
+Gemini Pro 订阅通道从 `agy models` 读取当前账号的型号及可用档位。选择 Gemini 4 Neon 的 `high` 后，界面会把完整型号 `gemini-4-neon-high` 写入 `models.<目标 ID>`。其他通道的档位保存在 `reasoningEffort.<目标 ID>`，优先于该目标别名中的 `reasoningEffort`。Codex CLI 使用 `model_reasoning_effort`，Claude Code 使用 `--effort`。
 
 DeepSeek 区分关闭思考和设置思考强度。Gemini API 和兼容推理模型使用 `reasoning_effort`。Anthropic 的兼容接口使用思考预算，界面对支持手动预算的 Claude 4 系列提供 1024、4096、8192 token 三档。具体可用档位还取决于模型及客户端版本。[DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/) · [Gemini API](https://ai.google.dev/gemini-api/docs/openai) · [Anthropic 兼容接口](https://platform.claude.com/docs/en/api/openai-sdk)
 

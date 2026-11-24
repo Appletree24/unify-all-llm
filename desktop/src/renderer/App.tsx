@@ -5,11 +5,19 @@ import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
 import { BenchmarkPage } from './Benchmark.js';
 import { SessionList } from './Sessions.js';
 import { Card, Composer, DistillDialog, ExecDialog, Turn, type ComposerState, type FollowUpChoice, type PendingInteractionItem, type TurnActions } from './Thread.js';
-import { Icon, Spinner, hue, isActive } from './ui.js';
+import { Icon, Spinner, isActive } from './ui.js';
 
 type View = 'bench' | 'chat' | 'quota' | 'memory' | 'settings';
 interface Toast { id: number; msg: string; kind: 'ok' | 'err' | 'info' }
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+function timeGreeting(): string {
+  const hour = new Date().getHours();
+  if (hour < 5) return '夜深了';
+  if (hour < 12) return '上午好';
+  if (hour < 14) return '中午好';
+  if (hour < 18) return '下午好';
+  return '晚上好';
+}
 const darkTheme = window.matchMedia('(prefers-color-scheme: dark)');
 function subscribeTheme(listener: () => void) {
   darkTheme.addEventListener('change', listener);
@@ -37,6 +45,8 @@ export function App() {
   const [zoom, setZoom] = useState<{ turnId: string; runId: string }>();
   const [followUp, setFollowUp] = useState<FollowUpChoice>();
   const [composerSelection, setComposerSelection] = useState<ComposerSelection>();
+  const [settingsGraph,setSettingsGraph] = useState<string>();
+  const [revisionId,setRevisionId] = useState<string>();
   const [sidebar, setSidebar] = useState(true);
   const [menu, setMenu] = useState(false);
   const [recent, setRecent] = useState<string[]>([]);
@@ -143,7 +153,7 @@ export function App() {
     const available = new Set(ws?.targets.filter((target) => target.installed !== false).map((target) => target.id));
     const selected = (composerSelection?.selected ?? ws?.defaults ?? []).filter((id) => available.has(id));
     const synth = composerSelection?.synth ?? '';
-    return { selected, synth: synth === 'off' || available.has(synth) ? synth : '' };
+    return { selected, synth: synth === 'off' || available.has(synth) ? synth : '', graph: composerSelection?.graph && ws?.collaborationGraphs[composerSelection.graph] ? composerSelection.graph : undefined };
   }, [ws, composerSelection]);
 
   const changeComposerSelection = (selection: ComposerSelection) => {
@@ -202,6 +212,12 @@ export function App() {
   const busy = turns.some(isActive);
   const latestComparisonId = useMemo(() => turns.filter((r) => r.kind === 'comparison').at(-1)?.id, [turns]);
   const activeFollowUp = followUp && followUp.turnId === latestComparisonId ? followUp : undefined;
+  const revision = revisionId && revisionId === turns.at(-1)?.id ? records[revisionId] : undefined;
+  const graphControls = {
+    revision: revision?.collaboration,
+    onGraph: (graph?: string) => { setRevisionId(undefined); changeComposerSelection({ ...composerSelection, graph }); },
+    editGraph: () => { setSettingsGraph(composer.graph ?? ''); setView('settings'); },
+  };
   const liveSessions = useMemo(() => new Set(Object.values(records).filter(isActive).map((r) => r.sessionId)), [records]);
   const quotaMap = useMemo(() => new Map((quota ?? []).map((q) => [q.targetId, q])), [quota]);
 
@@ -238,21 +254,25 @@ export function App() {
   const send = async (question: string): Promise<boolean> => {
     try {
       const ids = await unify.ask({
-        question, selected: composer.selected, manual: composerSelection?.selected !== undefined,
+        question, selected: composer.selected, manual: composerSelection?.selected !== undefined, graph: composer.graph, reviseTurn: revision?.id,
         synthesize: composer.synth !== 'off', synthesizer: composer.synth && composer.synth !== 'off' ? composer.synth : undefined,
         sessionId: current ?? undefined,
-        continueFrom: activeFollowUp?.targetId,
+        continueFrom: revision ? undefined : activeFollowUp?.targetId,
         memoryUpdates: current && pendingMemoryUpdates.length ? pendingMemoryUpdates : undefined,
       });
       setFollowUp(undefined);
       setPendingMemoryUpdates([]);
       setCurrent(ids.sessionId);
+      setRevisionId(undefined);
       refreshSessions();
       return true;
     } catch (err) { notify(errText(err), 'err'); return false; }
   };
 
   const actions: TurnActions = {
+    confirmGraph: record => { void unify.exec(record.id,undefined,record.collaboration!.execution.target).then(() => refreshSessions(),err => notify(errText(err),'err')); },
+    reviseGraph: record => { setRevisionId(record.id); setFollowUp(undefined); document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(); },
+    closeGraph: record => { void unify.closeCollaboration(record.id).then(() => setRevisionId(undefined),err => notify(errText(err),'err')); },
     zoom: (turnId, runId) => setZoom(runId ? { turnId, runId } : undefined),
     exec: (turnId, from) => { unify.previewExec(turnId, from).then(setExecPreview, (err) => notify(errText(err), 'err')); },
     retry: (turnId, targetIds) => {
@@ -276,7 +296,7 @@ export function App() {
   // ── keyboard ────────────────────────────────────────────────────────────
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
-      if (e.target instanceof Element && e.target.closest('.session-dialog')) return;
+      if (e.target instanceof Element && e.target.closest('.session-dialog, .source-dialog')) return;
       const mod = e.ctrlKey || e.metaKey;
       if (e.key === 'Escape' && zoom) { setZoom(undefined); return; }
       if (!mod || !ws) return;
@@ -309,8 +329,8 @@ export function App() {
   }, [records, current, openSession]);
 
   const zoomed = zoom && records[zoom.turnId];
-  const zoomResult = zoomed && [...zoomed.results, ...(zoomed.synthesis ? [zoomed.synthesis.result] : [])].find((r) => r.runId === zoom.runId);
-  const selectedLabels = ws?.targets.filter((t) => composer.selected.includes(t.id)) ?? [];
+  const zoomCall = zoomed?.calls.find(c => c.id === zoom?.runId);
+  const zoomResult = zoomed && (zoomCall?.result ?? [...zoomed.results, ...(zoomed.synthesis ? [zoomed.synthesis.result] : [])].find((r) => r.runId === zoom.runId));
 
   if (ws === undefined) return <div className="boot"><Spinner /></div>;
 
@@ -392,31 +412,60 @@ export function App() {
           : view === 'bench' ? null
           : view === 'quota' ? <QuotaPage quota={quota} loading={quotaLoading} refresh={() => refreshQuota(true)} />
           : view === 'memory' ? <MemoryPage cwd={ws.cwd} notify={notify} />
-          : view === 'settings' ? <SettingsPage ws={ws} onChange={setWs} notify={notify} />
-          : (
+          : view === 'settings' ? <SettingsPage key={ws.cwd} ws={ws} onChange={setWs} notify={notify} initialGraph={settingsGraph} />
+          : turns.length === 0 ? (
+            <div className="home-stage">
+              {ws.configError && <div className="error block home-alert"><Icon name="alert" size={14} /><span>配置有误：{ws.configError}</span></div>}
+              {pendingInteractions.length > 0 && (
+                <div className="home-interact">
+                  <div className="interact-banner" role="status">
+                    <div className="interact-banner-left">
+                      <Icon name="alert" size={14} />
+                      <span>
+                        <b>{pendingInteractions[0].targetLabel}</b> 等待交互：{pendingInteractions[0].request.title}
+                        {pendingInteractions.length > 1 ? `（另有 ${pendingInteractions.length - 1} 项）` : ''}
+                      </span>
+                    </div>
+                    <button type="button" className="interact-banner-jump" onClick={() => jumpToInteraction(pendingInteractions[0])}>
+                      定位处理
+                    </button>
+                  </div>
+                </div>
+              )}
+              <div className="home-center">
+                <div className="home-head">
+                  <div className="home-mark" aria-hidden="true"><Icon name="spark" size={18} /></div>
+                  <h1>{timeGreeting()}</h1>
+                  {ws.targets.some((t) => t.installed === undefined) ? (
+                    <p className="home-status"><Spinner />正在准备可用模型…</p>
+                  ) : !ws.targets.some((t) => t.installed) ? (
+                    <p className="home-status">
+                      <button type="button" className="home-setup-btn" onClick={() => { setSettingsGraph(undefined); setView('settings'); }}>
+                        <Icon name="sliders" size={13} />在设置中接入模型
+                      </button>
+                    </p>
+                  ) : null}
+                </div>
+                <Composer
+                  home {...graphControls}
+                  ws={ws} quota={quotaMap} busy={busy} state={composer} onToggleTarget={toggleTarget}
+                  onSynthesisChange={(synth) => changeComposerSelection({ ...composerSelection, synth })}
+                  onSend={send} onCancel={cancelCurrent} autoFocusKey={`${ws.cwd}:${current}`}
+                  followUp={activeFollowUp} onClearFollowUp={() => setFollowUp(undefined)}
+                  pendingMemoryUpdates={pendingMemoryUpdates} onClearMemoryUpdates={() => setPendingMemoryUpdates([])}
+                />
+              </div>
+            </div>
+          ) : (
             <>
               <div className="thread" ref={thread} onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
                 {ws.configError && <div className="error block"><Icon name="alert" size={14} /><span>配置有误：{ws.configError}</span></div>}
-                {turns.length === 0 ? (
-                  <div className="hero">
-                    <h1>想比较什么？</h1>
-                    <p className="lede">
-                      {selectedLabels.length
-                        ? <>问题会同时发给 {selectedLabels.map((t, i) => <span key={t.id} className="hero-target" style={{ '--h': hue(t.id) } as React.CSSProperties}>{i > 0 && '、'}<i className="dot" />{t.label}</span>)}，回答并排显示，再匿名汇总。</>
-                        : ws.targets.some((t) => t.installed === undefined) ? '正在检测可用的模型…'
-                        : ws.targets.some((t) => t.installed) ? '从下方选择要提问的模型。'
-                        : <button className="link" onClick={() => setView('settings')}>在设置中接入模型</button>}
-                    </p>
-                    <ul className="tips">
-                      <li><b>并排</b>每个模型一列，实时流式输出；点 <Icon name="expand" size={12} /> 放大阅读。</li>
-                      <li><b>追问</b>同一对话里继续提问，会带上之前的汇总作为上下文。</li>
-                      <li><b>实施</b>选一个回答或汇总，交给支持实施的模型修改项目文件。</li>
-                    </ul>
-                  </div>
-                ) : turns.map((r) => (
+                {turns.map((r) => (
                   <Turn
                     key={r.id} record={r} notices={notices[r.id] ?? []} interactions={interactions} showReasoning={ws.showReasoning} actions={actions}
-                    isLatestComparison={r.id === latestComparisonId} followUp={activeFollowUp}
+                    isLatestComparison={r.id === latestComparisonId} isLatestTurn={r.id === turns.at(-1)?.id} followUp={activeFollowUp}
+                    execution={r.collaboration ? turns.find(t => t.planSource?.turnId === r.id) : undefined}
+                    graphExecutor={r.collaborationTargets?.find(t => t.id === r.collaboration?.execution.target)?.label}
                   />
                 ))}
               </div>
@@ -436,7 +485,7 @@ export function App() {
                   </div>
                 </div>
               )}
-              <Composer
+              <Composer {...graphControls}
                 ws={ws} quota={quotaMap} busy={busy} state={composer} onToggleTarget={toggleTarget}
                 onSynthesisChange={(synth) => changeComposerSelection({ ...composerSelection, synth })}
                 onSend={send} onCancel={cancelCurrent} autoFocusKey={`${ws.cwd}:${current}`}
@@ -449,7 +498,7 @@ export function App() {
           <div className="zoom-back" onMouseDown={(e) => { if (e.target === e.currentTarget) setZoom(undefined); }}>
             <Card
               record={zoomed} result={zoomResult} zoomed showReasoning={ws?.showReasoning ?? false} interactions={interactions[zoomResult.runId]} actions={actions}
-              kind={zoomed.synthesis?.result.runId === zoomResult.runId ? 'synthesis' : zoomed.kind === 'execution' ? 'exec' : 'answer'}
+              kind={zoomCall?.scope === 'plan-review' || zoomCall?.scope === 'result-review' ? zoomCall.scope : zoomed.synthesis?.result.runId === zoomResult.runId ? 'synthesis' : zoomed.kind === 'execution' ? 'exec' : 'answer'}
             />
           </div>
         )}

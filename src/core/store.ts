@@ -7,6 +7,8 @@ import { mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { z } from 'zod';
+import { collaborationSchema } from './collaboration.js';
+import { sourceCheckSchema } from './source-check.js';
 import { customSchema, effortSchema, readJson } from './config.js';
 export { loadConfig, type Config } from './config.js';
 
@@ -62,7 +64,7 @@ const inputSchema = z.object({
   memoryUpdates: z.array(z.string()).optional(),
 });
 const sourceSchema = z.object({
-  turnId: safeId, runId: safeId, targetId: safeId, scope: z.enum(['answer', 'synthesis']),
+  turnId: safeId, runId: safeId, targetId: safeId, scope: z.enum(['answer', 'synthesis', 'plan-review']),
   planText: z.string().optional(),
 });
 const recordSchema = z.object({
@@ -70,10 +72,13 @@ const recordSchema = z.object({
   parentTurnId: safeId.optional(), retryOf: safeId.optional(), createdAt: z.string(), updatedAt: z.string(),
   owner: z.object({ pid: z.number().int().positive(), hostname: z.string() }).optional(),
   question: z.string(), input: inputSchema, targets: z.array(targetSchema),
+  collaboration: collaborationSchema.optional(),
+  collaborationTargets: z.array(targetSchema).optional(),
+  collaborationClosed: z.boolean().optional(),
   status: z.enum(['created', 'deciding', 'answering', 'synthesizing', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']),
   error: z.string().optional(), results: z.array(resultSchema),
   calls: z.array(z.object({
-    id: safeId, scope: z.enum(['decision', 'answer', 'synthesis', 'exec']), target: targetSchema,
+    id: safeId, scope: z.enum(['decision', 'answer', 'dispute-assessment', 'source-check', 'synthesis', 'exec', 'plan-review', 'result-review']), target: targetSchema,
     input: z.object({
       prompt: z.string(),
       messages: z.array(chatMessageSchema).optional(),
@@ -87,6 +92,7 @@ const recordSchema = z.object({
   decision: z.object({ providers: z.array(safeId), synthesize: z.boolean(), reason: z.string().optional() }).optional(),
   synthesis: z.object({
     provider: safeId, labels: z.record(z.string(), safeId), result: resultSchema,
+    sourceCheck: sourceCheckSchema.optional(),
     preferredProvider: safeId.optional(), fallback: z.boolean().optional(), alsoAnswered: z.boolean().optional(),
   }).optional(),
   planSource: sourceSchema.optional(),
@@ -136,6 +142,9 @@ export function exportRun(cwd: string, run: RunRecord): void {
   atomicWrite(join(dir, 'question.md'), run.question + '\n');
   for (const r of run.results) atomicWrite(join(dir, `answer-${safeId.parse(r.targetId)}.md`), `${r.ok ? '' : `**${r.status}**: ${r.error ?? ''}\n\n`}${r.text}${formatMemoryReferences(r.memoryReferences)}\n`);
   if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), synthesisFormatter(run)(run.synthesis.result.text) + formatMemoryReferences(run.synthesis.result.memoryReferences) + '\n');
+  for (const call of run.calls) if (call.scope === 'plan-review' || call.scope === 'result-review') {
+    atomicWrite(join(dir, call.scope + '.md'), call.result.text + '\n');
+  }
 }
 
 export function listRunIds(cwd: string): string[] {
@@ -215,6 +224,7 @@ function sourceDisplayName(source: PlanSource, comparison?: RunRecord): string {
   const target = comparison?.targets.find((t) => t.id === source.targetId);
   const config = target?.configuration;
   const name = target?.model ?? (config?.type === 'openai' ? config.model : undefined) ?? target?.label ?? source.targetId;
+  if (source.scope === 'plan-review') return `复核（${name}）`;
   return source.scope === 'synthesis' ? `汇总（${name}）` : name;
 }
 
@@ -234,8 +244,13 @@ function formatExecutedAnswer(planText: string | undefined, execution: RunRecord
   const execLabel = execution.targets[0]?.label ?? execResult?.targetId ?? '执行模型';
   if (planText) {
     const header = srcLabel ? `[已采纳方案：${srcLabel}]\n` : '';
-    const outcome = execOk ? `\n\n[已由 ${execLabel} 实施]\n${execResult.text.trim()}` : '';
-    return `${header}${planText}${outcome}`;
+    let outcome = execOk ? `\n\n[已由 ${execLabel} 实施]\n${execResult.text.trim()}` : '';
+    if (!execOk && execution.collaboration) {
+      const details = [execResult?.text.trim(), execResult?.error, execution.error].filter(Boolean).join('\n');
+      outcome = `\n\n[实施状态：${execution.status}，再次实施前应核对工作目录里的已有改动]\n${details}`;
+    }
+    const audit = execution.calls.find(c => c.scope === 'result-review' && c.result.ok);
+    return `${header}${planText}${outcome}${audit ? '\n\n[实施复核]\n' + audit.result.text.trim() : ''}`;
   }
   return execOk ? execResult.text.trim() : undefined;
 }
@@ -267,6 +282,8 @@ export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, from
     const answer = formatExecutedAnswer(planText, followUpExecution, run);
     if (answer) return [...run.input.history, entry(run.id, answer)];
   }
+  const review = run.calls.find(c => c.scope === 'plan-review' && c.result.ok && c.result.text.trim());
+  if (review) return [...run.input.history, entry(run.id, review.result.text.trim())];
   if (run.synthesis?.result.ok && run.synthesis.result.text.trim()) {
     const answer = synthesisFormatter(run)(run.synthesis.result.text);
     return [...run.input.history, entry(run.id, answer)];

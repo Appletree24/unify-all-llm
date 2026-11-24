@@ -1,8 +1,10 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { synthesisFormatter } from '../../../src/core/synth.js';
+import { graphIssue, graphPlanResult, graphStages, roleNames, type Collaboration } from '../../../src/core/collaboration.js';
 import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSourceRef, DuplicateCheckResult, ExecPreview, InteractionResponse, PendingInteraction, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { Icon, Markdown, Spinner, hue, isActive, kilo, quotaSummary, seconds, statusText, useTicker } from './ui.js';
+import { SynthesisMarkdown } from './SynthesisMarkdown.js';
 
 export interface PendingInteractionItem {
   turnId: string;
@@ -11,7 +13,7 @@ export interface PendingInteractionItem {
   targetLabel: string;
   request: PendingInteraction;
 }
-type CardKind = 'answer' | 'synthesis' | 'exec';
+type CardKind = 'answer' | 'synthesis' | 'exec' | 'plan-review' | 'result-review';
 
 /** When each call was first seen running, for elapsed-time labels. */
 const firstSeen = new Map<string, number>();
@@ -23,6 +25,9 @@ export interface FollowUpChoice {
 }
 
 export interface TurnActions {
+  confirmGraph?(record: RunRecord): void;
+  reviseGraph?(record: RunRecord): void;
+  closeGraph?(record: RunRecord): void;
   zoom(turnId: string, runId: string): void;
   exec(turnId: string, from?: string): void;
   retry(turnId: string, targetIds?: string[]): void;
@@ -214,7 +219,9 @@ export function Card({ record, result, kind, showReasoning, interactions, action
   if (running && !firstSeen.has(result.runId)) firstSeen.set(result.runId, Date.now());
   const call = record.calls.find((c) => c.id === result.runId);
   const target = call?.target ?? record.targets.find((t) => t.id === result.targetId);
-  const label = kind === 'synthesis' ? `汇总 · ${target?.label ?? result.targetId}` : kind === 'exec' ? `实施 · ${target?.label ?? result.targetId}` : target?.label ?? result.targetId;
+  const prefix = { answer: '', synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核' }[kind];
+  const label = (prefix ? prefix + ' · ' : '') + (target?.label ?? result.targetId);
+  const review = kind === 'plan-review' || kind === 'result-review';
   const meta = [result.model, result.reasoningEffort && `思考 ${result.reasoningEffort}`].filter(Boolean).join(' · ');
   const elapsed = running ? now - (firstSeen.get(result.runId) ?? now) : result.durationMs;
   const turnRunning = isActive(record);
@@ -229,12 +236,13 @@ export function Card({ record, result, kind, showReasoning, interactions, action
   const [thinkOpen, setThinkOpen] = useState(showReasoning);
   const waiting = running && !result.text && !result.reasoning && !needsInput;
   const format = kind === 'synthesis' ? synthesisFormatter(record) : undefined;
+  const sourceCheck = kind === 'synthesis' ? record.synthesis?.sourceCheck : undefined;
   const text = format?.(result.text) ?? result.text;
   const reasoning = format?.(result.reasoning) ?? result.reasoning;
   const tools = result.tools;
 
   return (
-    <article className={`card ${kind} ${status}${needsInput ? ' needs-input' : ''}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
+    <article id={zoomed ? undefined : 'call-' + result.runId} className={`card ${kind} ${status}${needsInput ? ' needs-input' : ''}${zoomed ? ' zoomed' : ''}`} style={{ '--h': hue(result.targetId) } as CSSProperties}>
       <header>
         {kind === 'synthesis' ? <span className="mark"><Icon name="spark" size={14} /></span> : kind === 'exec' ? <span className="mark"><Icon name="run" size={14} /></span> : <i className="dot" />}
         <div className="who">
@@ -270,6 +278,16 @@ export function Card({ record, result, kind, showReasoning, interactions, action
             </dl>
           </details>
         )}
+        {sourceCheck && (sourceCheck.excerpts.length ? (
+          <details className="think">
+            <summary>源码证据<span>{sourceCheck.excerpts.length} 处</span></summary>
+            <div className="source-evidence">
+              {sourceCheck.excerpts.map(({ path, line, quote }, i) => (
+                <div key={i}><code>{path}:{line}</code><pre>{quote}</pre></div>
+              ))}
+            </div>
+          </details>
+        ) : <p className="hint" title={sourceCheck.question}>定点核查未匹配到源码原文</p>)}
         {result.reasoning && (
           <details className="think" open={thinkOpen || (running && !result.text && showReasoning)} onToggle={(e) => setThinkOpen((e.target as HTMLDetailsElement).open)}>
             <summary>思考过程<span>{kilo(reasoning.length)} 字</span></summary>
@@ -298,7 +316,7 @@ export function Card({ record, result, kind, showReasoning, interactions, action
         {waiting ? (
           <div className="skeleton"><i /><i /><i /></div>
         ) : result.text ? (
-          <Markdown text={text} />
+          kind === 'synthesis' ? <SynthesisMarkdown record={record} text={result.text} /> : <Markdown text={text} />
         ) : !running && !error ? <p className="empty">没有输出</p> : null}
         {interactions && actions.respondInteraction && interactions.map((item) => (
           <InteractionPrompt key={item.request.id} item={item} onRespond={actions.respondInteraction!} />
@@ -316,8 +334,8 @@ export function Card({ record, result, kind, showReasoning, interactions, action
             <button title="取消这个模型，其余继续" onClick={() => actions.cancelTarget(record.id, result.targetId)}><Icon name="x" /></button>
           )}
           {text && <button title="复制" onClick={() => void unify.copy(text)}><Icon name="copy" /></button>}
-          {!turnRunning && !running && actions.benchmark && <button title="这次不符合预期，留作评测题" onClick={() => actions.benchmark!(record.id, result.runId)}>留题</button>}
-          {result.ok && !turnRunning && text && actions.distill && (
+          {!review && !turnRunning && !running && actions.benchmark && <button title="这次不符合预期，留作评测题" onClick={() => actions.benchmark!(record.id, result.runId)}>留题</button>}
+          {!review && result.ok && !turnRunning && text && actions.distill && (
             <button
               title="存为记忆…（可先划选一段文字）"
               onClick={() => {
@@ -336,7 +354,7 @@ export function Card({ record, result, kind, showReasoning, interactions, action
               <Icon name="bookmark" size={14} />
             </button>
           )}
-          {kind === 'answer' && !running && !turnRunning && (
+          {kind === 'answer' && !record.collaboration && !running && !turnRunning && (
             <button title="只重新调用这个模型" onClick={() => actions.retry(record.id, [result.targetId])}><Icon name="retry" /></button>
           )}
           {kind === 'answer' && result.ok && !emptyAnswer && !turnRunning && canFollowUp && actions.followUp && (
@@ -348,7 +366,7 @@ export function Card({ record, result, kind, showReasoning, interactions, action
               <Icon name="check" />
             </button>
           )}
-          {kind === 'answer' && result.ok && !emptyAnswer && !turnRunning && (
+          {kind === 'answer' && !record.collaboration && result.ok && !emptyAnswer && !turnRunning && (
             <button title="按这个回答实施" onClick={() => actions.exec(record.id, result.targetId)}><Icon name="run" /></button>
           )}
           <button title={zoomed ? '退出放大 (Esc)' : '放大阅读'} onClick={() => actions.zoom(record.id, zoomed ? '' : result.runId)}><Icon name={zoomed ? 'shrink' : 'expand'} /></button>
@@ -359,16 +377,33 @@ export function Card({ record, result, kind, showReasoning, interactions, action
 }
 
 // ── one round: question, answers, synthesis ───────────────────────────────
-export function Turn({ record, notices, interactions, showReasoning, actions, isLatestComparison, followUp }: {
+function GraphProgress({ graph, record, execution, pending }: { graph: Collaboration; record: RunRecord; execution?: RunRecord; pending: boolean }) {
+  const scope = { plan:'answer', merge:'synthesis', check:'plan-review', execution:'exec', audit:'result-review' } as const;
+  const calls = [...record.calls, ...(execution?.calls ?? [])];
+  return <nav className="cg-progress" aria-label={graph.name + '进度'}><b>{graph.name}</b>{graphStages(graph).map(step => {
+    const matching = step === 'confirm' ? [] : calls.filter(c => c.scope === scope[step]);
+    const running = matching.find(c => c.result.status === 'running');
+    const ended = step === 'confirm' ? !!execution : matching.length > 0 && matching.every(c => c.result.ok);
+    const current = !!running || (step === 'confirm' && pending);
+    const failed = matching.some(c => !c.result.ok && c.result.status !== 'running');
+    const dest = step === 'confirm' ? 'gate-' + record.id : matching[0] && 'call-' + (running ?? matching[0]).id;
+    const label = step === 'confirm' ? roleNames.confirm : step === 'plan' ? graph.plans[0].label ?? '方案' : graph[step]?.label ?? roleNames[step];
+    return <button key={step} aria-current={current ? 'step' : undefined} className={current ? 'current' : failed ? 'failed' : ''}
+      disabled={!dest} onClick={() => dest && document.getElementById(dest)?.scrollIntoView({block:'center'})}>{ended ? '✓ ' : failed ? '× ' : current ? '● ' : ''}{label}</button>;
+  })}</nav>;
+}
+export function Turn({ record, notices, interactions, showReasoning, actions, isLatestComparison, isLatestTurn, followUp, execution, graphExecutor }: {
   record: RunRecord; notices: string[]; interactions?: Record<string, PendingInteractionItem[]>; showReasoning: boolean; actions: TurnActions;
-  isLatestComparison?: boolean; followUp?: FollowUpChoice;
+  isLatestComparison?: boolean; isLatestTurn?: boolean; followUp?: FollowUpChoice; execution?: RunRecord; graphExecutor?: string;
 }) {
   const active = isActive(record);
   const time = new Date(record.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  const reviewCards = record.calls.filter(c => c.scope === 'plan-review' || c.scope === 'result-review').map(c =>
+    <Card key={c.id} record={record} result={c.result} kind={c.scope as 'plan-review' | 'result-review'} showReasoning={showReasoning} actions={actions} interactions={interactions?.[c.id]} />);
   if (record.kind === 'execution') {
     const result = record.results[0];
     const src = record.planSource;
-    const srcLabel = src ? (src.scope === 'synthesis' ? '汇总' : record.targets.find((t) => t.id === src.targetId)?.label ?? src.targetId) : '';
+    const srcLabel = src ? (src.scope === 'synthesis' ? '汇总' : src.scope === 'plan-review' ? '复核后的方案' : record.targets.find((t) => t.id === src.targetId)?.label ?? src.targetId) : '';
     return (
       <section className="turn exec-turn">
         <div className="q small">
@@ -376,10 +411,12 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
         </div>
         {result ? <Card record={record} result={result} kind="exec" showReasoning={showReasoning} interactions={interactions?.[result.runId]} actions={actions} />
           : <div className="pending"><Spinner />正在准备实施…</div>}
+        {reviewCards}
         {record.error && <div className="error"><Icon name="alert" size={14} /><span>{record.error}</span></div>}
         <div className="turn-foot">
           {active ? <button className="ghost" onClick={() => actions.cancel(record.id)}><Icon name="stop" size={14} />停止实施</button>
             : result?.ok ? <span className="hint"><Icon name="check" size={14} />实施完成，请用 git diff 检查改动</span> : null}
+          {record.collaboration && isLatestTurn && !active && <button className="btn" onClick={() => actions.reviseGraph?.(record)}>带回方案讨论</button>}
         </div>
       </section>
     );
@@ -389,6 +426,7 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
   const failed = answers.filter((r) => !r.ok && r.status !== 'running');
   const anyOk = answers.some((r) => r.ok) || record.synthesis?.result.ok;
   const n = Math.min(Math.max(answers.length, 1), 3);
+  const pending = !!(isLatestComparison && !execution && graphPlanResult(record));
   return (
     <section className="turn">
       <div className="q">
@@ -399,6 +437,7 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
           {answers.length > 0 && <span>{answers.length} 个模型</span>}
         </div>
       </div>
+      {record.collaboration && <GraphProgress graph={record.collaboration} record={record} execution={execution} pending={pending} />}
       {record.status === 'deciding' && <div className="pending"><Spinner />正在决定由哪些模型回答…</div>}
       {record.status === 'created' && <div className="pending"><Spinner />正在检查模型…</div>}
       {notices.length > 0 && <div className="notices">{notices.map((m, i) => <div key={i}>{m}</div>)}</div>}
@@ -415,15 +454,23 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
         </div>
       )}
       {record.synthesis && <Card record={record} result={record.synthesis.result} kind="synthesis" showReasoning={showReasoning} interactions={interactions?.[record.synthesis.result.runId]} actions={actions} />}
+      {reviewCards}
+      {record.collaboration && <div id={'gate-' + record.id}>
+        {pending ? <div className="cg-confirm"><b>方案已就绪，交由 {graphExecutor ?? record.collaboration.execution.target} 开始实施？</b>
+          <footer><button className="btn primary" onClick={() => actions.confirmGraph?.(record)}>确认并实施</button>
+          <button className="btn" onClick={() => actions.reviseGraph?.(record)}>继续修改方案</button>
+          <button className="ghost" onClick={() => actions.closeGraph?.(record)}>终止协作</button></footer></div>
+          : record.collaborationClosed ? <span className="hint">协作已终止</span> : null}
+      </div>}
       {record.error && <div className="error"><Icon name="alert" size={14} /><span>{record.error}</span></div>}
       <div className="turn-foot">
         {active ? (
           <button className="ghost" onClick={() => actions.cancel(record.id)}><Icon name="stop" size={14} />取消本轮</button>
         ) : (
           <>
-            {anyOk && <button className="ghost" onClick={() => actions.exec(record.id)}><Icon name="run" size={14} />实施方案…</button>}
+            {anyOk && !record.collaboration && <button className="ghost" onClick={() => actions.exec(record.id)}><Icon name="run" size={14} />实施方案…</button>}
             {actions.benchmark && <button className="ghost" onClick={() => actions.benchmark!(record.id)}>整轮留题</button>}
-            {failed.length > 0 && <button className="ghost" onClick={() => actions.retry(record.id)}><Icon name="retry" size={14} />重试未成功的 {failed.length} 个</button>}
+            {(record.collaboration ? isLatestComparison && !execution && ['failed','partial','interrupted','cancelled'].includes(record.status) : failed.length > 0) && <button className="ghost" onClick={() => actions.retry(record.id)}><Icon name="retry" size={14} />{record.collaboration ? '重新运行协作方案' : '重试未成功的 ' + failed.length + ' 个'}</button>}
             <button className="ghost subtle" onClick={() => void unify.reveal('run', record.id)}><Icon name="folder" size={14} />记录</button>
           </>
         )}
@@ -433,7 +480,7 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
 }
 
 // ── composer ──────────────────────────────────────────────────────────────
-export interface ComposerState { selected: string[]; synth: string }
+export interface ComposerState { selected: string[]; synth: string; graph?: string }
 
 function SynthesisPicker({ targets, defaultId, value, onChange }: {
   targets: WorkspaceInfo['targets']; defaultId?: string; value: string; onChange(value: string): void;
@@ -503,8 +550,94 @@ function SynthesisPicker({ targets, defaultId, value, onChange }: {
   );
 }
 
-export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisChange, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp, pendingMemoryUpdates, onClearMemoryUpdates }: {
-  ws: WorkspaceInfo; quota: Map<string, TargetQuota>; busy: boolean;
+function ModePicker({ graphs, value, revision, route, onSelect, onManage }: {
+  graphs: WorkspaceInfo['collaborationGraphs'];
+  value?: string;
+  revision?: Collaboration;
+  route?: string;
+  onSelect(id?: string): void;
+  onManage(): void;
+}) {
+  const menuId = useId();
+  const trigger = useRef<HTMLButtonElement>(null);
+  const current = revision ? 'revision' : value ?? '';
+  const items: { value: string; label: string; detail?: string; icon: string }[] = [
+    { value: '', label: '普通问答', detail: '自由选择参与模型与汇总', icon: 'chat' },
+    ...(revision ? [{ value: 'revision', label: `修改 · ${revision.name}`, detail: '由原方案模型沿用记录调整', icon: 'edit' }] : []),
+    ...Object.entries(graphs).map(([id, g]) => ({ value: id, label: g.name, detail: '组合模版', icon: 'layers' })),
+  ];
+  const active = items.find((item) => item.value === current) ?? items[0];
+  const isGraph = !!current;
+
+  return (
+    <div className="synth-picker mode-picker">
+      <button
+        ref={trigger} type="button" className={`synth-trigger mode-trigger${isGraph ? ' on' : ''}`}
+        popoverTarget={menuId} aria-haspopup="menu" aria-label="本轮协作模式" title={route ?? '选择普通问答或组合模版'}
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+          event.preventDefault();
+          event.currentTarget.click();
+        }}
+      >
+        <Icon name="layers" size={13} />
+        <span>{active.label}</span>
+        <Icon name="chevron" size={12} />
+      </button>
+      <div
+        id={menuId} popover="auto" role="menu" className="synth-popover mode-popover" aria-label="本轮协作模式"
+        onToggle={(event) => {
+          if (event.currentTarget.matches(':popover-open')) {
+            event.currentTarget.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus();
+          }
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Tab') { event.currentTarget.hidePopover(); return; }
+          if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"], [role="menuitem"]')];
+          const index = buttons.findIndex((item) => item === document.activeElement);
+          const step = event.key === 'ArrowUp' ? -1 : 1;
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (index + step + buttons.length) % buttons.length;
+          buttons[next]?.focus();
+        }}
+      >
+        {items.map((item) => {
+          const checked = item.value === active.value;
+          return (
+            <button
+              key={item.value} type="button" role="menuitemradio" aria-checked={checked} tabIndex={-1}
+              className="synth-item" onClick={(event) => {
+                onSelect(item.value || undefined);
+                event.currentTarget.closest<HTMLElement>('[popover]')?.hidePopover();
+                trigger.current?.focus();
+              }}
+            >
+              <Icon name={item.icon} size={14} />
+              <span className="synth-item-label"><strong>{item.label}</strong>{item.detail && <small>{item.detail}</small>}</span>
+              {checked && <Icon name="check" size={14} />}
+            </button>
+          );
+        })}
+        <div className="popover-sep" role="separator" />
+        <button
+          type="button" role="menuitem" tabIndex={-1} className="synth-item"
+          onClick={(event) => {
+            event.currentTarget.closest<HTMLElement>('[popover]')?.hidePopover();
+            onManage();
+          }}
+        >
+          <Icon name="sliders" size={14} />
+          <span className="synth-item-label"><strong>管理组合模版…</strong></span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function Composer({ home = false, ws, quota, busy, state, onToggleTarget, onSynthesisChange, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp, pendingMemoryUpdates, onClearMemoryUpdates, onGraph, editGraph, revision }: {
+  home?: boolean; ws: WorkspaceInfo; quota: Map<string, TargetQuota>; busy: boolean;
+  onGraph(id?: string): void; editGraph(): void; revision?: Collaboration;
   state: ComposerState; onToggleTarget(id: string): void; onSynthesisChange(value: string): void;
   onSend(text: string): Promise<boolean>; onCancel(): void; autoFocusKey: string;
   followUp?: FollowUpChoice; onClearFollowUp?: () => void;
@@ -521,11 +654,14 @@ export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisCh
     if (!el) return;
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, window.innerHeight * 0.4)}px`;
-  }, [text]);
+  }, [text, home]);
   useEffect(() => { area.current?.focus(); }, [autoFocusKey]);
 
   const usable = ws.targets.filter((t) => t.installed !== false);
-  const count = state.selected.length;
+  const graph = revision ?? (state.graph ? ws.collaborationGraphs[state.graph] : undefined);
+  const problem = graph && graphIssue(graph, ws.targets);
+  const count = graph ? (problem ? 0 : graph.plans.length) : state.selected.length;
+  const route = graph && graphStages(graph).map(s => s === 'confirm' ? '本人确认' : s === 'plan' ? graph.plans.map(p => p.target).join(' + ') : graph[s]!.target).join(' → ');
   const send = async () => {
     const q = text.trim();
     if (!q || busy || sending || !count) return;
@@ -540,7 +676,7 @@ export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisCh
   };
 
   return (
-    <div className="composer-wrap">
+    <div className={`composer-wrap${home ? ' home' : ''}`}>
       {followUp && (
         <div className="followup-bar">
           <span><Icon name="check" size={12} />下轮追问将沿用「<b>{followUp.label}</b>」的回答</span>
@@ -555,8 +691,8 @@ export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisCh
       )}
       <div className={`composer${busy ? ' busy' : ''}`}>
         <textarea
-          ref={area} value={text} rows={1} spellCheck={false}
-          placeholder={count ? `向 ${count} 个模型提问…` : usable.length ? '先在下方选择至少一个模型' : undefined}
+          ref={area} value={text} rows={home ? 2 : 1} spellCheck={false}
+          placeholder={problem ?? (revision ? '告诉方案模型你想调整什么…' : graph ? '描述要协作完成的任务…' : count ? (home ? '问点什么，或描述你想做的事…' : '继续提问…') : '先选择一个回答模型')}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); }
@@ -574,8 +710,14 @@ export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisCh
           }}
         />
         <div className="composer-bar">
+          <ModePicker graphs={ws.collaborationGraphs} value={state.graph} revision={revision} route={route} onSelect={onGraph} onManage={editGraph} />
+          {graph ? (
+            <button type="button" className="synth-trigger" onClick={editGraph} title="编辑组合模版"><Icon name="sliders" size={13} /><span>编辑模版</span></button>
+          ) : (
+            <span className="composer-sep" aria-hidden="true" />
+          )}
           <div className="chips">
-            {usable.map((t) => {
+            {!graph && usable.map((t) => {
               const q = quotaSummary(quota.get(t.id)?.reading, t);
               const on = state.selected.includes(t.id);
               return (
@@ -591,7 +733,7 @@ export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisCh
               );
             })}
           </div>
-          <SynthesisPicker targets={usable} defaultId={ws.synthesizer} value={state.synth} onChange={onSynthesisChange} />
+          {!graph && <SynthesisPicker targets={usable} defaultId={ws.synthesizer} value={state.synth} onChange={onSynthesisChange} />}
           {busy ? (
             <button type="button" className="send stop" onClick={onCancel} title="停止 (Esc)"><Icon name="stop" /></button>
           ) : (
@@ -601,7 +743,9 @@ export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisCh
           )}
         </div>
       </div>
-      <div className="composer-hint">Enter 发送 · Shift+Enter 换行 · ↑ 历史{busy ? ' · Esc 停止' : ''}</div>
+      {revision && <p className="cg-note">下一轮由原方案模型接手，沿用这份协作图和已有记录。</p>}
+      {problem && <p className="cg-warning" role="status">{problem}</p>}
+      {!home && <div className="composer-hint">Enter 发送 · Shift+Enter 换行 · ↑ 历史{busy ? ' · Esc 停止' : ''}</div>}
     </div>
   );
 }

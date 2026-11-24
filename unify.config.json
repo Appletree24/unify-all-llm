@@ -1,12 +1,24 @@
 {
   "showReasoning": true,
-  "disableClaude": true,
   "synthesizer": "deepseek",
+  "collaborationGraphs": {
+    "relay": {
+      "name": "方案接力",
+      "plans": [
+        {
+          "target": "gemini-pro"
+        }
+      ],
+      "execution": {
+        "target": "codex"
+      }
+    }
+  },
   "reasoningEffort": {
-    "codex": "high"
+    "codex": "xhigh"
   },
   "models": {
-    "gemini-pro": "gemini-4-neon-medium",
+    "gemini-pro": "gemini-4-neon-low",
     "deepseek": "deepseek-flash",
     "codex": "gpt-6.2-sol"
   }

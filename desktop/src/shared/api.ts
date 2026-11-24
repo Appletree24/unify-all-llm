@@ -6,6 +6,7 @@ import type { Config, ReasoningEffort } from '../../../src/core/config.js';
 import type { InteractionOption, InteractionQuestion, InteractionRequest, InteractionResponse, PendingInteraction } from '../../../src/core/types.js';
 import type { RunRecord } from '../../../src/core/store.js';
 import type { ModelTestState } from '../../../src/core/model-tests.js';
+import type { AgyModel } from '../../../src/providers/agy-models.js';
 import type { TargetQuota } from '../../../src/quota/types.js';
 import type { QuotaNotice } from '../../../src/quota/reminders.js';
 import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult } from '../../../src/memory/distill.js';
@@ -42,6 +43,7 @@ export interface WorkspaceInfo {
   synthesizer?: string;
   executor?: string;
   decider?: string;
+  collaborationGraphs: NonNullable<Config['collaborationGraphs']>;
   showReasoning: boolean;
   configError?: string;
 }
@@ -50,6 +52,7 @@ export interface ComposerSelection {
   /** Omit to follow the project defaults. An empty array is a manual selection. */
   selected?: string[];
   synth?: string;
+  graph?: string;
 }
 
 export interface OpenedWorkspace {
@@ -76,6 +79,8 @@ export interface SessionChanges {
 export const SESSION_TITLE_LIMIT = 120;
 
 export interface AskRequest {
+  graph?: string;
+  reviseTurn?: string;
   question: string;
   selected: string[];
   manual: boolean;
@@ -93,7 +98,7 @@ export interface ExecPreview {
   turnId: string;
   question: string;
   from?: string;
-  source: { targetId: string; scope: 'answer' | 'synthesis'; label: string };
+  source: { targetId: string; scope: 'answer' | 'synthesis' | 'plan-review'; label: string };
   sources: { id?: string; label: string }[];
   executor: { id: string; label: string };
   executors: { id: string; label: string }[];
@@ -148,14 +153,17 @@ export interface UnifyApi {
   ask(req: AskRequest): Promise<{ turnId: string; sessionId: string }>;
   retry(turnId: string, targetIds?: string[]): Promise<{ turnId: string; sessionId: string }>;
   cancel(turnId: string): Promise<void>;
+  closeCollaboration(turnId: string): Promise<void>;
   cancelTarget(turnId: string, targetId: string): Promise<boolean>;
   respondInteraction(turnId: string, interactionId: string, response: InteractionResponse): Promise<boolean>;
   previewExec(turnId: string, from?: string, executor?: string): Promise<ExecPreview>;
   exec(turnId: string, from: string | undefined, executor: string): Promise<{ turnId: string; sessionId: string }>;
   quota(force?: boolean): Promise<TargetQuota[]>;
   settings(): Promise<SettingsInfo>;
+  agyModels(cwd: string): Promise<AgyModel[]>;
   testTarget(id: string): Promise<void>;
   setSetting(key: keyof Config, value: unknown, entry?: string): Promise<WorkspaceInfo>;
+  saveCollaboration(cwd: string, id: string, graph: NonNullable<Config['collaborationGraphs']>[string] | undefined): Promise<void>;
   saveApi(id: string, model: string, apiKey?: string): Promise<WorkspaceInfo>;
   memoryUrl(): Promise<string>;
   captureBench(cwd: string, turn: string, call?: string): Promise<Candidate>;

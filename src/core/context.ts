@@ -24,7 +24,7 @@ function extractMentionCandidates(question: string): string[] {
   return found;
 }
 
-function resolveInsideCwd(cwdReal: string, rawPath: string): { display: string; abs: string } | undefined {
+export function resolveInsideCwd(cwdReal: string, rawPath: string): { display: string; abs: string } | undefined {
   const candidates = [rawPath, rawPath.replace(/[.,;:]+$/, '')].filter((v, i, arr) => v && arr.indexOf(v) === i);
   for (const candidate of candidates) {
     if (isAbsolute(candidate)) continue;

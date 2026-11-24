@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { loadConfig, parseConfig, timeoutMillis } from './core/config.js';
-import { latestComparison, listRunIds, loadRun, type RunRecord } from './core/store.js';
+import { latestComparison, listRunIds, loadRun, type CallRecord, type RunRecord } from './core/store.js';
 import { synthesisFormatter } from './core/synth.js';
 import { detectTargets } from './core/targets.js';
 import type { InteractionResponse, PendingInteraction } from './core/types.js';
@@ -68,7 +68,7 @@ exec 选项:
   targets: { "fast": { "provider": "codex", "model": "<模型名>" } }
   providers: ["fast", "gemini-pro"]；concurrency: 3。
   custom 端点和命令仅从用户配置加载，详见 README。
-  disableClaude: true 完全禁用 Claude Code，包括版本检测。
+  在 ~/.unify/config.json 中设置 disableClaude: true 可全局禁用 Claude Code，包括版本检测。
   TUI: /settings /models /quota /synth /cancel [目标] /retry [目标] /exec /new /copy /exit /quit。
 `;
 
@@ -91,19 +91,22 @@ async function readStdin(): Promise<string> {
 function renderer(json: boolean, reasoning = false) {
     let view: FanOutView | undefined
     let hasText = false;
+    const titles: Partial<Record<CallRecord['scope'], string>> = {
+        synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核',
+    };
     return {
         event(event: WorkflowEvent) {
             if (json) { process.stdout.write(JSON.stringify({ schemaVersion: 2, ...event }) + '\n'); return; }
             if (event.type === 'stage' && event.stage === 'answering') {
                 view = new FanOutView(Object.fromEntries(event.targets.map((t) => [t.id, t.label])));
                 view.start();
-            } else if (event.type === 'call' && (event.scope === 'synthesis' || event.scope === 'exec')) {
+            } else if (event.type === 'call' && titles[event.scope]) {
                 view?.stop();
                 hasText = false;
-                header(`${event.scope === 'synthesis' ? '汇总' : '实施'} · ${event.target.label}`);
+                header(`${titles[event.scope]} · ${event.target.label}`);
             } else if (event.type === 'provider') {
                 if (event.scope === 'answer') view?.onEvent(event.targetId, event.event);
-                else if (event.scope !== 'decision') {
+                else if (titles[event.scope]) {
                     if (event.event.type === 'delta') hasText = true;
                     if (event.event.type === 'done' && !hasText) process.stdout.write(event.event.text);
                     streamEvent(event.event, reasoning);
@@ -228,7 +231,7 @@ async function cmdExec(argv: string[]): Promise<number> {
     const run = positionals[0] ? loadRun(cwd, positionals[0]) : latestComparison(cwd);
     const plan = selectPlan(run, values.from);
     const targets = Object.values(buildRegistry(config));
-    const executor = chooseExecutor(targets, values.with ?? config.executor, await detectTargets(targets, abort.signal));
+    const executor = chooseExecutor(targets, values.with ?? run.collaboration?.execution.target ?? config.executor, await detectTargets(targets, abort.signal));
     process.stdout.write(`${bold('即将实施')}\n  记录: ${run.id}\n  需求: ${run.question.slice(0, 120).replace(/\s+/g, ' ')}\n  方案: ${plan.source.targetId} (${plan.source.scope})\n  执行: ${executor.label}\n  目录: ${cwd}\n`);
     if (!values.yes) {
         if (!process.stdin.isTTY) throw new Error('非交互环境需要 --yes 确认');
@@ -354,7 +357,8 @@ async function cmdMemory(args: string[]): Promise<number> {
 
 function show(run: RunRecord): void {
     process.stdout.write(`${bold(run.id)} · ${run.status}\n\n${run.question}\n`);
-    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : [])]) {
+    const reviews = run.calls.filter(c => c.scope === 'plan-review' || c.scope === 'result-review');
+    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...reviews.map(c => c.result)]) {
         header(`${r.targetId} (${r.provider}${r.model ? ` / ${r.model}` : ''})`, `${r.status} · ${secs(r.durationMs)}`);
         const text = r === run.synthesis?.result ? synthesisFormatter(run)(r.text) : r.text;
         process.stdout.write(text + formatMemoryReferences(r.memoryReferences) + '\n');

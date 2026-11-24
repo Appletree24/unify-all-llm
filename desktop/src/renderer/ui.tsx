@@ -3,6 +3,7 @@ import type { QuotaReading } from '../../../src/quota/types.js';
 import type { RunRecord, RunResultRecord } from '../shared/api.js';
 import { unify } from './api.js';
 import { renderMarkdown } from './markdown.js';
+import type { Token } from 'marked';
 
 // ── icons ─────────────────────────────────────────────────────────────────
 const paths: Record<string, ReactNode> = {
@@ -132,13 +133,19 @@ export function quotaSummary(
 }
 
 // ── components ────────────────────────────────────────────────────────────
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
+export const Markdown = memo(function Markdown({ text }: { text: string | Token }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
+  return <MarkdownBody html={html} />;
+});
+
+export function MarkdownBody({ html, onCitation }: { html: string; onCitation?(index: number): void }) {
   return (
     <div
       className="md"
       dangerouslySetInnerHTML={{ __html: html }}
       onClick={(e) => {
+        const citation = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-unify-citation]');
+        if (citation && onCitation) { onCitation(Number(citation.dataset.unifyCitation)); return; }
         const button = (e.target as HTMLElement).closest('.code-copy');
         if (!button) return;
         const code = button.closest('.code')?.querySelector('code')?.textContent ?? '';
@@ -149,7 +156,7 @@ export const Markdown = memo(function Markdown({ text }: { text: string }) {
       }}
     />
   );
-});
+}
 
 /** Re-render on a timer while something is running, for elapsed-time labels. */
 export function useTicker(active: boolean, ms = 1000): number {

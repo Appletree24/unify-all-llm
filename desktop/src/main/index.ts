@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicWrite } from '../../../src/core/atomic-write.js';
+import { readAgyModels } from '../../../src/providers/models.js';
 import { collectQuotaReminders, type QuotaReminderHistory } from '../../../src/quota/reminders.js';
 import type { ComposerSelection, Method, OpenedWorkspace, Push, QuotaNotice, Reply, TargetQuota, UnifyApi } from '../shared/api.js';
 import { prepareProviderPath } from './env.js';
@@ -24,10 +25,11 @@ interface State {
 
 function parseComposerSelection(value: unknown): ComposerSelection | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const { selected, synth } = value as Record<string, unknown>;
+  const { selected, synth, graph } = value as Record<string, unknown>;
   if (selected !== undefined && (!Array.isArray(selected) || selected.some((id) => typeof id !== 'string'))) return undefined;
   if (synth !== undefined && typeof synth !== 'string') return undefined;
-  return { selected: selected && [...new Set(selected)], synth };
+  if (graph !== undefined && typeof graph !== 'string') return undefined;
+  return { selected: selected && [...new Set(selected)], synth, graph };
 }
 
 function readState(): State {
@@ -225,11 +227,14 @@ const api: UnifyApi = {
   async benchPublish(cwd, data, judge, options) { return currentWorkspace(cwd).benchPublish(data, judge, options); },
   async benchRun(cwd, ids, targets, judge, collection) { return currentWorkspace(cwd).benchRun(ids, targets, judge, collection); },
   async previewExec(turnId, from, executor) { return need().previewExec(turnId, from, executor); },
+  async closeCollaboration(turnId) { need().closeCollaboration(turnId); },
   async exec(turnId, from, executor) { return need().exec(turnId, from, executor); },
   async quota(force) { return need().quota(force); },
   async settings() { return need().settings(); },
+  async agyModels(cwd) { return readAgyModels(currentWorkspace(cwd).cwd); },
   async testTarget(id) { return need().testTarget(id); },
   async setSetting(key, value, entry) { return need().setSetting(key, value, entry); },
+  async saveCollaboration(cwd, id, graph) { currentWorkspace(cwd).setSetting('collaborationGraphs', graph, id); },
   async saveApi(id, model, apiKey) { return need().saveApi(id, model, apiKey); },
   async memoryUrl() { return need().memoryUrl(); },
   async prepareDistill(source) { return need().prepareDistill(source); },

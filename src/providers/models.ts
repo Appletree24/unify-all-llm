@@ -2,7 +2,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { readJson } from '../core/config.js';
+import { runText } from '../core/proc.js';
 import type { ModelTarget } from '../core/types.js';
+import { parseAgyModels } from './agy-models.js';
 import { officialApis } from './official.js';
 
 // Text models for each transport. The CLI and HTTP catalogs differ even for the same vendor.
@@ -18,6 +20,13 @@ const modelsByProvider: Readonly<Record<string, readonly string[]>> = {
 const codexCache = z.object({
   models: z.array(z.object({ slug: z.string().regex(/^\S+$/), visibility: z.string() })),
 });
+
+export async function readAgyModels(cwd: string) {
+  let output = '';
+  const opts = { cwd, nativeExecutable: true, signal: AbortSignal.timeout(20_000) };
+  for await (const chunk of runText('agy', ['models'], opts)) output += chunk;
+  return parseAgyModels(output);
+}
 
 export function modelIds(provider: string, configured: readonly string[] = []): string[] {
   let ids = Object.hasOwn(modelsByProvider, provider) ? modelsByProvider[provider] : [];

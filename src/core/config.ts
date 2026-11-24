@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { collaborationSchema } from './collaboration.js';
 
 const id = z.string().regex(/^[a-z][\w-]*$/i).refine((s) => !['__proto__', 'constructor', 'prototype'].includes(s), '保留名称');
 const text = z.string().trim().min(1);
@@ -30,6 +31,7 @@ const schema = z.strictObject({
   disableClaude: z.boolean().optional(),
   providers: z.array(id).min(1).refine((a) => new Set(a).size === a.length, '目标不能重复').optional(),
   synthesizer: id.optional(), executor: id.optional(), decider: id.optional(),
+  collaborationGraphs: z.record(id, collaborationSchema).optional(),
   reasoningEffort: z.record(id, z.union([effortSchema, z.literal('default')])).optional(),
   models: z.record(id, text).optional(),
   targets: z.record(id, z.strictObject({ provider: id, model: text.optional(), reasoningEffort: effortSchema.optional(), label: text.optional() })).optional(),
@@ -57,7 +59,6 @@ export function readJson(path: string): unknown {
   }
 }
 
-/** Custom transports are trusted only from the user config. Disable is monotonic. */
 export function loadConfig(cwd: string): Config {
   const userPath = join(homedir(), '.unify', 'config.json');
   const projectPath = join(cwd, 'unify.config.json');
@@ -77,9 +78,10 @@ export function mergeConfig(user: Config, project: Config): Config {
   } : undefined;
   return removeRetiredGemini({
     ...user, ...project, custom: user.custom, quotaCommands: user.quotaCommands,
-    disableClaude: user.disableClaude === true || project.disableClaude === true,
+    disableClaude: user.disableClaude ?? false,
     reasoningEffort: { ...user.reasoningEffort, ...project.reasoningEffort },
     models: { ...user.models, ...project.models }, targets: { ...user.targets, ...project.targets },
+    ...(user.collaborationGraphs || project.collaborationGraphs ? { collaborationGraphs: { ...user.collaborationGraphs, ...project.collaborationGraphs } } : {}),
     ...(memory && Object.keys(memory).length ? { memory } : {}),
   });
 }

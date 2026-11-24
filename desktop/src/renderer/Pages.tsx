@@ -1,8 +1,10 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { QUOTA_LOW_PERCENT, QUOTA_RESET_NOTICE_MINUTES } from '../../../src/quota/reminders.js';
+import { isAgyProvider, modelSettings, type AgyModel } from '../../../src/providers/agy-models.js';
 import type { ApiInfo, Config, SettingsInfo, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { Icon, Spinner, Switch, ago, hue, until } from './ui.js';
+import { CollaborationGraph } from './CollaborationGraph.js';
 
 type Notify = (msg: string, kind?: 'ok' | 'err') => void;
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -16,7 +18,7 @@ export function Welcome({ onOpen }: { onOpen(dir?: string): void }) {
       <div className="welcome-inner">
         <div className="logo"><Icon name="spark" size={22} /></div>
         <h1>Unify</h1>
-        <p className="lede">把同一个问题发给多个模型，并排比较回答，匿名汇总，再选一个方案实施。</p>
+        <p className="lede">选择项目，开启多模型协作</p>
         <button className="btn primary big" onClick={() => onOpen()}><Icon name="folder" />打开项目文件夹</button>
         {recent.length > 0 && (
           <div className="recent">
@@ -102,20 +104,19 @@ export function MemoryPage({ cwd, notify }: { cwd: string; notify: Notify }) {
 }
 
 // ── settings ──────────────────────────────────────────────────────────────
-function Section({ title, note, children }: { title: string; note?: ReactNode; children: ReactNode }) {
+function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="set-section">
       <h2>{title}</h2>
-      {note && <p className="set-note">{note}</p>}
       <div className="set-rows">{children}</div>
     </section>
   );
 }
 
-function Row({ label, hint, children }: { label: ReactNode; hint?: ReactNode; children: ReactNode }) {
+function Row({ label, status, children }: { label: ReactNode; status?: string; children: ReactNode }) {
   return (
     <div className="set-row">
-      <div className="set-label"><div>{label}</div>{hint && <small>{hint}</small>}</div>
+      <div className="set-label"><div>{label}</div>{status && <small>{status}</small>}</div>
       <div className="set-control">{children}</div>
     </div>
   );
@@ -129,25 +130,6 @@ function NumberField({ value, fallback, onSave }: { value?: number; fallback: nu
     if (next !== value) onSave(next);
   };
   return <input className="num" inputMode="numeric" value={draft} placeholder={String(fallback)} onChange={(e) => setDraft(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }} />;
-}
-
-function JsonField({ value, onSave }: { value: unknown; onSave(v: unknown): void }) {
-  const initial = value === undefined ? '' : JSON.stringify(value, null, 2);
-  const [draft, setDraft] = useState(initial);
-  const [error, setError] = useState('');
-  useEffect(() => setDraft(initial), [initial]);
-  return (
-    <div className="json-field">
-      <textarea value={draft} spellCheck={false} rows={Math.min(14, Math.max(3, draft.split('\n').length))} placeholder="{}" onChange={(e) => { setDraft(e.target.value); setError(''); }} />
-      <div className="json-acts">
-        {error && <span className="err-text">{error}</span>}
-        <button className="btn" disabled={draft === initial} onClick={() => {
-          try { onSave(draft.trim() ? JSON.parse(draft) : undefined); }
-          catch { setError('不是有效的 JSON'); }
-        }}>保存</button>
-      </div>
-    </div>
-  );
 }
 
 function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceInfo): void; notify: Notify }) {
@@ -180,11 +162,10 @@ function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceI
               {api.models.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           </label>
-          <label>API Key
+          <label title={`~/.unify/api/${api.id}.json · ${api.baseUrl}`}>API Key（本地明文保存）
             <input type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" spellCheck={false}
               placeholder={api.hasKey ? '留空沿用已保存的密钥' : api.envKey ? `留空使用 ${api.apiKeyEnv}` : '粘贴密钥'} />
           </label>
-          <p className="set-note">密钥以明文保存在 ~/.unify/api/{api.id}.json（POSIX 权限 0600）。{api.baseUrl}</p>
           <div className="json-acts"><button className="btn primary" disabled={busy || !model}>保存</button></div>
         </form>
       )}
@@ -192,8 +173,24 @@ function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceI
   );
 }
 
-export function SettingsPage({ ws, onChange, notify }: { ws: WorkspaceInfo; onChange(ws: WorkspaceInfo): void; notify: Notify }) {
+export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: WorkspaceInfo; onChange(ws: WorkspaceInfo): void; notify: Notify; initialGraph?: string }) {
+  const [tab,setTab] = useState(initialGraph === undefined ? 'general' : 'collaboration');
   const [info, setInfo] = useState<SettingsInfo>();
+  const [agyCatalog, setAgyCatalog] = useState<AgyModel[]>();
+  const [agyError, setAgyError] = useState('');
+  const [agyAttempt, setAgyAttempt] = useState(0);
+  const hasAgy = ws.targets.some(t => isAgyProvider(t.provider, t.askPolicy) && t.installed !== false);
+  useEffect(() => {
+    if (!hasAgy) return;
+    let active = true;
+    setAgyCatalog(undefined);
+    setAgyError('');
+    void unify.agyModels(ws.cwd).then(
+      models => { if (active) setAgyCatalog(models); },
+      err => { if (active) setAgyError(errText(err)); },
+    );
+    return () => { active = false; };
+  }, [ws.cwd, hasAgy, agyAttempt]);
   const load = () => unify.settings().then(setInfo, (err) => notify(errText(err), 'err'));
   useEffect(() => { void load(); }, [ws]);
 
@@ -213,46 +210,57 @@ export function SettingsPage({ ws, onChange, notify }: { ws: WorkspaceInfo; onCh
       <header className="page-head">
         <div>
           <h1>设置</h1>
-          <p className="lede">常用设置写入当前项目的 unify.config.json，从下一次提问生效。API 凭证、自定义端点和额度命令保存在用户目录。</p>
         </div>
       </header>
       {ws.configError && <div className="error block"><Icon name="alert" size={14} /><span>{ws.configError}</span></div>}
+      <nav className="cg-templates" aria-label="设置分类">
+        <button aria-pressed={tab === 'general'} onClick={() => setTab('general')}>通用设置</button>
+        <button aria-pressed={tab === 'collaboration'} onClick={() => setTab('collaboration')}>组合模版</button>
+      </nav>
+      {tab === 'collaboration' ? <CollaborationGraph key={ws.cwd} ws={ws} initial={initialGraph} notify={notify} connect={() => setTab('general')} /> : <>
 
-      <Section title="官方 API" note="接入后即可直接提问，不需要安装模型 CLI。">
+      <Section title="官方 API">
         {info.apis.map((api) => <ApiRow key={api.id} api={api} notify={notify} onSaved={(next) => { onChange(next); void load(); }} />)}
       </Section>
 
-      <Section title="模型与思考强度" note="「默认」让底层服务或 CLI 决定思考强度。测试会按已保存的配置发送一次简短提问。">
-        {ws.targets.map((t) => (
-          <div key={t.id} className="model-setting">
-            <Row label={<span className="target-label" style={{ '--h': hue(t.id) } as CSSProperties}><i className="dot" />{t.label}<code>{t.id}</code></span>}
-              hint={t.installed === false ? '未检测到' : t.exec ? '可回答 · 可实施' : '只回答'}>
-              <select value={t.modelOverride ?? ''} onChange={(e) => void save('models', e.target.value || undefined, t.id)}>
-                <option value="">继承配置{t.model && !t.modelOverride ? `（${t.model}）` : ''}</option>
-                {t.models.map((m) => <option key={m} value={m}>{m}</option>)}
-              </select>
-              <select value={t.reasoningEffort ?? 'default'} disabled={!t.efforts.length} title={t.efforts.length ? '' : '此模型或接口未提供可配置的思考档位'}
-                onChange={(e) => void save('reasoningEffort', e.target.value, t.id)}>
-                <option value="default">{t.efforts.length ? '默认强度' : '不支持'}</option>
-                {t.efforts.map((x) => <option key={x} value={x}>{x}</option>)}
-              </select>
-              <button className="btn" disabled={t.test?.status === 'testing' || !!ws.configError}
-                aria-label={`测试 ${t.label}（${t.id}）可用性`}
-                onClick={() => void unify.testTarget(t.id).catch(err => notify(errText(err), 'err'))}>
-                {t.test?.status === 'testing' ? <><Spinner />测试中…</> : '测试可用性'}
-              </button>
-            </Row>
-            {t.test && t.test.status !== 'testing' && (
-              <p role="status" className={t.test.status === 'passed' ? 'ok-text' : 'err-text'}>
-                {t.test.status === 'failed' && '测试失败 · '}{t.test.message}
-              </p>
-            )}
-          </div>
-        ))}
+      <Section title="模型与思考强度">
+        {ws.targets.map((t) => {
+          const agy = isAgyProvider(t.provider, t.askPolicy);
+          const options = modelSettings(t, agy ? agyCatalog ?? [] : undefined);
+          const loading = agy && t.installed !== false && !agyCatalog && !agyError;
+          const modelOverride = agy ? info.project.models?.[t.id] : t.modelOverride;
+          return (
+            <div key={t.id} className="model-setting">
+              <Row label={<span className="target-label" style={{ '--h': hue(t.id) } as CSSProperties}><i className="dot" />{t.label}<code>{t.id}</code></span>}
+                status={t.installed === false ? '未检测到' : undefined}>
+                <select aria-label={t.label + ' 模型'} disabled={loading} value={modelOverride ?? ''} onChange={(e) => void save('models', e.target.value || undefined, t.id)}>
+                  <option value="">继承配置{t.model && !modelOverride ? `（${t.model}）` : ''}</option>
+                  {options.models.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                </select>
+                <select aria-label={t.label + ' 思考强度'} value={options.effortValue} disabled={!options.efforts.length}
+                  onChange={(e) => void save(options.effortField, e.target.value, t.id)}>
+                  {!options.efforts.length && <option value={options.effortValue}>{loading ? '加载中…' : options.storedEffort ?? (agyError && agy ? '未获取' : '无档位')}</option>}
+                  {options.efforts.map(e => <option key={e.value} value={e.value}>{e.label}</option>)}
+                </select>
+                {agy && agyError && t.installed !== false && <button className="btn" title={agyError} onClick={() => setAgyAttempt(n => n + 1)}>重试模型列表</button>}
+                <button className="btn" disabled={t.test?.status === 'testing' || !!ws.configError}
+                  aria-label={`测试 ${t.label}（${t.id}）可用性`}
+                  onClick={() => void unify.testTarget(t.id).catch(err => notify(errText(err), 'err'))}>
+                  {t.test?.status === 'testing' ? <><Spinner />测试中…</> : '测试可用性'}
+                </button>
+              </Row>
+              {t.test && t.test.status !== 'testing' && (
+                <p role="status" className={t.test.status === 'passed' ? 'ok-text' : 'err-text'}>
+                  {t.test.status === 'failed' && '测试失败 · '}{t.test.message}
+                </p>
+              )}
+            </div>
+          );
+        })}
       </Section>
 
       <Section title="回答、汇总与执行">
-        <Row label="默认回答目标" hint={providers ? '固定为下面勾选的目标' : '自动：所有可用目标（不含决策模型）'}>
+        <Row label="默认回答目标">
           <Switch label="自动选择" checked={!providers} onChange={(auto) => void save('providers', auto ? undefined : ws.defaults.length ? ws.defaults : ws.targets.slice(0, 1).map((t) => t.id))} />
         </Row>
         {providers && (
@@ -268,8 +276,8 @@ export function SettingsPage({ ws, onChange, notify }: { ws: WorkspaceInfo; onCh
             ))}
           </div>
         )}
-        {([['synthesizer', '汇总模型', '汇总多个回答；不可用时使用第一个成功的回答目标'], ['executor', '执行模型', '按方案修改文件，只能选择支持实施的目标'], ['decider', '决策模型', '决定每轮由哪些目标回答、是否汇总']] as const).map(([key, title, hint]) => (
-          <Row key={key} label={title} hint={hint}>
+        {([['synthesizer', '汇总模型'], ['executor', '执行模型'], ['decider', '决策模型']] as const).map(([key, title]) => (
+          <Row key={key} label={title}>
             <select value={cfg[key] ?? ''} onChange={(e) => void save(key, e.target.value || undefined)}>
               <option value="">{key === 'decider' ? '不使用' : '默认'}</option>
               {ws.targets.filter((t) => key !== 'executor' || t.exec).map((t) => <option key={t.id} value={t.id}>{label(t.id)}</option>)}
@@ -278,22 +286,24 @@ export function SettingsPage({ ws, onChange, notify }: { ws: WorkspaceInfo; onCh
         ))}
       </Section>
 
-      <Section title="并发与超时" note="留空恢复默认值。">
+      <Section title="并发与超时">
         {([['concurrency', '回答并发数', 3], ['timeoutSec', '回答与汇总超时（秒）', 600], ['decisionTimeoutSec', '决策超时（秒）', 60], ['execTimeoutSec', '执行超时（秒）', 3600]] as const).map(([key, title, fallback]) => (
           <Row key={key} label={title}><NumberField value={cfg[key]} fallback={fallback} onSave={(v) => void save(key, v)} /></Row>
         ))}
       </Section>
 
       <Section title="界面">
-        <Row label="显示思考过程" hint="生成时默认展开模型的思考内容"><Switch label="显示思考过程" checked={cfg.showReasoning ?? false} onChange={(v) => void save('showReasoning', v)} /></Row>
+        <Row label="显示思考过程"><Switch label="显示思考过程" checked={cfg.showReasoning ?? false} onChange={(v) => void save('showReasoning', v)} /></Row>
       </Section>
 
-      <Section title="高级" note={<>目标别名写入项目配置；自定义端点与额度命令只从用户配置加载。<button className="link" onClick={() => void unify.reveal('project-config')}>项目配置文件</button><button className="link" onClick={() => void unify.reveal('user-config')}>用户配置文件</button></>}>
-        <Row label="禁用 Claude Code" hint="包括版本检测和基于 Claude 的目标"><Switch label="禁用 Claude Code" checked={cfg.disableClaude ?? false} onChange={(v) => void save('disableClaude', v)} /></Row>
-        <div className="set-block"><div className="set-label"><div>目标别名 <code>targets</code></div><small>同一个 provider 可以配置多个模型或思考强度</small></div><JsonField value={info.project.targets} onSave={(v) => void save('targets', v)} /></div>
-        <div className="set-block"><div className="set-label"><div>自定义端点与命令 <code>custom</code></div><small>OpenAI 兼容端点或本地命令，仅用户配置</small></div><JsonField value={info.user.custom} onSave={(v) => void save('custom', v)} /></div>
-        <div className="set-block"><div className="set-label"><div>额度查询命令 <code>quotaCommands</code></div><small>按 provider id 配置，仅用户配置</small></div><JsonField value={info.user.quotaCommands} onSave={(v) => void save('quotaCommands', v)} /></div>
+      <Section title="高级">
+        <Row label="配置文件">
+          <button className="btn" onClick={() => void unify.reveal('project-config')}>项目配置</button>
+          <button className="btn" onClick={() => void unify.reveal('user-config')}>用户配置</button>
+        </Row>
+        <Row label="全局禁用 Claude Code"><Switch label="全局禁用 Claude Code" checked={cfg.disableClaude ?? false} onChange={(v) => void save('disableClaude', v)} /></Row>
       </Section>
+      </>}
     </div>
   );
 }

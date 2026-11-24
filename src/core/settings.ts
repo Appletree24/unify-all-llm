@@ -7,8 +7,7 @@ import type { ModelTarget } from './types.js';
 import { buildRegistry } from '../providers/index.js';
 
 export type SettingField = keyof Config;
-/** Transports and quota commands run local code, so they are trusted only from the user layer. */
-export const userField = (field: SettingField) => field === 'custom' || field === 'quotaCommands';
+export const userField = (field: SettingField) => field === 'custom' || field === 'quotaCommands' || field === 'disableClaude';
 export const userConfigPath = () => join(homedir(), '.unify', 'config.json');
 export const projectConfigPath = (cwd: string) => join(cwd, 'unify.config.json');
 
@@ -25,7 +24,6 @@ export function writeSetting(cwd: string, key: SettingField, value: unknown, ent
     if (value === undefined) delete map[entry];
     value = Object.keys(map).length ? map : undefined;
   }
-  if (key === 'disableClaude' && user.disableClaude && value === false) throw new Error('Claude Code 已在 ~/.unify/config.json 中禁用');
   const next = parseConfig({ ...original, [key]: value });
   const cfg = global ? mergeConfig(next, project) : mergeConfig(user, next);
   const targets = Object.values(buildRegistry(cfg));

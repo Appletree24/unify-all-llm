@@ -269,10 +269,10 @@ export class App {
   private workflowEvent(ev: WorkflowEvent): void {
     if (ev.type === 'stage' && ev.stage === 'answering') {
       this.panes = ev.targets.map((t) => this.newPane(t.id, 'answer', t.label, this.colorOf(t.id)));
-    } else if (ev.type === 'call' && ev.scope === 'synthesis') {
-      this.synth = this.newPane(ev.target.id, 'synth', `汇总 · ${ev.target.label}`, GOLD);
+    } else if (ev.type === 'call' && (ev.scope === 'synthesis' || ev.scope === 'plan-review')) {
+      this.synth = this.newPane(ev.target.id, 'synth', `${ev.scope === 'plan-review' ? '方案复核' : '汇总'} · ${ev.target.label}`, GOLD);
     } else if (ev.type === 'provider') {
-      const pane = ev.scope === 'answer' ? this.panes.find((p) => p.id === `a:${ev.targetId}`) : ev.scope === 'synthesis' ? this.synth : ev.scope === 'exec' ? this.exec : undefined;
+      const pane = ev.scope === 'answer' ? this.panes.find((p) => p.id === `a:${ev.targetId}`) : ev.scope === 'synthesis' || ev.scope === 'plan-review' ? this.synth : ev.scope === 'exec' ? this.exec : undefined;
       if (pane) this.apply(pane, ev.event);
     } else if (ev.type === 'notice') this.say(ev.message);
     this.requestRender();
@@ -320,10 +320,10 @@ export class App {
     if (!run) return this.say('还没有可实施的方案：先提一个问题', YELLOW);
 
     const focused = this.panes.find((p) => p.id === this.focus);
-    const from = focused?.id.slice(2);
+    const from = run.collaboration ? undefined : focused?.id.slice(2);
     try {
       const plan = selectPlan(run, from);
-      const chosen = chooseExecutor(this.all, executorId ?? this.cfg.executor, this.installed);
+      const chosen = chooseExecutor(this.all, executorId ?? run.collaboration?.execution.target ?? this.cfg.executor, this.installed);
       this.confirm = {
         text: `按 y 确认 · 其他键取消 — 让 ${chosen.label} 按「${plan.source.targetId}」修改 ${basename(this.cwd)}/ 下的文件`,
         yes: () => void this.runExec(chosen, run, from),
@@ -342,7 +342,10 @@ export class App {
     try {
       this.active = startExecution({
         cwd: this.cwd, config: this.cfg, targets: this.all, executor, source, from, signal: ctl.signal,
-        onEvent: (ev) => { if (ev.type === 'provider') this.apply(pane, ev.event); },
+        onEvent: (ev) => {
+          if (ev.type === 'call' && ev.scope === 'result-review') this.exec = this.newPane(ev.target.id, 'exec', `实施复核 · ${ev.target.label}`, GOLD);
+          if (ev.type === 'provider') this.apply(ev.scope === 'result-review' ? this.exec! : pane, ev.event);
+        },
       });
       this.lastExecution = await this.active.done;
       this.addUsage(this.lastExecution);
@@ -397,7 +400,8 @@ export class App {
   }
 
   private addUsage(run: RunRecord): void {
-    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : [])]) {
+    const supporting = run.calls.filter(c => ['plan-review', 'result-review', 'dispute-assessment', 'source-check'].includes(c.scope));
+    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...supporting.map(c => c.result)]) {
       this.tokens.input += r.usage?.inputTokens ?? 0;
       this.tokens.output += r.usage?.outputTokens ?? 0;
     }
@@ -532,6 +536,7 @@ export class App {
           }, () => { this.api = undefined; });
         },
         () => { this.settings = undefined; },
+        () => this.requestRender(),
       );
     }
     else if (name === 'bench') {

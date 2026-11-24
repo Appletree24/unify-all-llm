@@ -21,7 +21,9 @@ export function displaySynthesisEvents(render: (event: WorkflowEvent) => void) {
       const text = pending[part.type] + part.text;
       const start = text.lastIndexOf('[');
       const tail = start < 0 ? '' : text.slice(start);
-      const incomplete = tail && labels.some((label) => label !== tail && label.startsWith(tail));
+      const passagePrefix = /^\[ref:(\d+)#\d*$/.exec(tail);
+      const incomplete = tail && (labels.some((label) => label !== tail && label.startsWith(tail))
+        || !!passagePrefix && labels.includes(`[ref:${passagePrefix[1]}]`));
       pending[part.type] = incomplete ? tail : '';
       const ready = incomplete ? text.slice(0, start) : text;
       if (ready) render({ ...event, event: { type: part.type, text: format(ready) } });

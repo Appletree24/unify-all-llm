@@ -20,7 +20,7 @@ import swift from 'highlight.js/lib/languages/swift';
 import typescript from 'highlight.js/lib/languages/typescript';
 import xml from 'highlight.js/lib/languages/xml';
 import yaml from 'highlight.js/lib/languages/yaml';
-import { Marked } from 'marked';
+import { Marked, type Token } from 'marked';
 
 const languages = { bash, c, cpp, csharp, css, diff, go, java, javascript, json, kotlin, markdown, powershell, python, rust, sql, swift, typescript, xml, yaml };
 for (const [name, lang] of Object.entries(languages)) hljs.registerLanguage(name, lang);
@@ -49,7 +49,7 @@ const marked = new Marked({
 });
 
 /** Model output is untrusted: render Markdown, then sanitize before it touches the DOM. */
-export function renderMarkdown(text: string): string {
-  const html = marked.parse(text, { async: false });
-  return DOMPurify.sanitize(html, { FORBID_TAGS: ['style', 'form', 'input', 'iframe'], FORBID_ATTR: ['style'] });
+export function renderMarkdown(text: string | Token): string {
+  const html = typeof text === 'string' ? marked.parse(text, { async: false }) : marked.parser([text]);
+  return DOMPurify.sanitize(html, { FORBID_TAGS: ['style', 'form', 'input', 'iframe'], FORBID_ATTR: ['style', 'data-unify-citation'] });
 }

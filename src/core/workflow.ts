@@ -3,11 +3,13 @@ import { hostname } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config.js';
 import { timeoutMillis } from './config.js';
+import { graphIssue, graphPlanResult, graphStages, type Collaboration } from './collaboration.js';
 import { resolveSharedFileContext } from './context.js';
 import { buildDecisionPrompt, parseDecision } from './decider.js';
 import { fanOut, runOne } from './orchestrator.js';
 import { createRun, exportRun, historyAfter, latestExecutionFor, newRunId, saveRun, type CallRecord, type PlanSource, type RunRecord } from './store.js';
-import { anonymize, buildApiMessages, buildConversationPrompt, buildExecPrompt, buildSynthesisInput, buildSynthesisInstructions, buildSynthesisPrompt, buildTurnUserContent, extractFinalPlan, synthesisFormatter } from './synth.js';
+import { anonymize, buildApiMessages, buildConversationPrompt, buildExecPrompt, buildSynthesisInput, buildSynthesisInstructions, buildTurnUserContent, extractFinalPlan, synthesisFormatter } from './synth.js';
+import { confirmedExcerpts, decideSourceCheck, sourceCheckPrompt, sourceCheckRequest, type SourceCheck } from './source-check.js';
 import { appendToolUse, snapshotTarget, type ChatMessage, type InteractionHandler, type InteractionRequest, type InteractionResponse, type ModelTarget, type PendingInteraction, type ProviderEvent, type RunResult, type TargetSnapshot } from './types.js';
 import { defaultTargetIds, detectTargets } from './targets.js';
 import { memoryReportMarker, requestMemoryReport } from '../memory/report.js';
@@ -37,6 +39,8 @@ interface CommonOptions {
 }
 export interface ComparisonOptions extends CommonOptions {
   question: string;
+  collaboration?: Collaboration;
+  collaborationTargets?: TargetSnapshot[];
   selected?: string[];
   manualSelection?: boolean;
   synthesize?: boolean;
@@ -241,18 +245,16 @@ class Journal {
     scope: Scope,
     input: string | PreparedInput,
     timeoutMs: number,
-    synthesisMeta?: { labels: Record<string, string>; preferredProvider?: string; fallback?: boolean; alsoAnswered?: boolean },
+    synthesisMeta?: Omit<NonNullable<RunRecord['synthesis']>, 'provider' | 'result'>,
   ): Promise<CallRecord> {
     const call = this.prepare(target, scope, input, timeoutMs);
     if (scope === 'exec') this.record.results.push(call.result);
     if (scope === 'synthesis') {
       this.record.synthesis = {
         provider: target.id,
-        labels: synthesisMeta?.labels ?? {},
+        labels: {},
         result: call.result,
-        ...(synthesisMeta?.preferredProvider ? { preferredProvider: synthesisMeta.preferredProvider } : {}),
-        ...(synthesisMeta?.fallback !== undefined ? { fallback: synthesisMeta.fallback } : {}),
-        ...(synthesisMeta?.alsoAnswered !== undefined ? { alsoAnswered: synthesisMeta.alsoAnswered } : {}),
+        ...synthesisMeta,
       };
     }
     this.checkpoint();
@@ -262,7 +264,7 @@ class Journal {
       ...call.input,
       messages: this.messagesFor(call.id),
       memoryReportMarker: call.input.memoryReportMarker,
-      interact: this.interactorFor(call),
+      interact: scope === 'source-check' || scope === 'dispute-assessment' ? undefined : this.interactorFor(call),
       runId: call.id, signal: this.ctl.signal, onEvent: (_id, event) => this.event(call, event),
     }));
     this.checkpoint();
@@ -273,7 +275,8 @@ class Journal {
     try {
       await work();
       this.assertWritable();
-      const results = [...this.record.results, ...(this.record.synthesis ? [this.record.synthesis.result] : [])];
+      const reviews = this.record.calls.filter(c => c.scope === 'plan-review' || c.scope === 'result-review');
+      const results = [...this.record.results, ...(this.record.synthesis ? [this.record.synthesis.result] : []), ...reviews.map(c => c.result)];
       this.record.status = this.ctl.signal.aborted ? 'cancelled'
         : results.length && results.every((r) => r.ok) ? 'completed'
         : results.some((r) => r.ok) ? 'partial' : 'failed';
@@ -312,11 +315,28 @@ function initialRecord(opts: CommonOptions, question: string, previous?: RunReco
   };
 }
 
+function recordedTarget(target: ModelTarget, saved?: TargetSnapshot): ModelTarget {
+  if (!saved) return target;
+  if (target.adapter.id !== saved.provider || !isDeepStrictEqual(target.adapter.configuration, saved.configuration)) {
+    throw new Error(`目标 ${target.id} 的接入配置已改变，请重新发起协作`);
+  }
+  return { ...target, label: saved.label, model: saved.model, reasoningEffort: saved.reasoningEffort };
+}
+
 /** CLI and TUI share routing, fallbacks, context, cancellation, and persistence. */
 export function startComparison(opts: ComparisonOptions): WorkflowHandle {
   const question = opts.retry?.record.question ?? opts.question.trim();
   if (!question) throw new Error('问题不能为空');
   const record = initialRecord(opts, question, opts.retry ? undefined : opts.previous, opts.retry ? undefined : opts.continueFrom);
+  const graph = opts.collaboration ?? opts.retry?.record.collaboration;
+  if (graph) {
+    record.collaboration = structuredClone(graph);
+    const ids = new Set(graphStages(graph).flatMap(step => step === 'confirm' ? [] : step === 'plan' ? graph.plans.map(p => p.target) : [graph[step]!.target]));
+    const previousTargets = opts.collaborationTargets ?? opts.retry?.record.collaborationTargets;
+    opts = { ...opts, targets: opts.targets.map(t => recordedTarget(t, previousTargets?.find(s => s.id === t.id))) };
+    record.collaborationTargets = opts.targets.filter(t => ids.has(t.id)).map(snapshotTarget);
+  }
+  const plannerInstruction = graph ? '\n\n请与用户讨论并制定具体可实施的方案。列出已经确定的行为、约束和待确认的取舍。当前阶段只交付方案。' : '';
   if (opts.retry) {
     if (opts.retry.record.kind !== 'comparison') throw new Error('实施记录不能自动重试');
     record.input = structuredClone(opts.retry.record.input);
@@ -325,7 +345,7 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     record.parentTurnId = opts.retry.record.parentTurnId;
     record.retryOf = opts.retry.record.id;
   }
-  const selected = opts.retry?.targetIds ?? opts.selected ?? defaultTargetIds(opts.config, opts.targets);
+  const selected = graph?.plans.map(p => p.target) ?? opts.retry?.targetIds ?? opts.selected ?? defaultTargetIds(opts.config, opts.targets);
   if (!selected.length || new Set(selected).size !== selected.length) throw new Error('请选择不重复的目标');
   let targets = selected.map((id) => {
     const t = opts.targets.find((t) => t.id === id);
@@ -343,6 +363,10 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
   const done = Promise.resolve().then(() => journal.finish(async () => {
     const available = await detectTargets(opts.targets, journal.ctl.signal);
     if (journal.ctl.signal.aborted) return;
+    if (graph) {
+      const issue = graphIssue(graph, opts.targets.map(t => ({ id: t.id, installed: available.get(t.id), exec: t.adapter.capabilities.exec })));
+      if (issue) throw new Error(issue);
+    }
     const unavailable = targets.filter((t) => !available.get(t.id));
     if (unavailable.length) {
       journal.emit({ type: 'notice', turnId: record.id, message: `不可用: ${unavailable.map((t) => t.label).join('、')}` });
@@ -351,9 +375,9 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
       targets = targets.filter((t) => available.get(t.id));
     }
     if (!targets.length) throw new Error('没有可用的模型，请运行 unify doctor');
-    let synthesize = opts.synthesize !== false;
+    let synthesize = graph ? !!graph.merge : opts.synthesize !== false;
     const decider = opts.targets.find((t) => t.id === opts.config.decider);
-    if (decider && !opts.manualSelection && !opts.retry && targets.length > 1 && available.get(decider.id)) {
+    if (!graph && decider && !opts.manualSelection && !opts.retry && targets.length > 1 && available.get(decider.id)) {
       journal.stage('deciding', targets);
       const call = await journal.one(decider, 'decision', buildDecisionPrompt({ question: record.input.prompt, available: targets }), timeoutMillis(opts.config.decisionTimeoutSec ?? 60));
       if (journal.ctl.signal.aborted) return;
@@ -368,7 +392,8 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     if (journal.ctl.signal.aborted) return;
     record.targets = targets.map(snapshotTarget);
     const hasTextOnly = targets.some((t) => t.adapter.capabilities.askPolicy === 'text-only')
-      || (synthesize && opts.targets.some((t) => t.id === (opts.config.synthesizer ?? 'claude') && t.adapter.capabilities.askPolicy === 'text-only'));
+      || opts.targets.some(t => t.id === graph?.check?.target && t.adapter.capabilities.askPolicy === 'text-only')
+      || (synthesize && opts.targets.some((t) => t.id === (graph?.merge?.target ?? opts.config.synthesizer ?? 'claude') && t.adapter.capabilities.askPolicy === 'text-only'));
 
     // Resolve shared @file attachments and shared memory snapshot once per new turn;
     // retries strictly replay the saved call snapshot without re-reading disk.
@@ -435,7 +460,7 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
       const allowUser = canReceiveUserMemory(t, opts.config);
       const mem = formatSharedMemoryPrompt(opts.cwd, memorySnapshot, { includeUser: allowUser, home: opts.home, blobs: memoryBlobs });
       const baseSystem = t.adapter.configuration?.type === 'openai' ? t.adapter.configuration.system : undefined;
-      const currentUserContent = record.input.userContent ?? record.question;
+      const currentUserContent = (record.input.userContent ?? record.question) + plannerInstruction;
       const messages = buildApiMessages({
         baseSystem,
         sharedMemory: mem.text || undefined,
@@ -447,7 +472,7 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
         : record.input.prompt;
       const targetSnapshot = mem.items.length ? { version: memorySnapshot!.version, items: mem.items } : undefined;
       return journal.prepare(t, 'answer', {
-        prompt,
+        prompt: prompt + plannerInstruction,
         messages,
         memorySnapshot: targetSnapshot,
         includesUserMemory: mem.items.some((i) => i.scope === 'user'),
@@ -465,7 +490,7 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
           }, timeoutMs);
         }
       }
-      return journal.prepare(t, 'answer', record.input.prompt, timeoutMs);
+      return journal.prepare(t, 'answer', record.input.prompt + plannerInstruction, timeoutMs);
     };
 
     journal.stage('answering', targets);
@@ -500,8 +525,22 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     if (journal.ctl.signal.aborted) return;
     const memoryTargets = new Set([...calls.entries()].filter(([, c]) => !!c.input.memorySnapshot?.items.length).map(([id]) => id));
     const answers = anonymize(record.results, record.targets, shared.files, memoryTargets);
-    if (!synthesize || answers.length < 2) return;
-    const preferredId = opts.config.synthesizer ?? 'claude';
+    if (graph && answers.length !== graph.plans.length) throw new Error('方案分支未全部完成，协作已停止');
+    const reviewPlan = async (plan: string) => {
+      if (!graph?.check || journal.ctl.signal.aborted) return;
+      const reviewer = opts.targets.find(t => t.id === graph.check!.target)!;
+      journal.stage('synthesizing', [reviewer]);
+      const checked = await journal.one(reviewer, 'plan-review', [
+        '请复核候选方案是否满足原需求，纠正遗漏或矛盾。用「## 复核意见」列出发现，用「## 最终答案」给出可以单独交给执行者的完整方案。',
+        record.input.prompt, shared.text, '候选方案', plan,
+      ].filter(Boolean).join('\n\n'), timeoutMs);
+      if (!journal.ctl.signal.aborted && checked.result.ok && !checked.result.text.trim()) throw new Error('方案复核没有返回可实施的正文');
+    };
+    if (!synthesize || answers.length < 2) {
+      if (answers[0]) await reviewPlan(answers[0].text);
+      return;
+    }
+    const preferredId = graph?.merge?.target ?? opts.config.synthesizer ?? 'claude';
     const preferred = opts.targets.find((t) => t.id === preferredId);
     const answeringIds = new Set(record.results.filter((r) => r.ok).map((r) => r.targetId));
     const okTargets = targets.filter((t) => answeringIds.has(t.id));
@@ -517,10 +556,10 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
     }
     journal.stage('synthesizing', [synth]);
     const labels = Object.fromEntries(answers.map((a) => [a.label, a.provider]));
-    const synthCanInspect = synth.adapter.capabilities.askPolicy !== 'text-only';
+    const textOnly = synth.adapter.capabilities.askPolicy === 'text-only';
 
     // Ensure fallback or separately-configured text-only synthesizer also receives frozen shared memory + shared files.
-    if (!synthCanInspect && !memorySnapshot && !opts.retry) {
+    if (textOnly && !memorySnapshot && !opts.retry) {
       if (opts.previous?.input.memorySnapshot) {
         memorySnapshot = structuredClone(opts.previous.input.memorySnapshot);
         record.input.memorySnapshot = memorySnapshot;
@@ -534,23 +573,43 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
         }
       }
     }
-    if (!synthCanInspect && !shared.text && !opts.retry && !shared.files.length) {
+    if (textOnly && !shared.text && !opts.retry && !shared.files.length) {
       shared = resolveSharedFileContext(opts.cwd, record.question);
     }
 
-    const synthPrompt = buildSynthesisPrompt(record.input.prompt, answers, {
-      canInspectWorkspace: synthCanInspect,
-      sharedContext: !synthCanInspect ? shared.text : undefined,
-    });
+    const options = { sharedContext: textOnly ? shared.text : undefined };
+    let material = buildSynthesisInput(record.input.prompt, answers, options);
+    const reader = textOnly ? okTargets.find(t =>
+      ['sandbox-read-only', 'read-tools', 'provider-plan'].includes(t.adapter.capabilities.askPolicy)) : undefined;
+    let sourceCheck: SourceCheck | undefined;
+    if (reader) {
+      journal.emit({ type: 'notice', turnId: record.id, message: '正在判断分歧是否需要查阅项目原文' });
+      const assessment = await journal.one(synth, 'dispute-assessment', {
+        prompt: decideSourceCheck + '\n\n' + material,
+        messages: [{ role: 'system', content: decideSourceCheck }, { role: 'user', content: material }],
+        skipReportWrap: true,
+      }, timeoutMillis(opts.config.decisionTimeoutSec ?? 60));
+      if (journal.ctl.signal.aborted) return;
+      const check = assessment.result.ok ? sourceCheckRequest(assessment.result.text, answers) : undefined;
+      if (check) {
+        journal.emit({ type: 'notice', turnId: record.id, message: `定点核查 · ${reader.label} · ${check.question}` });
+        const evidence = await journal.one(reader, 'source-check', { prompt: sourceCheckPrompt(check.question), skipReportWrap: true }, timeoutMs);
+        if (journal.ctl.signal.aborted) return;
+        sourceCheck = { ...check, excerpts: evidence.result.ok ? confirmedExcerpts(opts.cwd, evidence.result.text) : [] };
+        material = buildSynthesisInput(record.input.prompt, answers, { ...options, sourceCheck });
+      }
+    }
+    const instructions = buildSynthesisInstructions(!textOnly);
+    const synthPrompt = instructions + '\n\n' + material;
     let synthInput: string | PreparedInput = synthPrompt;
-    if (!synthCanInspect) {
+    if (textOnly) {
       const allowUser = canReceiveUserMemory(synth, opts.config);
       const mem = formatSharedMemoryPrompt(opts.cwd, memorySnapshot, { includeUser: allowUser, home: opts.home, blobs: memoryBlobs });
       const baseSystem = synth.adapter.configuration?.type === 'openai' ? synth.adapter.configuration.system : undefined;
-      const systemParts = [baseSystem?.trim(), mem.text || undefined, buildSynthesisInstructions(false)].filter((s): s is string => !!s);
+      const systemParts = [baseSystem?.trim(), mem.text || undefined, instructions].filter((s): s is string => !!s);
       const userBody = [
         formatMemoryUpdateDelta(record.input.memoryUpdates),
-        buildSynthesisInput(record.input.prompt, answers, { canInspectWorkspace: false, sharedContext: shared.text }),
+        material,
       ].filter(Boolean).join('\n\n');
       const synthSnapshot = mem.items.length ? { version: memorySnapshot!.version, items: mem.items } : undefined;
       synthInput = {
@@ -564,17 +623,20 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
       };
     }
 
-    await journal.one(
+    const merged = await journal.one(
       synth,
       'synthesis',
       synthInput,
       timeoutMs,
       {
         labels,
+        sourceCheck,
         ...(fallback ? { preferredProvider: preferredId, fallback: true } : {}),
         alsoAnswered,
       },
     );
+    if (graph && merged.result.ok && !merged.result.text.trim()) throw new Error('方案比较没有返回可实施的正文');
+    if (merged.result.ok && merged.result.text.trim()) await reviewPlan(synthesisFormatter(record)(extractFinalPlan(merged.result.text)));
   }));
   return {
     record, done, cancel: () => { journal.cancelAllInteractions(); journal.ctl.abort(); },
@@ -595,6 +657,14 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
 export function selectPlan(record: RunRecord, targetId?: string): { source: PlanSource; question: string; text: string } {
   if (record.kind !== 'comparison') throw new Error('请选择问答记录中的方案');
   if (['created', 'deciding', 'answering', 'synthesizing'].includes(record.status)) throw new Error('当前轮次尚未结束');
+  if (record.collaboration) {
+    const result = graphPlanResult(record);
+    if (!result || targetId) throw new Error('请使用协作图中已完成的最终方案');
+    const scope = record.collaboration.check ? 'plan-review' : record.collaboration.merge ? 'synthesis' : 'answer';
+    const text = scope === 'synthesis' ? synthesisFormatter(record)(extractFinalPlan(result.text))
+      : scope === 'plan-review' ? extractFinalPlan(result.text) : result.text;
+    return { question: record.question, text, source: { turnId: record.id, runId: result.runId, targetId: result.targetId, scope, planText: text } };
+  }
   const result = targetId ? record.results.find((r) => r.targetId === targetId && r.ok) :
     record.synthesis?.result.ok ? record.synthesis.result : record.results.filter((r) => r.ok).length === 1 ? record.results.find((r) => r.ok) : undefined;
   if (!result?.text.trim()) throw new Error('没有可用方案，请用 --from 或聚焦面板明确选择一个成功回答');
@@ -620,6 +690,13 @@ export function chooseExecutor(targets: ModelTarget[], requested: string | undef
 /** Execution is a separate durable record referencing the exact source turn and call. */
 export function startExecution(opts: CommonOptions & { source: RunRecord; from?: string; executor: ModelTarget }): WorkflowHandle {
   const plan = selectPlan(opts.source, opts.from);
+  const graph = opts.source.collaboration;
+  if (graph && graph.execution.target !== opts.executor.id) throw new Error('执行目标与已确认的协作图不一致');
+  const frozen = opts.source.collaborationTargets;
+  const executor = recordedTarget(opts.executor, frozen?.find(t => t.id === opts.executor.id));
+  const auditTarget = graph?.audit && opts.targets.find(t => t.id === graph.audit!.target);
+  if (graph?.audit && !auditTarget) throw new Error('实施复核目标已移除，请更新协作图');
+  const reviewer = auditTarget && recordedTarget(auditTarget, frozen?.find(t => t.id === auditTarget.id));
   if (!opts.executor.adapter.capabilities.exec) throw new Error(`${opts.executor.label} 不支持实施`);
   const record = initialRecord(opts, plan.question);
   record.sessionId = opts.source.sessionId;
@@ -627,12 +704,28 @@ export function startExecution(opts: CommonOptions & { source: RunRecord; from?:
   record.input.history = structuredClone(opts.source.input.history);
   record.kind = 'execution';
   record.planSource = plan.source;
-  record.targets = [snapshotTarget(opts.executor)];
+  if (graph) {
+    record.collaboration = structuredClone(graph);
+    record.collaborationTargets = frozen && structuredClone(frozen);
+  }
+  record.targets = [snapshotTarget(executor)];
   record.input.prompt = buildExecPrompt(opts.source.input.prompt, plan.text);
+  if (graph?.audit) record.input.prompt += '\n完成后列出实际改动文件、关键变更片段、证据和仍未验证的事项，供下游模型复核。';
   const journal = new Journal(record, opts);
   const done = Promise.resolve().then(() => journal.finish(async () => {
-    journal.stage('answering', [opts.executor]);
-    await journal.one(opts.executor, 'exec', record.input.prompt, timeoutMillis(opts.config.execTimeoutSec ?? 3600));
+    journal.stage('answering', [executor]);
+    const execution = await journal.one(executor, 'exec', record.input.prompt, timeoutMillis(opts.config.execTimeoutSec ?? 3600));
+    if (execution.result.ok && reviewer && !journal.ctl.signal.aborted) {
+      journal.stage('synthesizing', [reviewer]);
+      const verify = reviewer.adapter.capabilities.askPolicy === 'text-only'
+        ? '你收到的是执行报告及其中的变更片段，请明确哪些结论仅由报告支持、哪些需要核查实际文件。'
+        : '只读检查执行报告涉及的文件和改动，对照方案核实实现。';
+      const review = await journal.one(reviewer, 'result-review', [
+        '你负责实施复核。' + verify + ' 给出已完成项、具体偏差及仍待确认项。', opts.source.input.prompt,
+        '已确认方案', plan.text, '实施报告', execution.result.text,
+      ].join('\n\n'), timeoutMillis(opts.config.timeoutSec ?? 600));
+      if (review.result.ok && !review.result.text.trim()) throw new Error('实施已完成，复核模型没有返回正文');
+    }
   }));
   return {
     record, done,

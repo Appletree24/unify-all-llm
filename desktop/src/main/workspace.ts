@@ -6,7 +6,8 @@ import { atomicWrite } from '../../../src/core/atomic-write.js';
 import { loadConfig, parseConfig, timeoutMillis, readJson, type Config } from '../../../src/core/config.js';
 import { currentGitBranch, listGitBranches, switchGitBranch } from '../../../src/core/git-branches.js';
 import { projectConfigPath, userConfigPath, writeSetting } from '../../../src/core/settings.js';
-import { listRunIds, loadRun, type RunRecord } from '../../../src/core/store.js';
+import { listRunIds, loadRun, saveRun, type RunRecord } from '../../../src/core/store.js';
+import { graphIssue } from '../../../src/core/collaboration.js';
 import { defaultTargetIds, detectTargets } from '../../../src/core/targets.js';
 import { ModelTests } from '../../../src/core/model-tests.js';
 import type { ModelTarget } from '../../../src/core/types.js';
@@ -69,7 +70,11 @@ export class Workspace {
     } catch (err) {
       this.configError = message(err);
       this.cfg = {};
-      try { this.targets = Object.values(buildRegistry({})); } catch { this.targets = []; }
+      try {
+        const path = userConfigPath();
+        this.cfg.disableClaude = parseConfig(readJson(path) ?? {}, path).disableClaude;
+        this.targets = Object.values(buildRegistry(this.cfg));
+      } catch { this.targets = []; }
     }
     this.invalidateQuota();
     if (redetect) this.detect();
@@ -109,6 +114,7 @@ export class Workspace {
     return {
       cwd: this.cwd, name: basename(this.cwd) || this.cwd, branch: this.branch, targets, defaults,
       synthesizer: this.cfg.synthesizer, executor: this.cfg.executor, decider: this.cfg.decider,
+      collaborationGraphs: this.cfg.collaborationGraphs ?? {},
       showReasoning: this.cfg.showReasoning ?? false, configError: this.configError,
     };
   }
@@ -331,11 +337,21 @@ export class Workspace {
       this.assertSessionIdle(req.sessionId);
       const runs = this.session(req.sessionId);
       if (!runs.length) throw new Error('找不到可以继续的对话');
-      previous = runs.findLast((r) => r.kind === 'comparison');
+      previous = req.reviseTurn ? runs.at(-1) : runs.findLast((r) => r.kind === 'comparison');
     }
     const config = req.synthesizer ? parseConfig({ ...this.cfg, synthesizer: req.synthesizer }) : this.cfg;
+    const workspace = this.info();
+    if (req.reviseTurn && (previous?.id !== req.reviseTurn || !previous.collaboration)) throw new Error('请打开最新协作轮次再修改方案');
+    let graph = req.graph && Object.hasOwn(workspace.collaborationGraphs, req.graph) ? workspace.collaborationGraphs[req.graph] : undefined;
+    if (req.reviseTurn) graph = previous?.collaboration;
+    if (req.graph && !graph) throw new Error('所选协作图不存在');
+    if (graph) {
+      const issue = graphIssue(graph, workspace.targets);
+      if (issue) throw new Error(issue);
+    }
     return this.start((onEvent) => startComparison({
-      cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected,
+      cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected, collaboration: graph,
+      collaborationTargets: req.reviseTurn ? previous?.collaborationTargets : undefined,
       manualSelection: req.manual, synthesize: req.synthesize, previous, continueFrom: req.continueFrom,
       memoryUpdates: req.memoryUpdates, interactive: true, onEvent,
     }));
@@ -346,6 +362,14 @@ export class Workspace {
     if (this.disposed) throw new Error('项目已关闭');
     const original = this.load(turnId);
     if (!original) throw new Error(`找不到记录 ${turnId}`);
+    if (original.collaboration) {
+      if (original.kind !== 'comparison') throw new Error('实施不能自动重试');
+      this.assertSessionIdle(original.sessionId);
+      return this.start(onEvent => startComparison({
+        cwd: this.cwd, config: this.cfg, targets: this.targets, question: original.question, collaboration: original.collaboration,
+        retry: { record: original, targetIds: original.collaboration!.plans.map(p => p.target) }, interactive: true, onEvent,
+      }));
+    }
     this.assertSessionIdle(original.sessionId);
     const ids = targetIds?.length ? targetIds : original.targets.filter((t) => !original.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id);
     if (!ids.length) throw new Error('没有需要重试的目标');
@@ -357,6 +381,23 @@ export class Workspace {
 
   cancel(turnId: string): void {
     this.handles.get(turnId)?.cancel();
+  }
+
+  private assertGraphPending(run: RunRecord): void {
+    const turns = this.session(run.sessionId);
+    if (!run.collaboration || run.collaborationClosed || turns.at(-1)?.id !== run.id) throw new Error('这份方案已处理，请查看最新轮次');
+    selectPlan(run);
+  }
+
+  closeCollaboration(turnId: string): void {
+    const run = this.load(turnId);
+    if (!run) throw new Error('找不到协作记录');
+    this.assertSessionIdle(run.sessionId);
+    this.assertGraphPending(run);
+    const closed = { ...run, collaborationClosed: true };
+    saveRun(this.cwd, closed);
+    this.runCache.delete(turnId);
+    this.push({ type: 'run', record: closed });
   }
 
   cancelTarget(turnId: string, targetId: string): boolean {
@@ -372,7 +413,7 @@ export class Workspace {
     if (!run) throw new Error(`找不到记录 ${turnId}`);
     const plan = selectPlan(run, from);
     await this.detecting;
-    const executor = chooseExecutor(this.targets, executorId ?? this.cfg.executor, this.installed);
+    const executor = chooseExecutor(this.targets, executorId ?? run.collaboration?.execution.target ?? this.cfg.executor, this.installed);
     const label = (id: string) => run.targets.find((t) => t.id === id)?.label ?? this.targets.find((t) => t.id === id)?.label ?? id;
     const sources: ExecPreview['sources'] = [];
     if (run.synthesis?.result.ok) sources.push({ label: `汇总 · ${label(run.synthesis.provider)}` });
@@ -394,6 +435,11 @@ export class Workspace {
     const source = this.load(turnId);
     if (!source) throw new Error(`找不到记录 ${turnId}`);
     this.assertSessionIdle(source.sessionId);
+    if (source.collaboration) {
+      this.assertGraphPending(source);
+      const audit = source.collaboration.audit;
+      if (audit && !this.installed.get(audit.target)) throw new Error(`复核目标 ${audit.target} 不可用，请先接入该目标`);
+    }
     const executor = chooseExecutor(this.targets, executorId, this.installed);
     return this.start((onEvent) => startExecution({ cwd: this.cwd, config: this.cfg, targets: this.targets, executor, source, from, interactive: true, onEvent }));
   }
