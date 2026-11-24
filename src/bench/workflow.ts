@@ -35,7 +35,8 @@ export async function draftCase(cwd: string, id: string, author: BenchModel, not
     '仓库补丁可使用 {"kind":"patch","image":"已知可用镜像@sha256:摘要","files":[{"path":"check.sh","content":"验收脚本"}],"command":["sh","/checks/check.sh"]}，' +
     '答案为 unified diff，negative 为空表示未修复的起点，仅在材料提供镜像摘要时使用，禁止编造。' +
     '不适合改写成纯函数的工程题要保留真实边界。\n' +
-    JSON.stringify({ task, files, observedAnswer: sourceAnswer(run, c.source.call), correction: note?.trim() || c.note });
+    '用户可能留下的是正例、改写、排序、评分、验收标准或事后结果。将标为正例的材料视为可接受的示范。排序表示用户偏好，事后才知道的事实不能作为当时应当知道的事实。' +
+    JSON.stringify({ task, files, observedAnswer: sourceAnswer(run, c.source.call), feedback: c.feedback, correction: note?.trim() || c.note });
   const review = reviewSchema.parse(authored(await temporary(dir => ask(author, design, dir))));
   if (review.grader.kind === 'rubric') review.grader.perCriterion = true;
   const data = caseSchema.parse({ version: 1, task, review });

@@ -45,6 +45,7 @@
       }
     ],
     "asar": true,
+    "asarUnpack": ["dist/material-text", "dist/office-text.py"],
     "win": {
       "target": [
         "nsis"
@@ -55,6 +56,10 @@
       "allowToChangeInstallationDirectory": true
     },
     "mac": {
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "录制你主动添加到对话的语音。",
+        "NSScreenCaptureUsageDescription": "录制你选定窗口或屏幕上的操作示范。"
+      },
       "target": [
         "dmg"
       ],

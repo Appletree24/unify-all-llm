@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 
 import type { Collection } from '../shared/api.js';
+import { useAnimatedDialog } from './motion.js';
 type Props = {
   initial?: Collection;
+  open: boolean;
   cases: { id: string; title: string }[];
   onSave: (name: string, caseIds: string[]) => Promise<void>;
   onDelete?: () => Promise<void>;
   onClose: () => void;
 };
 
-export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: Props) {
-  const dialogRef = useRef<HTMLDialogElement>(null);
+export function CollectionEditor({ initial, open, cases, onSave, onDelete, onClose }: Props) {
+  const dialogRef = useAnimatedDialog(open);
   const nameRef = useRef<HTMLInputElement>(null);
   const [name, setName] = useState(initial?.name ?? '');
   const [selected, setSelected] = useState(() => new Set<string>(initial?.caseIds ?? []));
@@ -20,13 +22,7 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
   const [confirmDelete, setConfirmDelete] = useState(false);
   const busy = pending !== null;
 
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (dialog && !dialog.open) dialog.showModal();
-    nameRef.current?.focus();
-    nameRef.current?.select();
-    return () => { if (dialog?.open) dialog.close(); };
-  }, []);
+  useLayoutEffect(() => { if (open) nameRef.current?.select(); }, [open]);
 
   const visibleCases = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -72,6 +68,7 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
     <dialog
       ref={dialogRef}
       className="collection-editor"
+      inert={!open}
       aria-labelledby="collection-editor-title"
       onCancel={(e) => { e.preventDefault(); close(); }}
     >
@@ -83,7 +80,7 @@ export function CollectionEditor({ initial, cases, onSave, onDelete, onClose }: 
 
         <label className="collection-field">
           <span>名称</span>
-          <input ref={nameRef} maxLength={100} className="collection-input" value={name} disabled={busy} placeholder="输入分组名称" onChange={(e) => setName(e.target.value)} />
+          <input ref={nameRef} autoFocus maxLength={100} className="collection-input" value={name} disabled={busy} placeholder="输入分组名称" onChange={(e) => setName(e.target.value)} />
         </label>
 
         <div className="collection-members-head">

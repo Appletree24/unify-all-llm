@@ -17,6 +17,11 @@ export interface ChatMessage {
   content: string;
 }
 
+export function httpMessages(input: { prompt: string; messages?: ChatMessage[] }, system?: string): ChatMessage[] {
+  if (input.messages?.length) return input.messages;
+  return [...(system ? [{ role: 'system' as const, content: system }] : []), { role: 'user', content: input.prompt }];
+}
+
 export const TOOL_STATUSES = ['pending', 'in_progress', 'completed', 'failed', 'denied'] as const;
 
 export interface ToolUse {
@@ -54,11 +59,18 @@ export function appendToolUse(result: RunResult, tool: ToolUse): void {
 }
 
 /** The single event vocabulary every provider is translated into. */
+export interface NativeSession {
+  id: string;
+  /** A provider that can fork this immutable turn even after the original thread advances. */
+  turnId?: string;
+  forkable?: boolean;
+}
+
 export type ProviderEvent =
   | { type: 'reasoning'; text: string }
   | { type: 'delta'; text: string }
   | ({ type: 'tool' } & ToolUse)
-  | { type: 'done'; text: string; usage?: Usage; memoryReferences?: MemoryReference[] }
+  | { type: 'done'; text: string; usage?: Usage; memoryReferences?: MemoryReference[]; nativeSession?: NativeSession }
   | { type: 'error'; message: string; status?: 'failed' | 'cancelled' | 'timed_out' };
 
 export interface Capabilities {
@@ -78,6 +90,7 @@ export interface InteractionQuestion {
   header?: string;
   question: string;
   options?: { label: string; description?: string }[];
+  multiSelect?: boolean;
   allowOther?: boolean;
   secret?: boolean;
 }
@@ -109,6 +122,10 @@ export type InteractionHandler = (request: InteractionRequest) => Promise<Intera
 
 export interface RunRequest {
   prompt: string;
+  /** Report a transport-level fallback before submitting the full public history. */
+  onPublicReplay?: () => void;
+  /** Full public replay is always in prompt. Send only this turn after a confirmed native resume. */
+  conversation?: { turnPrompt: string; resumeId?: string; fork?: boolean; turnId?: string };
   /** Structured append-only messages for OpenAI-compatible API targets (preferred over prompt when present). */
   messages?: ChatMessage[];
   cwd: string;
@@ -127,6 +144,7 @@ export interface DetectResult {
 
 export interface ProviderAdapter {
   id: string;
+  nativeConversation?: boolean;
   label: string;
   defaultModel?: string;
   autoSelect?: boolean;
@@ -171,6 +189,7 @@ export interface RunResult {
   error?: string;
   durationMs: number;
   usage?: Usage;
+  cacheWarnings?: string[];
   tools?: ToolUse[];
   memoryReferences?: MemoryReference[];
   /** Display failures never change the provider's outcome. */

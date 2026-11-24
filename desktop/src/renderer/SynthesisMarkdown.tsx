@@ -4,6 +4,7 @@ import { answerPassages } from '../../../src/core/answer-passages.js';
 import { synthesisFormatter } from '../../../src/core/synth.js';
 import type { RunRecord } from '../shared/api.js';
 import { renderMarkdown } from './markdown.js';
+import { useAnimatedDialog, usePresence } from './motion.js';
 import { Markdown, MarkdownBody } from './ui.js';
 
 interface Source {
@@ -59,26 +60,26 @@ function citationsIn(text: string, record: RunRecord, cache: BlockCache) {
   return { html: template.innerHTML, citations };
 }
 
-function SourceDialog({ source, close }: { source: Source; close(): void }) {
-  const dialog = useRef<HTMLDialogElement>(null);
+function SourceDialog({ source, open, close }: { source: Source; open: boolean; close(): void }) {
+  const dialog = useAnimatedDialog(open);
+  const body = useRef<HTMLDivElement>(null);
   const highlight = useRef<HTMLDivElement>(null);
   const title = useId();
   useLayoutEffect(() => {
-    const el = dialog.current!;
-    el.showModal();
-    highlight.current?.scrollIntoView({ block: 'start' });
-    return () => el.close();
-  }, []);
+    if (!open) return;
+    if (highlight.current) highlight.current.scrollIntoView({ block: 'start', behavior: 'instant' });
+    else body.current?.scrollTo(0, 0);
+  }, [open, source]);
 
   return (
-    <dialog ref={dialog} className="modal source-dialog" aria-labelledby={title}
+    <dialog ref={dialog} className="modal source-dialog" aria-labelledby={title} inert={!open}
       onCancel={e => { e.preventDefault(); close(); }}
       onClick={e => { if (e.target === dialog.current) close(); }}>
       <header>
         <h2 id={title}>{source.name} · 回答原文</h2>
         <button className="btn" autoFocus onClick={close} title="返回汇总 (Esc)">返回汇总</button>
       </header>
-      <div className="source-body">
+      <div className="source-body" ref={body}>
         {source.blocks.map((block, i) => (
           <div key={i} ref={i + 1 === source.passage ? highlight : undefined}
             className={i + 1 === source.passage ? 'source-passage cited' : 'source-passage'}>
@@ -95,8 +96,9 @@ export function SynthesisMarkdown({ text, record }: { text: string; record: RunR
   const cache = useRef<BlockCache>(new Map());
   const { html, citations } = useMemo(() => citationsIn(text, record, cache.current), [text, record]);
   const [source, setSource] = useState<Source>();
+  const { rendered, state } = usePresence(source);
   return <>
     <MarkdownBody html={html} onCitation={index => setSource(citations[index])} />
-    {source && <SourceDialog source={source} close={() => setSource(undefined)} />}
+    {rendered && <SourceDialog source={rendered} open={state === 'open'} close={() => setSource(undefined)} />}
   </>;
 }

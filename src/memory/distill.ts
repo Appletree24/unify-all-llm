@@ -340,6 +340,7 @@ ${material.slice(0, 12_000)}
 </material>`;
 
   const res = await runOne(target, {
+    cache: { scope: 'distill', home: ctx.home },
     cwd: ctx.cwd,
     mode: 'ask',
     prompt,

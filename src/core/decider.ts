@@ -22,8 +22,6 @@ export interface DecideInput {
 export function buildDecisionPrompt(input: DecideInput): string {
   return `你是一个路由决策器。根据下面的问题，决定应该让哪些模型回答，以及是否需要对它们的回答做汇总评审。
 
-可用模型: ${input.available.map((a) => `${a.id}（${a.label}）`).join('、')}
-
 原则:
 - 事实明确、简单直接的问题：选 1 个模型，synthesize 为 false。
 - 有争议、需要权衡、方案设计或出错代价高的问题：选多个模型，synthesize 为 true。
@@ -34,7 +32,9 @@ export function buildDecisionPrompt(input: DecideInput): string {
 
 <question>
 ${input.question.trim()}
-</question>`;
+</question>
+
+可用模型: ${input.available.map((a) => `${a.id}（${a.label}）`).join('、')}`;
 }
 
 /** Extract and validate the decision. Returns undefined when the reply is unusable. */

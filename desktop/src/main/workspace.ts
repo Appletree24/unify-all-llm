@@ -8,6 +8,8 @@ import { currentGitBranch, listGitBranches, switchGitBranch } from '../../../src
 import { projectConfigPath, userConfigPath, writeSetting } from '../../../src/core/settings.js';
 import { listRunIds, loadRun, saveRun, type RunRecord } from '../../../src/core/store.js';
 import { graphIssue } from '../../../src/core/collaboration.js';
+import { discussionFormat } from '../shared/decision-format.js';
+import { commitMaterials } from './materials.js';
 import { defaultTargetIds, detectTargets } from '../../../src/core/targets.js';
 import { ModelTests } from '../../../src/core/model-tests.js';
 import type { ModelTarget } from '../../../src/core/types.js';
@@ -306,7 +308,7 @@ export class Workspace {
           interactionId: e.interactionId,
         });
       } else {
-        if (e.type === 'notice') this.push({ type: 'notice', turnId: e.turnId, message: e.message });
+        if (e.type === 'notice') this.push(e);
         flush();
       }
     };
@@ -337,6 +339,7 @@ export class Workspace {
       this.assertSessionIdle(req.sessionId);
       const runs = this.session(req.sessionId);
       if (!runs.length) throw new Error('找不到可以继续的对话');
+      if (req.replyTo && runs.at(-1)?.id !== req.replyTo) throw new Error('对话已有新一轮，请在最新轮次提交选择');
       previous = req.reviseTurn ? runs.at(-1) : runs.findLast((r) => r.kind === 'comparison');
     }
     const config = req.synthesizer ? parseConfig({ ...this.cfg, synthesizer: req.synthesizer }) : this.cfg;
@@ -349,11 +352,13 @@ export class Workspace {
       const issue = graphIssue(graph, workspace.targets);
       if (issue) throw new Error(issue);
     }
+    if (req.materials?.length && req.materialWorkspace !== this.cwd) throw new Error('请回到添加材料的项目发送');
+    const materials = req.materials?.length ? commitMaterials(this.cwd, req.materials) : undefined;
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected, collaboration: graph,
       collaborationTargets: req.reviseTurn ? previous?.collaborationTargets : undefined,
       manualSelection: req.manual, synthesize: req.synthesize, previous, continueFrom: req.continueFrom,
-      memoryUpdates: req.memoryUpdates, interactive: true, onEvent,
+      memoryUpdates: req.memoryUpdates, materials, expandFileMentions: !req.replyTo, discussionFormat, interactive: true, onEvent,
     }));
   }
 
@@ -367,7 +372,7 @@ export class Workspace {
       this.assertSessionIdle(original.sessionId);
       return this.start(onEvent => startComparison({
         cwd: this.cwd, config: this.cfg, targets: this.targets, question: original.question, collaboration: original.collaboration,
-        retry: { record: original, targetIds: original.collaboration!.plans.map(p => p.target) }, interactive: true, onEvent,
+        retry: { record: original, targetIds: original.collaboration!.plans.map(p => p.target) }, discussionFormat, interactive: true, onEvent,
       }));
     }
     this.assertSessionIdle(original.sessionId);
@@ -375,7 +380,7 @@ export class Workspace {
     if (!ids.length) throw new Error('没有需要重试的目标');
     return this.start((onEvent) => startComparison({
       cwd: this.cwd, config: this.cfg, targets: this.targets, question: '',
-      retry: { record: original, targetIds: ids }, interactive: true, onEvent,
+      retry: { record: original, targetIds: ids }, discussionFormat, interactive: true, onEvent,
     }));
   }
 
@@ -529,7 +534,7 @@ export class Workspace {
   private benchModel(id: string) {
     const target = this.targets.find(t => t.id === id);
     if (!target) throw new Error('评测目标不可用：' + id);
-    return { target, signal: this.benchAbort.signal, timeoutMs: timeoutMillis(this.cfg.timeoutSec ?? 600) };
+    return { target, signal: this.benchAbort.signal, timeoutMs: timeoutMillis(this.cfg.timeoutSec ?? 600), project: this.cwd };
   }
 
   benchDraft(id: string, target: string, note: string, repo?: Repository) {

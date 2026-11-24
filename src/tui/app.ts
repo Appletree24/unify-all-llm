@@ -12,6 +12,7 @@ import type { MemoryContext } from '../memory/types.js';
 import { startMemoryServer, type MemoryServer } from '../memory/server.js';
 import { buildRegistry } from '../providers/index.js';
 import { readTargetQuotas } from '../quota/index.js';
+import { readCacheReport } from '../core/cache-monitor.js';
 import { defaultTargetIds, detectTargets } from '../core/targets.js';
 import { ModelTests } from '../core/model-tests.js';
 import { displaySynthesisEvents } from '../ui/synthesis.js';
@@ -581,6 +582,10 @@ export class App {
     else if (name === 'copy') this.copy();
     else if (name === 'help') this.help = true;
     else if (name === 'quota') this.quotaDetails = true;
+    else if (name === 'cache') {
+      void readCacheReport().then(r => this.say(`缓存监控 · ${r.reported}/${r.calls.length} 次已上报 · ${r.warned} 次预警 · unify cache 查看明细`, r.warned ? YELLOW : DIM),
+        err => this.say('读取缓存记录失败 · ' + String(err), RED));
+    }
     else if (name === 'memory') {
       if (arg === 'web') this.memoryWeb().then((url) => this.say(`记忆管理界面（仅本机）: ${url}`, GOLD), (err) => this.say(`无法启动记忆管理界面: ${err instanceof Error ? err.message : err}`, RED));
       else this.openMemory();

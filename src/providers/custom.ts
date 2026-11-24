@@ -1,5 +1,5 @@
 import { commandExists, openText, runText } from '../core/proc.js';
-import type { InteractionRequest, ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
+import { httpMessages, type InteractionRequest, type ProviderAdapter, type ProviderEvent, type RunRequest } from '../core/types.js';
 import { z } from 'zod';
 import type { CustomProviderConfig } from '../core/config.js';
 import { httpEffort } from './effort.js';
@@ -62,9 +62,7 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
         yield { type: 'error', message: `环境变量 ${c.apiKeyEnv} 未设置` };
         return;
       }
-      const messages = req.messages?.length
-        ? req.messages
-        : [...(c.system ? [{ role: 'system' as const, content: c.system }] : []), { role: 'user' as const, content: req.prompt }];
+      const messages = httpMessages(req, c.system);
       const res = await fetch(`${c.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
         method: 'POST',
         signal: req.signal,
@@ -72,6 +70,7 @@ function openaiAdapter(id: string, c: Extract<CustomProviderConfig, { type: 'ope
         body: JSON.stringify({
           model: req.model ?? c.model,
           stream: true,
+          ...(/^https:\/\/api\.(?:openai|deepseek)\.com(?:\/|$)/i.test(c.baseUrl) && { stream_options: { include_usage: true } }),
           ...httpEffort(c.baseUrl, req.reasoningEffort),
           messages,
         }),

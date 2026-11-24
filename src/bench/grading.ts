@@ -10,7 +10,7 @@ import type { ModelTarget } from '../core/types.js';
 import type { BenchCase, BenchTask } from './cases.js';
 
 const exec = promisify(execFile);
-export interface BenchModel { target: ModelTarget; timeoutMs: number; signal?: AbortSignal }
+export interface BenchModel { target: ModelTarget; timeoutMs: number; signal?: AbortSignal; project?: string }
 type Files = BenchTask['files'];
 export interface RubricCheck { criterion: string; pass: boolean; reason: string }
 export type Grade = { status: 'pass' | 'fail'; detail: string; invalid?: boolean; checks?: RubricCheck[] };
@@ -27,7 +27,8 @@ export async function temporary<T>(work: (dir: string) => Promise<T>) {
   try { return await work(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 export async function ask(model: BenchModel, prompt: string, cwd: string) {
-  const result = await runOne(model.target, { cwd, prompt, mode: 'ask', timeoutMs: model.timeoutMs, signal: model.signal });
+  const result = await runOne(model.target, { cwd, prompt, mode: 'ask', timeoutMs: model.timeoutMs, signal: model.signal,
+    cache: { scope: 'benchmark', project: model.project } });
   if (!result.ok) throw new Error(result.error || result.status);
   return result.text;
 }

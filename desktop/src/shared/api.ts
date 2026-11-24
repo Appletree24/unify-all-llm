@@ -9,10 +9,19 @@ import type { ModelTestState } from '../../../src/core/model-tests.js';
 import type { AgyModel } from '../../../src/providers/agy-models.js';
 import type { TargetQuota } from '../../../src/quota/types.js';
 import type { QuotaNotice } from '../../../src/quota/reminders.js';
+import type { CacheReport } from '../../../src/core/cache-monitor.js';
+export type { CacheReport };
 import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult } from '../../../src/memory/distill.js';
 
 export type { Config, DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult, InteractionOption, InteractionQuestion, InteractionRequest, InteractionResponse, PendingInteraction, QuotaNotice, ReasoningEffort, RunRecord, TargetQuota };
 export type RunResultRecord = RunRecord['results'][number];
+export type Material = NonNullable<RunRecord['input']['materials']>[number];
+export type Feedback = NonNullable<Candidate['feedback']>;
+export type StagedMaterial = Omit<Material, 'file' | 'note'> & { id: string };
+export type MaterialSelection = { id: string; note: string };
+export interface Evidence {
+  question: string; answer: string; followUp: string; record: RunRecord;
+}
 export type CallRecord = RunRecord['calls'][number];
 
 export interface TargetInfo {
@@ -79,6 +88,8 @@ export interface SessionChanges {
 export const SESSION_TITLE_LIMIT = 120;
 
 export interface AskRequest {
+  materials?: MaterialSelection[];
+  materialWorkspace?: string;
   graph?: string;
   reviseTurn?: string;
   question: string;
@@ -88,6 +99,8 @@ export interface AskRequest {
   synthesizer?: string;
   /** Continue this session's latest comparison; omit to start a new one. */
   sessionId?: string;
+  /** The turn whose decision form the user is answering. */
+  replyTo?: string;
   /** Optional targetId (or 'synthesis') from the previous turn to carry into follow-up history. */
   continueFrom?: string;
   /** Optional newly distilled memory items appended to the next API turn without mutating cached system prefix. */
@@ -131,7 +144,7 @@ export type Push =
   | { type: 'run'; record: RunRecord }
   | { type: 'interaction'; turnId: string; callId: string; scope: CallRecord['scope']; targetId: string; targetLabel: string; request: PendingInteraction }
   | { type: 'interaction-resolved'; turnId: string; callId: string; interactionId: string }
-  | { type: 'notice'; turnId: string; message: string }
+  | { type: 'notice'; turnId: string; message: string; category?: 'cache' }
   | { type: 'end'; turnId: string; sessionId: string; status: RunRecord['status'] }
   | { type: 'quota'; cwd: string; quotas: TargetQuota[] }
   | { type: 'quota-notice'; notice: QuotaNotice }
@@ -159,6 +172,7 @@ export interface UnifyApi {
   previewExec(turnId: string, from?: string, executor?: string): Promise<ExecPreview>;
   exec(turnId: string, from: string | undefined, executor: string): Promise<{ turnId: string; sessionId: string }>;
   quota(force?: boolean): Promise<TargetQuota[]>;
+  cacheReport(): Promise<CacheReport>;
   settings(): Promise<SettingsInfo>;
   agyModels(cwd: string): Promise<AgyModel[]>;
   testTarget(id: string): Promise<void>;
@@ -166,13 +180,16 @@ export interface UnifyApi {
   saveCollaboration(cwd: string, id: string, graph: NonNullable<Config['collaborationGraphs']>[string] | undefined): Promise<void>;
   saveApi(id: string, model: string, apiKey?: string): Promise<WorkspaceInfo>;
   memoryUrl(): Promise<string>;
-  captureBench(cwd: string, turn: string, call?: string): Promise<Candidate>;
+  stageMaterial(cwd: string, name: string, mime: string, data: ArrayBuffer): Promise<StagedMaterial>;
+  discardMaterial(cwd: string, id: string): Promise<void>;
+  revealMaterial(cwd: string, turn: string, index: number): Promise<void>;
+  captureBench(cwd: string, turn: string, call?: string, note?: string, feedback?: Feedback): Promise<Candidate>;
   benchIndex(cwd: string): Promise<BenchIndex>;
   benchSaveDraft(cwd: string, data: BenchCase, previous?: { id: string; data: BenchCase }): Promise<string>;
   benchSaveCollection(cwd: string, name: string, caseIds: string[], previous?: Collection): Promise<Collection>;
   benchDeleteCollection(cwd: string, previous: Collection): Promise<void>;
   benchDeleteEntry(cwd: string, kind: 'case' | 'draft' | 'candidate', id: string): Promise<void>;
-  benchEvidence(cwd: string, id: string): Promise<{ question: string; answer: string; followUp: string }>;
+  benchEvidence(cwd: string, id: string): Promise<Evidence>;
   benchDraft(cwd: string, id: string, target: string, note: string, repo?: Repository): Promise<{ id: string; data: BenchCase }>;
   benchRead(cwd: string, id: string, published: boolean): Promise<BenchCase>;
   benchPublish(cwd: string, data: BenchCase, judge?: string, options?: Publication): Promise<string>;

@@ -82,6 +82,7 @@ async function handleAgyInteraction(
         options: Array.isArray(q.options)
           ? q.options.map((o: any) => typeof o === 'string' ? { label: o } : { label: String(o.label ?? ''), description: o.description })
           : undefined,
+        multiSelect: q.multiSelect === true,
         allowOther: q.allowOther ?? true,
       }));
       const res = await interact({
@@ -122,6 +123,9 @@ function toolStep(step: Record<string, any>): Extract<ProviderEvent, { type: 'to
 async function* runAntigravityHeadless(req: RunRequest, bin: BinaryTarget): AsyncGenerator<ProviderEvent> {
   const args = ['--mode', 'plan', '--disable-slash-commands', '--input-format', 'stream-json', '--output-format', 'stream-json'];
   if (req.model) args.push('--model', req.model);
+  // The headless transport can advance a thread, but cannot fork an immutable ACP parent.
+  const resumeId = req.conversation?.fork ? undefined : req.conversation?.resumeId;
+  if (resumeId) args.push('--conversation', resumeId);
 
   const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...args], {
     cwd: req.cwd,
@@ -134,10 +138,16 @@ async function* runAntigravityHeadless(req: RunRequest, bin: BinaryTarget): Asyn
   let askedForAnswer = false;
   let finished = false;
   let reportedDenial = false;
+  let sessionId = resumeId;
+  let started = false;
   try {
-    ask(req.prompt);
+    if (req.conversation?.resumeId && !resumeId) req.onPublicReplay?.();
+    ask(resumeId ? req.conversation!.turnPrompt : req.prompt);
     for await (const ev of session.events) {
       if (finished) throw new Error('Antigravity 在结束后继续发送事件');
+      const id = ev.conversation_id ?? ev.result?.conversation_id ?? ev.start?.conversation_id;
+      if (typeof id === 'string') sessionId = id;
+      if (ev.event === 'step_update' || ev.request_id !== undefined) started = true;
       if (interact && await handleAgyInteraction(ev, interact, (value) => session.send(value))) continue;
       if (ev.event === 'step_update') {
         const step = ev.step_update;
@@ -175,13 +185,20 @@ async function* runAntigravityHeadless(req: RunRequest, bin: BinaryTarget): Asyn
         yield {
           type: 'done',
           text: response,
+          nativeSession: req.conversation && sessionId ? { id: sessionId } : undefined,
           usage: {
             inputTokens: result.usage?.input_tokens,
             outputTokens: result.usage?.output_tokens,
+            cachedInputTokens: result.usage?.cached_read_tokens ?? result.usage?.cached_input_tokens,
           },
         };
       }
     }
+  } catch (err) {
+    if (!resumeId || started || req.signal?.aborted || !/conversation.*(?:not found|does not exist)|unknown conversation/i.test(String(err))) throw err;
+    req.onPublicReplay?.();
+    await session.close();
+    yield* runAntigravityHeadless({ ...req, conversation: { turnPrompt: req.conversation!.turnPrompt } }, bin);
   } finally {
     await session.close();
   }
@@ -191,6 +208,7 @@ async function* runAntigravityHeadless(req: RunRequest, bin: BinaryTarget): Asyn
 export function createAntigravityAdapter(bin: BinaryTarget = DEFAULT_AGY_BIN): ProviderAdapter {
   return {
     id: 'gemini-pro',
+    nativeConversation: true,
     label: 'Gemini Pro',
     defaultModel: 'gemini-4-neon-medium',
     autoSelect: false,
@@ -201,8 +219,8 @@ export function createAntigravityAdapter(bin: BinaryTarget = DEFAULT_AGY_BIN): P
       return { installed: !!version, version };
     },
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
-      const request = { ...req, prompt: req.prompt + '\n\n' + INSPECT_PROMPT };
-      if (req.interact) {
+      const request = { ...req, prompt: INSPECT_PROMPT + '\n\n' + req.prompt };
+      if (req.interact || req.conversation) {
         yield* runAcp(request, bin, {
           args: ['acp'], label: 'Gemini Pro', modeId: 'plan', modelId: req.model, emptyAnswerPrompt: ANSWER_PROMPT,
           fallback: () => runAntigravityHeadless(request, bin),

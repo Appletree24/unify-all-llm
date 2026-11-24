@@ -45,22 +45,33 @@ function messageChunk(content: unknown): string {
 }
 
 export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOptions): AsyncGenerator<ProviderEvent> {
-  const interact = req.interact!;
+  const interact: NonNullable<RunRequest['interact']> = req.interact ?? (async () => ({ cancelled: true }));
   const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...options.args], {
     cwd: req.cwd, signal: req.signal, nativeExecutable: bin.nativeExecutable,
   });
   const send = (id: number, method: string, params: object) => session.send({ jsonrpc: '2.0', id, method, params });
   let initialized = false;
-  let sessionId: string;
+  let sessionId = '';
+  let resumeId: string | undefined;
+  let supportsResume = false;
+  let canFork = false;
+  let prompting = false;
   let promptId = 5;
   let answer = '';
   const tools = new Map<string, string>();
   const rejected = new Set<string>();
 
-  const prompt = (content: string) => send(promptId, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: content }] });
+  const prompt = (content: string) => {
+    prompting = true;
+    send(promptId, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: content }] });
+  };
+  const currentPrompt = () => {
+    if (req.conversation?.resumeId && !resumeId) req.onPublicReplay?.();
+    return resumeId ? req.conversation!.turnPrompt : req.prompt;
+  };
   const setModelOrPrompt = () => {
     if (options.modelId) send(4, 'session/set_model', { sessionId, modelId: options.modelId });
-    else prompt(req.prompt);
+    else prompt(currentPrompt());
   };
   const toolEvent = (update: Record<string, any>): Extract<ProviderEvent, { type: 'tool' }> => {
     const id = text(update.toolCallId);
@@ -79,20 +90,33 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
     send(1, 'initialize', { protocolVersion: 1, clientInfo: { name: 'unify_llm', version: '0.1.0' }, clientCapabilities: {} });
     for await (const ev of session.events) {
       if (!ev.method) {
+        if (ev.id === 2 && ev.error && resumeId) {
+          resumeId = undefined;
+          send(2, 'session/new', { cwd: req.cwd, mcpServers: [] });
+          continue;
+        }
         if (ev.error) throw new Error(text(ev.error.message) ?? options.label + ' ACP 请求失败');
         if (ev.id === 1) {
           if (ev.result?.protocolVersion !== 1) throw new Error(options.label + ' ACP 协议版本不受支持');
           initialized = true;
-          send(2, 'session/new', { cwd: req.cwd, mcpServers: [] });
+          const caps = ev.result?.agentCapabilities;
+          canFork = !!caps?.sessionCapabilities?.fork;
+          const method = req.conversation?.fork
+            ? (canFork ? 'session/fork' : undefined)
+            : caps?.sessionCapabilities?.resume ? 'session/resume' : caps?.loadSession ? 'session/load' : undefined;
+          supportsResume = !!(caps?.sessionCapabilities?.resume || caps?.loadSession);
+          resumeId = method ? req.conversation?.resumeId : undefined;
+          if (method && resumeId) send(2, method, { cwd: req.cwd, mcpServers: [], sessionId: resumeId });
+          else send(2, 'session/new', { cwd: req.cwd, mcpServers: [] });
         } else if (ev.id === 2) {
-          sessionId = ev.result?.sessionId;
+          sessionId = ev.result?.sessionId ?? (req.conversation?.fork ? undefined : resumeId);
           if (!text(sessionId)) throw new Error(options.label + ' ACP 未返回会话 ID');
           if (options.modeId) send(3, 'session/set_mode', { sessionId, modeId: options.modeId });
           else setModelOrPrompt();
         } else if (ev.id === 3) {
           setModelOrPrompt();
         } else if (ev.id === 4) {
-          prompt(req.prompt);
+          prompt(currentPrompt());
         } else if (ev.id === promptId) {
           if (ev.result?.stopReason === 'cancelled') throw new Error(options.label + ' 已取消本轮请求');
           if (!answer.trim() && options.emptyAnswerPrompt && promptId === 5) {
@@ -108,7 +132,7 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
             cachedInputTokens: stats.cachedReadTokens ?? stats.cachedInputTokens ?? stats.cached,
             cacheWriteTokens: stats.cachedWriteTokens,
           };
-          yield { type: 'done', text: answer, usage };
+          yield { type: 'done', text: answer, usage, nativeSession: (supportsResume || canFork) && req.conversation ? { id: sessionId, forkable: canFork } : undefined };
           break;
         }
         continue;
@@ -136,7 +160,7 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
         } });
       } else if (ev.id !== undefined) {
         session.send({ jsonrpc: '2.0', id: ev.id, error: { code: -32601, message: 'Unsupported ACP client method: ' + ev.method } });
-      } else if (ev.method === 'session/update') {
+      } else if (ev.method === 'session/update' && prompting && (!ev.params?.sessionId || ev.params.sessionId === sessionId)) {
         const update = ev.params?.update ?? {};
         if (update.sessionUpdate === 'agent_message_chunk') {
           const chunk = messageChunk(update.content);

@@ -1,4 +1,4 @@
-import type { Capabilities, ChatMessage, RunResult } from './types.js';
+import type { Capabilities, ChatMessage, ModelTarget, RunResult } from './types.js';
 import type { HistoryEntry, RunRecord } from './store.js';
 import { answerPassages } from './answer-passages.js';
 import type { SourceCheck } from './source-check.js';
@@ -48,23 +48,24 @@ export function summarizeEvidence(
   return tools ? `可查阅本地仓库；实际调用：${tools}` : '可查阅本地仓库（本轮未记录工具调用）';
 }
 
-/** Shuffle and anonymize so the synthesizer cannot favor its own answer. */
+/** Assign opaque references in the caller's blind order. */
 export function anonymize(
   results: RunResult[],
   targets?: readonly { id: string; capabilities: Capabilities }[],
   sharedFiles?: readonly string[],
   memoryTargets?: ReadonlySet<string>,
+  savedLabels?: Readonly<Record<string, string>>,
 ): LabeledAnswer[] {
   const ok = results.filter((r) => r.ok && r.text.trim());
-  for (let i = ok.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [ok[i], ok[j]] = [ok[j], ok[i]];
-  }
-  return ok.map((r, i) => {
+  const prior = new Map(Object.entries(savedLabels ?? {}).filter(([label]) => /^\[ref:[1-9]\d*\]$/.test(label))
+    .map(([label, id]) => [id, label]));
+  let next = 1;
+  return ok.map((r) => {
+    while (savedLabels?.[`[ref:${next}]`]) next++;
     const policy = targets?.find((t) => t.id === r.targetId)?.capabilities.askPolicy;
     const evidence = summarizeEvidence(r, policy, sharedFiles, memoryTargets?.has(r.targetId));
     return {
-      label: `[ref:${i + 1}]`,
+      label: prior.get(r.targetId) ?? `[ref:${next++}]`,
       provider: r.targetId,
       text: r.text,
       ...(evidence ? { evidence } : {}),
@@ -224,13 +225,14 @@ export function buildApiMessages(opts: {
   sharedMemory?: string;
   history: readonly HistoryEntry[];
   currentUserContent: string;
+  target?: ModelTarget;
 }): ChatMessage[] {
   const systemParts = [opts.baseSystem?.trim(), opts.sharedMemory?.trim()].filter((s): s is string => !!s);
   const messages: ChatMessage[] = [];
   if (systemParts.length) messages.push({ role: 'system', content: systemParts.join('\n\n') });
   for (const h of opts.history) {
-    messages.push({ role: 'user', content: h.userContent ?? h.question });
-    messages.push({ role: 'assistant', content: h.answer });
+    messages.push({ role: 'user', content: historicalUser(h, opts.target) ?? h.userContent ?? h.question });
+    messages.push({ role: 'assistant', content: historicalAnswer(h, opts.target) });
   }
   messages.push({ role: 'user', content: opts.currentUserContent });
   return messages;
@@ -241,25 +243,42 @@ export function buildTurnUserContent(question: string, opts: { sharedContext?: s
   return [opts.memoryUpdate?.trim(), opts.sharedContext?.trim(), question.trim()].filter(Boolean).join('\n\n');
 }
 
-/** Every answering role receives the same accumulated public conversation (CLI / single-prompt transport). */
-export function buildConversationPrompt(history: HistoryEntry[], question: string, sharedContext?: string): string {
-  const current = sharedContext ? `${sharedContext}\n\n${question}` : question;
-  if (!history.length) return current;
-  return `以下 JSON 是之前的公共对话记录，仅作上下文：\n${JSON.stringify(history.map(({ question, answer }) => ({ question, answer })), null, 2)}\n\n现在请回答：\n${current}`;
+function historicalUser(entry: HistoryEntry, target?: ModelTarget): string | undefined {
+  if (!target) return undefined;
+  const sent = entry.sentUsers?.find(u => u.target === target.id && u.provider === target.adapter.id);
+  const base = target.adapter.capabilities.askPolicy === 'text-only' ? entry.userContent ?? entry.question : entry.question;
+  return sent?.replace ? sent.suffix : base + (sent?.suffix ?? '');
 }
 
-export function buildExecPrompt(question: string, plan: string): string {
-  return `请在当前工作目录中实施下面这份已经确定的方案。
+function historicalAnswer(entry: HistoryEntry, target?: ModelTarget): string {
+  return entry.selected && entry.selected.target !== target?.id
+    ? entry.answer + '\n\n[已选定回答：' + entry.selected.label + ']' : entry.answer;
+}
 
-<original_request>
+export function appendConversationAnswer(prompt: string, entry: HistoryEntry, target?: ModelTarget): string {
+  return prompt + '\n\n上一轮的回答（JSON 字符串，仅作上下文）：\n' + JSON.stringify(historicalAnswer(entry, target)) + '\n\n现在请回答：\n';
+}
+
+/** Serializing another exchange only appends to the previous single-prompt input. */
+export function buildConversationPrompt(history: HistoryEntry[], question: string, sharedContext?: string, target?: ModelTarget): string {
+  const current = sharedContext ? `${sharedContext}\n\n${question}` : question;
+  return history.map(h => appendConversationAnswer(historicalUser(h, target) ?? h.question, h, target)).join('') + current;
+}
+
+export function buildPlanInput(question: string, plan: string): string {
+  return `<original_request>
 ${question.trim()}
 </original_request>
 
 <final_plan>
 ${plan.trim()}
-</final_plan>
+</final_plan>`;
+}
 
-要求：
+export function buildExecPrompt(question: string, plan: string): string {
+  return buildPlanInput(question, plan) + `
+
+请在当前工作目录中实施这份已经确定的方案。要求：
 - 以 final_plan 为准实施；发现方案与仓库实际情况冲突时，选择最贴近方案意图的做法并在最后说明。
 - 只做方案要求的改动，不做无关重构。
 - 不要提交 git commit，不要推送。

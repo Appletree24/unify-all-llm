@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { collectMemoryReport } from '../memory/report.js';
+import type { NativeConversation } from './native-conversation.js';
+import { monitorCache, type CacheContext } from './cache-monitor.js';
 import { appendToolUse, type ChatMessage, type InteractionHandler, type InteractionRequest, type InteractionResponse, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
 
 export interface RunOptions {
   prompt: string;
   messages?: ChatMessage[];
   memoryReportMarker?: string;
+  conversation?: NativeConversation;
+  cache?: CacheContext;
   cwd: string;
   mode: RunMode;
   timeoutMs: number;
@@ -28,6 +32,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
     status: 'running', ok: false, text: '', reasoning: '', durationMs: 0,
   };
   let stopped = false;
+  let monitor: ReturnType<typeof monitorCache> | undefined;
   let terminal: Extract<ProviderEvent, { type: 'done' | 'error' }> | undefined;
   let notifyAbort!: () => void;
   const aborted = new Promise<void>((resolve) => { notifyAbort = resolve; });
@@ -77,12 +82,15 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
     try {
       if (ctl.signal.aborted) return;
       if (opts.mode === 'exec' && !target.adapter.capabilities.exec) throw new Error(`${target.label} 不支持实施`);
-      const events = target.adapter.run({
+      const request = {
         prompt: opts.prompt,
+        conversation: opts.conversation?.request,
         ...(opts.messages ? { messages: opts.messages } : {}),
         cwd: opts.cwd, mode: opts.mode, model: target.model, reasoningEffort: target.reasoningEffort, signal: ctl.signal,
         ...(interact ? { interact } : {}),
-      });
+      };
+      monitor = monitorCache(target, request, res, opts.cache);
+      const events = target.adapter.run({ ...request, onPublicReplay: monitor.publicReplay });
       for await (const ev of collectMemoryReport(events, res.runId, opts.prompt, opts.memoryReportMarker)) {
         if (stopped || ctl.signal.aborted) break;
         if (terminal) throw new Error('模型在终态后继续发送事件');
@@ -106,6 +114,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
       if (opts.mode === 'ask' && !res.text.trim()) throw new Error('模型已结束，但没有返回回答正文');
       res.status = 'succeeded';
       res.ok = true;
+      if (opts.mode === 'ask' && terminal.nativeSession) opts.conversation?.save(terminal.nativeSession);
     } catch (err) {
       if (stopped || ctl.signal.aborted) return;
       res.status = 'failed';
@@ -125,6 +134,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
     opts.signal?.removeEventListener('abort', onAbort);
   }
   res.durationMs = Date.now() - started;
+  monitor?.finish();
   emit(res.ok ? { type: 'done', text: res.text, usage: res.usage, ...(res.memoryReferences && { memoryReferences: res.memoryReferences }) } : {
     type: 'error', message: res.error ?? '模型执行失败',
     status: res.status === 'cancelled' || res.status === 'timed_out' ? res.status : 'failed',
@@ -141,6 +151,8 @@ export async function fanOut(
     messagesByTarget?: ReadonlyMap<string, ChatMessage[]>;
     reportMarkers?: ReadonlyMap<string, string>;
     interactionsByTarget?: ReadonlyMap<string, InteractionHandler>;
+    conversations?: ReadonlyMap<string, NativeConversation>;
+    cacheByTarget?: ReadonlyMap<string, CacheContext>;
     targetSignals?: ReadonlyMap<string, AbortSignal>;
     runIds?: ReadonlyMap<string, string>;
     onResult?: (result: RunResult) => void;
@@ -165,6 +177,8 @@ export async function fanOut(
         results[i] = await runOne(target, {
           ...opts,
           prompt: opts.prompts?.get(target.id) ?? opts.prompt,
+          conversation: opts.conversations?.get(target.id),
+          cache: opts.cacheByTarget?.get(target.id) ?? opts.cache,
           messages: opts.messagesByTarget?.get(target.id) ?? opts.messages,
           memoryReportMarker: opts.reportMarkers?.get(target.id) ?? opts.memoryReportMarker,
           interact: opts.interactionsByTarget?.get(target.id) ?? opts.interact,

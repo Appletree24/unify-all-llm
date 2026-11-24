@@ -3,7 +3,7 @@
   "synthesizer": "deepseek",
   "collaborationGraphs": {
     "relay": {
-      "name": "方案接力",
+      "name": "Coding",
       "plans": [
         {
           "target": "gemini-pro"
@@ -18,7 +18,7 @@
     "codex": "xhigh"
   },
   "models": {
-    "gemini-pro": "gemini-4-neon-low",
+    "gemini-pro": "gemini-4-neon-xhigh",
     "deepseek": "deepseek-flash",
     "codex": "gpt-6.2-sol"
   }

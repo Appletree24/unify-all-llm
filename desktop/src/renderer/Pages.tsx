@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { QUOTA_LOW_PERCENT, QUOTA_RESET_NOTICE_MINUTES } from '../../../src/quota/reminders.js';
 import { isAgyProvider, modelSettings, type AgyModel } from '../../../src/providers/agy-models.js';
 import type { ApiInfo, Config, SettingsInfo, TargetQuota, WorkspaceInfo } from '../shared/api.js';
@@ -41,7 +41,7 @@ export function QuotaPage({ quota, loading, refresh }: { quota?: TargetQuota[]; 
   for (const q of quota ?? []) groups.set(q.provider, [...(groups.get(q.provider) ?? []), q]);
   const checked = quota?.[0]?.checkedAt;
   return (
-    <div className="page">
+    <div className="page page-enter">
       <header className="page-head">
         <div>
           <h1>套餐额度</h1>
@@ -52,10 +52,10 @@ export function QuotaPage({ quota, loading, refresh }: { quota?: TargetQuota[]; 
       {checked && <div className="page-meta">更新于 {new Date(checked).toLocaleTimeString('zh-CN')}</div>}
       {!quota ? <div className="pending"><Spinner />正在查询…</div> : (
         <div className="quota-grid">
-          {[...groups.entries()].map(([provider, rows]) => {
+          {[...groups.entries()].map(([provider, rows], index) => {
             const { reading } = rows[0];
             return (
-              <section key={provider} className="quota-card" style={{ '--h': hue(rows[0].targetId) } as CSSProperties}>
+              <section key={provider} className="quota-card" style={{ '--h': hue(rows[0].targetId), '--stagger': index } as CSSProperties}>
                 <header>
                   <i className="dot" />
                   <b>{rows.map((r) => r.label).join('、')}</b>
@@ -74,7 +74,7 @@ export function QuotaPage({ quota, loading, refresh }: { quota?: TargetQuota[]; 
                             <b>{l.remaining}{l.total !== undefined ? <span className="faint"> / {l.total}</span> : null}{l.unit === '%' ? '%' : ` ${l.unit}`}</b>
                           </div>
                           {ratio !== undefined && (
-                            <div className={`meter${ratio < 0.15 ? ' low' : ratio < 0.4 ? ' mid' : ''}`}><i style={{ width: `${Math.max(0, Math.min(1, ratio)) * 100}%` }} /></div>
+                            <div className={`meter${ratio < 0.15 ? ' low' : ratio < 0.4 ? ' mid' : ''}`}><i style={{ '--limit-width': `${Math.max(0, Math.min(1, ratio)) * 100}%` } as CSSProperties} /></div>
                           )}
                           {l.resetsAt && <div className="faint small">{until(l.resetsAt)}</div>}
                         </li>
@@ -99,8 +99,8 @@ export function MemoryPage({ cwd, notify }: { cwd: string; notify: Notify }) {
     setUrl(undefined);
     unify.memoryUrl().then(setUrl, (err) => notify(errText(err), 'err'));
   }, [cwd, notify]);
-  if (!url) return <div className="page"><div className="pending"><Spinner />正在扫描记忆…</div></div>;
-  return <iframe className="memory-frame" src={url} title="记忆管理" />;
+  if (!url) return <div className="page page-enter"><div className="pending"><Spinner />正在扫描记忆…</div></div>;
+  return <iframe className="memory-frame page-enter" src={url} title="记忆管理" />;
 }
 
 // ── settings ──────────────────────────────────────────────────────────────
@@ -134,6 +134,8 @@ function NumberField({ value, fallback, onSave }: { value?: number; fallback: nu
 
 function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceInfo): void; notify: Notify }) {
   const [open, setOpen] = useState(false);
+  const formId = useId();
+  const trigger = useRef<HTMLButtonElement>(null);
   const [model, setModel] = useState(api.model);
   const [key, setKey] = useState('');
   const [busy, setBusy] = useState(false);
@@ -143,32 +145,37 @@ function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceI
     <div className={`api-row${open ? ' open' : ''}`}>
       <div className="set-row">
         <div className="set-label"><div>{api.label}</div><small className={api.configured || api.envKey ? 'ok-text' : ''}>{status}</small></div>
-        <div className="set-control"><button className="btn" disabled={!!api.blocked} onClick={() => setOpen(!open)}>{open ? '收起' : api.configured ? '修改' : '接入'}</button></div>
+        <div className="set-control"><button ref={trigger} className="btn" disabled={!!api.blocked} aria-expanded={open}
+          aria-controls={formId} onClick={() => setOpen(!open)}>{open ? '收起' : api.configured ? '修改' : '接入'}</button></div>
       </div>
-      {open && (
-        <form className="api-form" onSubmit={async (e) => {
-          e.preventDefault();
-          setBusy(true);
-          try {
-            onSaved(await unify.saveApi(api.id, model, key.trim() || undefined));
-            setKey('');
-            setOpen(false);
-            notify(`已接入 ${api.label} · ${model}`, 'ok');
-          } catch (err) { notify(errText(err), 'err'); }
-          setBusy(false);
-        }}>
-          <label>模型
-            <select value={model} onChange={(e) => setModel(e.target.value)}>
-              {api.models.map((m) => <option key={m} value={m}>{m}</option>)}
-            </select>
-          </label>
-          <label title={`~/.unify/api/${api.id}.json · ${api.baseUrl}`}>API Key（本地明文保存）
-            <input type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" spellCheck={false}
-              placeholder={api.hasKey ? '留空沿用已保存的密钥' : api.envKey ? `留空使用 ${api.apiKeyEnv}` : '粘贴密钥'} />
-          </label>
-          <div className="json-acts"><button className="btn primary" disabled={busy || !model}>保存</button></div>
-        </form>
-      )}
+      <div id={formId} className="motion-fold" data-presence={open ? 'open' : 'closing'} inert={!open}>
+        <div className="motion-fold-inner">
+          <form className="api-form" onSubmit={async (e) => {
+            e.preventDefault();
+            const form = e.currentTarget;
+            setBusy(true);
+            try {
+              onSaved(await unify.saveApi(api.id, model, key.trim() || undefined));
+              setKey('');
+              if (form.contains(document.activeElement)) trigger.current?.focus();
+              setOpen(false);
+              notify(`已接入 ${api.label} · ${model}`, 'ok');
+            } catch (err) { notify(errText(err), 'err'); }
+            setBusy(false);
+          }}>
+            <label>模型
+              <select value={model} onChange={(e) => setModel(e.target.value)}>
+                {api.models.map((m) => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </label>
+            <label title={`~/.unify/api/${api.id}.json · ${api.baseUrl}`}>API Key（本地明文保存）
+              <input type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" spellCheck={false}
+                placeholder={api.hasKey ? '留空沿用已保存的密钥' : api.envKey ? `留空使用 ${api.apiKeyEnv}` : '粘贴密钥'} />
+            </label>
+            <div className="json-acts"><button className="btn primary" disabled={busy || !model}>保存</button></div>
+          </form>
+        </div>
+      </div>
     </div>
   );
 }
@@ -200,13 +207,13 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
       notify('已保存', 'ok');
     } catch (err) { notify(errText(err), 'err'); }
   };
-  if (!info) return <div className="page"><div className="pending"><Spinner />读取设置…</div></div>;
+  if (!info) return <div className="page page-enter"><div className="pending"><Spinner />读取设置…</div></div>;
   const cfg = info.merged;
   const providers = cfg.providers;
   const label = (id: string) => ws.targets.find((t) => t.id === id)?.label ?? id;
 
   return (
-    <div className="page settings">
+    <div className="page settings page-enter">
       <header className="page-head">
         <div>
           <h1>设置</h1>
@@ -217,8 +224,9 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
         <button aria-pressed={tab === 'general'} onClick={() => setTab('general')}>通用设置</button>
         <button aria-pressed={tab === 'collaboration'} onClick={() => setTab('collaboration')}>组合模版</button>
       </nav>
-      {tab === 'collaboration' ? <CollaborationGraph key={ws.cwd} ws={ws} initial={initialGraph} notify={notify} connect={() => setTab('general')} /> : <>
-
+      {tab === 'collaboration' ? (
+        <CollaborationGraph key={ws.cwd} ws={ws} initial={initialGraph} notify={notify} connect={() => setTab('general')} />
+      ) : <div className="page-enter">
       <Section title="官方 API">
         {info.apis.map((api) => <ApiRow key={api.id} api={api} notify={notify} onSaved={(next) => { onChange(next); void load(); }} />)}
       </Section>
@@ -250,7 +258,7 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
                 </button>
               </Row>
               {t.test && t.test.status !== 'testing' && (
-                <p role="status" className={t.test.status === 'passed' ? 'ok-text' : 'err-text'}>
+                <p key={t.test.status} role="status" className={t.test.status === 'passed' ? 'test-result ok-text' : 'test-result err-text'}>
                   {t.test.status === 'failed' && '测试失败 · '}{t.test.message}
                 </p>
               )}
@@ -303,7 +311,7 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
         </Row>
         <Row label="全局禁用 Claude Code"><Switch label="全局禁用 Claude Code" checked={cfg.disableClaude ?? false} onChange={(v) => void save('disableClaude', v)} /></Row>
       </Section>
-      </>}
+      </div>}
     </div>
   );
 }

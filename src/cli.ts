@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { benchCommand } from './bench/command.js';
+import { readCacheReport } from './core/cache-monitor.js';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
@@ -32,6 +33,7 @@ const HELP = `unify — 同时提问多个模型，再汇总与实施
   unify doctor                  检查目标及能力
   unify bench help              留题、出题、校验及运行项目评测集
   unify quota [--watch] [--json] 查看各目标剩余额度，--watch 每分钟刷新
+  unify cache [--json]           查看所有项目最近的缓存预警和供应商读数
   unify memory                  查看和管理各工具的记忆（网页；--tui 为终端界面）
 
 ask 选项:
@@ -384,6 +386,20 @@ async function main(): Promise<number> {
         case 'bench': return benchCommand(cwd, rest, abort.signal);
         case 'memory': return cmdMemory(rest);
         case 'quota': return cmdQuota(rest);
+        case 'cache': {
+            const { values } = parseArgs({ args: rest, options: { json: { type: 'boolean' } } });
+            const report = await readCacheReport();
+            if (values.json) console.log(JSON.stringify(report, null, 2));
+            else {
+                console.log(`缓存监控 · 最近 ${report.calls.length} 次调用 · ${report.warned} 次预警 · ${report.reported} 次返回缓存读数`);
+                for (const c of report.calls) {
+                    const cached = c.cachedTokens === undefined ? (c.phase === 'submitted' ? '尚无终态' : '未上报') : c.cachedTokens + ' tokens';
+                    console.log([new Date(c.updatedAt ?? c.at).toLocaleString(), c.project, c.model ?? c.target, c.scope, c.comparison, '缓存读取 ' + cached].join(' · '));
+                    for (const warning of c.warnings) console.log('  ⚠ ' + warning);
+                }
+            }
+            return 0;
+        }
         case 'doctor': {
             const cfg = loadConfig(cwd);
             const targets = Object.values(buildRegistry(cfg));

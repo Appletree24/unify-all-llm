@@ -1,5 +1,7 @@
-import { useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { SESSION_TITLE_LIMIT, type SessionChanges, type SessionSummary } from '../shared/api.js';
+import { useAnimatedDialog, usePresence } from './motion.js';
 import { Icon, Spinner, ACTIVE } from './ui.js';
 
 function dayGroup(iso: string): string {
@@ -10,6 +12,7 @@ function dayGroup(iso: string): string {
 }
 
 interface SessionListProps {
+  sidebarOpen: boolean;
   sessions: SessionSummary[];
   current: string | null;
   live: ReadonlySet<string>;
@@ -22,19 +25,37 @@ interface SessionListProps {
 type SessionAction = 'rename' | 'delete';
 const errorMessage = (err: unknown) => err instanceof Error ? err.message : String(err);
 
-export function SessionList({ sessions, current, live, open, update, remove, onError }: SessionListProps) {
+export function SessionList({ sidebarOpen, sessions, current, live, open, update, remove, onError }: SessionListProps) {
   const [query, setQuery] = useState('');
-  const [menu, setMenu] = useState<{ id: string; anchor: HTMLButtonElement }>();
-  const [dialog, setDialog] = useState<{ action: SessionAction; session: SessionSummary }>();
+  const [menu, setMenu] = useState<{ id: string; anchor: HTMLButtonElement; style: CSSProperties }>();
+  const [dialog, setDialog] = useState<{ key: number; action: SessionAction; session: SessionSummary }>();
+  const dialogSequence = useRef(0);
+  const openDialog = (action: SessionAction, session: SessionSummary) => {
+    setDialog({ key: ++dialogSequence.current, action, session });
+  };
+  const menuPresence = usePresence(sidebarOpen ? menu : undefined);
+  const dialogPresence = usePresence(dialog);
+  const visibleDialog = dialogPresence.rendered;
   const menuItems = useRef<HTMLDivElement>(null);
 
+  useLayoutEffect(() => { if (!sidebarOpen) setMenu(undefined); }, [sidebarOpen]);
   useLayoutEffect(() => {
-    if (!menu) return;
+    if (!menu || !sidebarOpen) return;
     menuItems.current?.querySelector('button')?.focus({ preventScroll: true });
     const close = () => setMenu(undefined);
     window.addEventListener('resize', close);
     return () => window.removeEventListener('resize', close);
-  }, [menu]);
+  }, [menu, sidebarOpen]);
+
+  const openMenu = (id: string, anchor: HTMLButtonElement) => {
+    const rect = anchor.getBoundingClientRect();
+    setMenu({
+      id, anchor, style: {
+        left: Math.max(8, Math.min(rect.right - 8, window.innerWidth - 176)),
+        ...(rect.top + 130 < window.innerHeight ? { top: rect.top } : { bottom: window.innerHeight - rect.bottom }),
+      },
+    });
+  };
 
   const closeMenu = () => {
     menu?.anchor.focus({ preventScroll: true });
@@ -54,12 +75,6 @@ export function SessionList({ sessions, current, live, open, update, remove, onE
     return groups;
   }, [sessions, search]);
 
-  const anchor = menu?.anchor.getBoundingClientRect();
-  const menuStyle = anchor && {
-    left: Math.min(anchor.right - 8, window.innerWidth - 176),
-    ...(anchor.top + 130 < window.innerHeight ? { top: anchor.top } : { bottom: window.innerHeight - anchor.bottom }),
-  };
-
   return (
     <>
       <label className="session-search">
@@ -77,12 +92,13 @@ export function SessionList({ sessions, current, live, open, update, remove, onE
               const label = title || '（空问题）';
               const selected = current === id;
               const active = live.has(id) || ACTIVE.includes(session.status);
-              const expanded = menu?.id === id;
+              const expanded = sidebarOpen && menu?.id === id;
+              const visibleMenu = menuPresence.rendered;
               return (
                 <div key={id} className={`session-row${selected ? ' on' : ''}`} onContextMenu={(event) => {
                   event.preventDefault();
                   const anchor = event.currentTarget.querySelector<HTMLButtonElement>('.session-actions');
-                  if (anchor) setMenu({ id, anchor });
+                  if (anchor) openMenu(id, anchor);
                 }}>
                   <button type="button" className="session" title={label} aria-current={selected ? 'true' : undefined}
                     onClick={() => { setMenu(undefined); open(id); }}>
@@ -91,23 +107,24 @@ export function SessionList({ sessions, current, live, open, update, remove, onE
                     {active ? <Spinner /> : session.turns > 1 ? <small>{session.turns}</small> : session.hasExec ? <Icon name="run" size={12} /> : null}
                   </button>
                   <button type="button" className="session-actions" title="对话操作" aria-label={`对话操作：${label}`}
-                    aria-expanded={expanded} onClick={(event) => setMenu(expanded ? undefined : { id, anchor: event.currentTarget })}
+                    aria-expanded={expanded} onClick={(event) => { if (expanded) closeMenu(); else openMenu(id, event.currentTarget); }}
                     onKeyDown={(event) => { if (expanded && event.key === 'Escape') closeMenu(); }}>
                     <Icon name="more" size={16} />
                   </button>
-                  {expanded && (
+                  {visibleMenu?.id === id && createPortal(
                     <>
-                      <div className="menu-back" aria-hidden="true" onClick={closeMenu} />
-                      <div className="session-menu" role="group" aria-label="对话操作" style={menuStyle} ref={menuItems}
+                      {expanded && <div className="menu-back" aria-hidden="true" onClick={closeMenu} />}
+                      <div className="session-menu" role="group" aria-label="对话操作" style={visibleMenu.style} ref={menuItems}
+                        data-presence={menuPresence.state} inert={!expanded}
                         onBlur={(event) => {
-                          if (!event.currentTarget.contains(event.relatedTarget) && event.relatedTarget !== menu.anchor) setMenu(undefined);
+                          if (expanded && !event.currentTarget.contains(event.relatedTarget) && event.relatedTarget !== visibleMenu.anchor) setMenu(undefined);
                         }}
                         onKeyDown={(event) => {
                           if (event.key !== 'Escape') return;
                           event.stopPropagation();
                           closeMenu();
                         }}>
-                        <button type="button" onClick={() => { closeMenu(); setDialog({ action: 'rename', session }); }}>
+                        <button type="button" onClick={() => { closeMenu(); openDialog('rename', session); }}>
                           <Icon name="edit" size={15} />重命名
                         </button>
                         <button type="button" onClick={() => {
@@ -118,11 +135,11 @@ export function SessionList({ sessions, current, live, open, update, remove, onE
                         </button>
                         <button type="button" className="danger" aria-disabled={active}
                           title={active ? '请等待请求完成或先取消' : undefined}
-                          onClick={() => { if (!active) { closeMenu(); setDialog({ action: 'delete', session }); } }}>
+                          onClick={() => { if (!active) { closeMenu(); openDialog('delete', session); } }}>
                           <Icon name="trash" size={15} />删除对话
                         </button>
                       </div>
-                    </>
+                    </>, document.body,
                   )}
                 </div>
               );
@@ -130,30 +147,27 @@ export function SessionList({ sessions, current, live, open, update, remove, onE
           </div>
         ))}
       </nav>
-      {dialog && (
-        <SessionDialog action={dialog.action} session={dialog.session} onClose={() => setDialog(undefined)}
-          onSubmit={(title) => dialog.action === 'delete' ? remove(dialog.session.id) : update(dialog.session.id, { title })} />
+      {visibleDialog && (
+        <SessionDialog key={visibleDialog.key} action={visibleDialog.action} session={visibleDialog.session}
+          open={dialogPresence.state === 'open'} onClose={() => setDialog(undefined)}
+          onSubmit={(title) => visibleDialog.action === 'delete'
+            ? remove(visibleDialog.session.id) : update(visibleDialog.session.id, { title })} />
       )}
     </>
   );
 }
 
-function SessionDialog({ action, session, onClose, onSubmit }: {
-  action: SessionAction; session: SessionSummary; onClose(): void; onSubmit(title: string): Promise<void>;
+function SessionDialog({ action, session, open, onClose, onSubmit }: {
+  action: SessionAction; session: SessionSummary; open: boolean; onClose(): void; onSubmit(title: string): Promise<void>;
 }) {
-  const dialog = useRef<HTMLDialogElement>(null);
+  const dialog = useAnimatedDialog(open);
   const input = useRef<HTMLInputElement>(null);
   const [title, setTitle] = useState(session.title);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const deleting = action === 'delete';
 
-  useLayoutEffect(() => {
-    const element = dialog.current;
-    element?.showModal();
-    input.current?.select();
-    return () => element?.close();
-  }, []);
+  useLayoutEffect(() => { if (open) input.current?.select(); }, [open]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -165,7 +179,7 @@ function SessionDialog({ action, session, onClose, onSubmit }: {
   };
 
   return (
-    <dialog className="modal session-dialog" ref={dialog} aria-labelledby="session-dialog-title"
+    <dialog className="modal session-dialog" ref={dialog} aria-labelledby="session-dialog-title" inert={!open}
       aria-describedby={deleting ? 'session-delete-description' : undefined}
       onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }}>
       <form onSubmit={(event) => void submit(event)}>
@@ -173,7 +187,7 @@ function SessionDialog({ action, session, onClose, onSubmit }: {
         {deleting ? (
           <p id="session-delete-description" className="lede">「{session.title || '（空问题）'}」的所有轮次、回答和实施记录都将移到系统回收站。</p>
         ) : (
-          <input ref={input} aria-label="对话标题" value={title} maxLength={SESSION_TITLE_LIMIT} disabled={busy}
+          <input ref={input} autoFocus aria-label="对话标题" value={title} maxLength={SESSION_TITLE_LIMIT} disabled={busy}
             onChange={(event) => setTitle(event.target.value)} />
         )}
         {error && <p className="session-dialog-error" role="alert">{error}</p>}

@@ -87,8 +87,7 @@ function formatFileChangeApprovalDetail(params: Record<string, any>, trackedPath
   return lines.join('\n');
 }
 
-function parseAppServerUsage(params: Record<string, any> | undefined): Usage | undefined {
-  const total = params?.tokenUsage?.total;
+function parseAppServerUsage(total: Record<string, any> | undefined): Usage | undefined {
   if (!total || typeof total !== 'object') return undefined;
   return {
     ...(typeof total.inputTokens === 'number' ? { inputTokens: total.inputTokens } : {}),
@@ -100,13 +99,23 @@ function parseAppServerUsage(params: Record<string, any> | undefined): Usage | u
   };
 }
 
+function usageSince(total: Usage, previous: Usage): Usage {
+  const usage: Usage = {};
+  for (const key of Object.keys(total) as (keyof Usage)[]) {
+    usage[key] = Math.max(0, total[key]! - (previous[key] ?? 0));
+  }
+  return usage;
+}
+
+class CodexStartupError extends Error {}
+
 /**
  * Interactive Codex execution over `codex app-server` JSON-RPC 2.0.
  * Streams deltas, reasoning, tools, cached token usage, and bridges all
  * mid-turn approval and user-input requests through `req.interact`.
  */
 async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGenerator<ProviderEvent> {
-  const interact = req.interact!;
+  const interact: NonNullable<RunRequest['interact']> = req.interact ?? (async () => ({ cancelled: true }));
   const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), 'app-server'], {
     cwd: req.cwd,
     signal: req.signal,
@@ -122,6 +131,21 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
   let usage: Usage | undefined;
   let diagnostic: string | undefined;
   let completed = false;
+  let resumeId = req.conversation?.resumeId;
+  let fork = req.conversation?.fork;
+  let activeThread: string | undefined;
+  let activeTurn: string | undefined;
+  let previousUsage: Usage | undefined;
+  const openThread = () => session.send({
+    id: 2, method: resumeId ? (fork ? 'thread/fork' : 'thread/resume') : 'thread/start',
+    params: {
+      cwd: req.cwd, sandbox: req.mode === 'ask' ? 'read-only' : 'workspace-write',
+      approvalPolicy: req.interact ? 'on-request' : 'never',
+      ...(resumeId ? { threadId: resumeId } : { ephemeral: req.mode === 'ask' && !req.conversation }),
+      ...(resumeId && fork ? { lastTurnId: req.conversation?.turnId } : {}),
+      ...(req.model ? { model: req.model } : {}),
+    },
+  });
 
   session.send({
     id: 1,
@@ -135,29 +159,34 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
       if (ev.id === 1 && !ev.method) {
         if (ev.error) throw new Error(String(ev.error.message ?? 'Codex app-server 初始化失败'));
         session.send({ method: 'initialized' });
-        session.send({
-          id: 2,
-          method: 'thread/start',
-          params: {
-            cwd: req.cwd,
-            sandbox: req.mode === 'ask' ? 'read-only' : 'workspace-write',
-            approvalPolicy: 'on-request',
-            ephemeral: req.mode === 'ask',
-            ...(req.model ? { model: req.model } : {}),
-          },
-        });
+        openThread();
         continue;
       }
       if (ev.id === 2 && !ev.method) {
+        if (ev.error && resumeId) {
+          resumeId = undefined;
+          openThread();
+          continue;
+        }
         if (ev.error) throw new Error(String(ev.error.message ?? 'Codex 创建会话失败'));
+        const anchor = req.conversation?.turnId;
+        if (resumeId && anchor && ev.result?.thread?.turns?.at(-1)?.id !== anchor) {
+          // Another client advanced the thread, or this server cannot fork at an exact turn.
+          if (fork) resumeId = undefined;
+          fork = true;
+          openThread();
+          continue;
+        }
         const threadId = ev.result?.thread?.id ?? ev.result?.threadId;
         if (typeof threadId !== 'string' || !threadId) throw new Error('Codex 未返回 threadId');
+        activeThread = threadId;
+        if (req.conversation?.resumeId && !resumeId) req.onPublicReplay?.();
         session.send({
           id: 3,
           method: 'turn/start',
           params: {
             threadId,
-            input: [{ type: 'text', text: req.prompt }],
+            input: [{ type: 'text', text: resumeId ? req.conversation!.turnPrompt : req.prompt }],
             ...(req.reasoningEffort ? { effort: req.reasoningEffort } : {}),
           },
         });
@@ -165,6 +194,7 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
       }
       if (ev.id === 3 && !ev.method) {
         if (ev.error) throw new Error(String(ev.error.message ?? 'Codex 启动回合失败'));
+        activeTurn = ev.result?.turn?.id ?? activeTurn;
         continue;
       }
 
@@ -274,6 +304,9 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
       // 3. Server->Client streaming notifications
       const method = ev.method;
       const params = ev.params ?? {};
+      if (!activeThread || (params.threadId && params.threadId !== activeThread)) continue;
+      if (method === 'turn/started') activeTurn = params.turn?.id;
+      if (params.turnId && activeTurn && params.turnId !== activeTurn) continue;
       if (method === 'item/agentMessage/delta' && typeof params.delta === 'string' && params.delta) {
         const itemId = typeof params.itemId === 'string' ? params.itemId : '__default__';
         let chunk = params.delta;
@@ -315,7 +348,14 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
           yield { type: 'tool', name: 'edit', detail: paths.join(', ') };
         }
       } else if (method === 'thread/tokenUsage/updated') {
-        usage = parseAppServerUsage(params) ?? usage;
+        const total = parseAppServerUsage(params.tokenUsage?.total);
+        if (!total) continue;
+        if (!resumeId) usage = total;
+        else if (activeTurn && params.turnId === activeTurn) {
+          const last = parseAppServerUsage(params.tokenUsage?.last);
+          if (!previousUsage && last) previousUsage = usageSince(total, last);
+          if (previousUsage) usage = usageSince(total, previousUsage);
+        }
       } else if (method === 'error') {
         diagnostic = String(params.error?.message ?? params.message ?? 'Codex 请求失败');
       } else if (method === 'turn/completed') {
@@ -331,23 +371,29 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
         }
         yield {
           type: 'done',
+          nativeSession: req.conversation && activeThread ? { id: activeThread, turnId: turn.id, forkable: !!turn.id } : undefined,
           text: req.mode === 'ask' ? lastMessage || acc : acc,
           usage,
         };
         break;
       }
     }
+  } catch (err) {
+    if (!activeThread) throw new CodexStartupError(String(err), { cause: err });
+    throw err;
   } finally {
     await session.close();
   }
 
   if (!completed && diagnostic) throw new Error(diagnostic);
+  if (!activeThread) throw new CodexStartupError('Codex app-server 未创建会话');
 }
 
 // Verified against codex-cli 0.167+ (`exec --json`) and 0.171 (`app-server`).
 export function createCodexAdapter(bin: BinaryTarget = DEFAULT_CODEX_BIN): ProviderAdapter {
   return {
     id: 'codex',
+    nativeConversation: true,
     label: 'Codex',
     capabilities: { askPolicy: 'sandbox-read-only', exec: true },
 
@@ -357,9 +403,15 @@ export function createCodexAdapter(bin: BinaryTarget = DEFAULT_CODEX_BIN): Provi
     },
 
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
-      if (req.interact) {
-        yield* runCodexAppServer(req, bin);
-        return;
+      if (req.interact || req.conversation) {
+        try {
+          yield* runCodexAppServer(req, bin);
+          return;
+        } catch (err) {
+          // Older headless installations may only support exec. No turn has started yet.
+          if (req.interact || req.signal?.aborted || !(err instanceof CodexStartupError)) throw err;
+          if (req.conversation?.resumeId) req.onPublicReplay?.();
+        }
       }
 
       const args = ['exec', '--json', '--skip-git-repo-check'];

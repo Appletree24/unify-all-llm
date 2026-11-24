@@ -1,7 +1,10 @@
 import { deleteCollection, saveCollection } from '../../../src/bench/catalog.js';
-import { candidateEvidence, capture, deleteEntry, getCase, getDraft, listBench, saveDraft } from '../../../src/bench/cases.js';
+import { candidateEvidence, capture, deleteEntry, getCandidate, getCase, getDraft, listBench, saveDraft } from '../../../src/bench/cases.js';
+import { loadRun } from '../../../src/core/store.js';
+import { readCacheReport } from '../../../src/core/cache-monitor.js';
+import { clearMaterials, discardMaterial, stageMaterial } from './materials.js';
 import type { MenuItemConstructorOptions } from 'electron';
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, Notification, screen, shell } from 'electron';
+import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeTheme, Notification, screen, shell } from 'electron';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -215,13 +218,24 @@ const api: UnifyApi = {
   async cancel(turnId) { need().cancel(turnId); },
   async cancelTarget(turnId, targetId) { return need().cancelTarget(turnId, targetId); },
   async respondInteraction(turnId, interactionId, response) { return need().respondInteraction(turnId, interactionId, response); },
-  async captureBench(cwd, turn, call) { return capture(currentWorkspace(cwd).cwd, turn, call); },
+  async stageMaterial(cwd, name, mime, data) { return stageMaterial(currentWorkspace(cwd).cwd, name, mime, data); },
+  async discardMaterial(cwd, id) { discardMaterial(cwd, id); },
+  async revealMaterial(cwd, turn, index) {
+    const ws = currentWorkspace(cwd);
+    const item = loadRun(ws.cwd, turn).input.materials?.[index];
+    if (!item || !/^\.unify\/materials\/[a-f0-9]{64}\/[^/\\]+$/.test(item.file)) throw new Error('找不到材料');
+    shell.showItemInFolder(join(ws.cwd, item.file));
+  },
+  async captureBench(cwd, turn, call, note, feedback) { return capture(currentWorkspace(cwd).cwd, turn, call, note, feedback); },
   async benchIndex(cwd) { return listBench(currentWorkspace(cwd).cwd); },
   async benchSaveCollection(cwd, name, ids, previous) { return saveCollection(currentWorkspace(cwd).cwd, name, ids, previous); },
   async benchDeleteCollection(cwd, previous) { deleteCollection(currentWorkspace(cwd).cwd, previous); },
   async benchDeleteEntry(cwd, kind, id) { deleteEntry(currentWorkspace(cwd).cwd, kind, id); },
   async benchSaveDraft(cwd, data, previous) { return saveDraft(currentWorkspace(cwd).cwd, data, previous); },
-  async benchEvidence(cwd, id) { return candidateEvidence(currentWorkspace(cwd).cwd, id); },
+  async benchEvidence(cwd, id) {
+    const ws = currentWorkspace(cwd);
+    return { ...candidateEvidence(ws.cwd, id), record: loadRun(ws.cwd, getCandidate(ws.cwd, id).source.turn) };
+  },
   async benchDraft(cwd, id, target, note, repo) { return currentWorkspace(cwd).benchDraft(id, target, note, repo); },
   async benchRead(cwd, id, published) { return (published ? getCase : getDraft)(currentWorkspace(cwd).cwd, id); },
   async benchPublish(cwd, data, judge, options) { return currentWorkspace(cwd).benchPublish(data, judge, options); },
@@ -230,6 +244,7 @@ const api: UnifyApi = {
   async closeCollaboration(turnId) { need().closeCollaboration(turnId); },
   async exec(turnId, from, executor) { return need().exec(turnId, from, executor); },
   async quota(force) { return need().quota(force); },
+  cacheReport() { return readCacheReport(); },
   async settings() { return need().settings(); },
   async agyModels(cwd) { return readAgyModels(currentWorkspace(cwd).cwd); },
   async testTarget(id) { return need().testTarget(id); },
@@ -291,6 +306,19 @@ function createWindow(view?: 'quota'): void {
   });
   if (state.bounds?.maximized) win.maximize();
   win.once('ready-to-show', () => win?.show());
+  const owner = win;
+  win.webContents.session.setDisplayMediaRequestHandler(async (request, reply) => {
+    if (!request.userGesture || request.frame !== owner.webContents.mainFrame) { reply({}); return; }
+    try {
+      const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 0, height: 0 } });
+      const menu = Menu.buildFromTemplate(sources.map(source => ({
+        label: source.name.replaceAll('&', '&&'), click: () => { selected = source; },
+      })));
+      let selected: (typeof sources)[number] | undefined;
+      if (!sources.length) { reply({}); return; }
+      menu.popup({ window: owner, callback: () => reply(selected ? { video: selected } : {}) });
+    } catch { reply({}); }
+  }, { useSystemPicker: true });
 
   // Model output can contain links: open web links in the browser, never inside the app.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -343,6 +371,7 @@ if (!app.requestSingleInstanceLock()) {
     void Promise.race([done, limit]).finally(() => app.quit());
   });
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+  app.on('will-quit', clearMaterials);
   app.on('activate', () => { if (!win) createWindow(); });
 
   void app.whenReady().then(async () => {

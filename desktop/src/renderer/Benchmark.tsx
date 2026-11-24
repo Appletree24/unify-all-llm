@@ -1,9 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { BenchCase, BenchIndex, BenchResult, Collection, WorkspaceInfo } from '../shared/api.js';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import type { BenchCase, BenchIndex, BenchResult, Collection, Evidence, WorkspaceInfo } from '../shared/api.js';
+import { SavedMaterials } from './MaterialInput.js';
 import { caseSchema } from '../../../src/bench/schema.js';
 import { unify } from './api.js';
 import { Icon, Spinner } from './ui.js';
 import { CollectionEditor } from './CollectionEditor.js';
+import { usePresence } from './motion.js';
 import './Benchmark.css';
 
 type View = 'home' | 'candidate' | 'draft' | 'case' | 'suite' | 'revision';
@@ -51,14 +53,17 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   const [scopeId, setScopeId] = useState('');
   const [destination, setDestination] = useState('');
   const [query, setQuery] = useState('');
-  const [collectionEditor, setCollectionEditor] = useState<Collection | 'new'>();
+  const [collectionEditor, setCollectionEditor] = useState<{ key: number; selection: Collection | 'new' }>();
+  const editorSequence = useRef(0);
+  const editCollection = (selection: Collection | 'new') => setCollectionEditor({ key: ++editorSequence.current, selection });
+  const editorPresence = usePresence(collectionEditor);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const originalDraft = useRef<BenchCase>(undefined);
   const [id, setId] = useState('');
   const [selectedModel, setModel] = useState<string>();
   const [participants, setParticipants] = useState<string[]>();
   const [candidate, setCandidate] = useState<CandidateItem>();
-  const [evidence, setEvidence] = useState<{ question: string; answer: string; followUp: string }>();
+  const [evidence, setEvidence] = useState<Evidence>();
   const [note, setNote] = useState('');
   const [commit, setCommit] = useState('');
   const [paths, setPaths] = useState('');
@@ -275,6 +280,8 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   const collectionHits = !scopeId && term ? index?.collections.filter(c => c.name.toLowerCase().includes(term) || c.id.includes(term)) ?? [] : [];
   const isFreshEmpty = !!index && totalCount === 0 && index.collections.length === 0 && !scopeId && !term;
   const targetLabel = (tid: string) => targets.find(t => t.id === tid)?.label ?? tid;
+  const editor = editorPresence.rendered;
+  const editingCollection = editor?.selection === 'new' ? undefined : editor?.selection;
 
   const judgePicker = (label: string) => (
     <label className="bench-inline-field">
@@ -287,7 +294,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
   );
 
   return (
-    <section ref={page} className="page bench-page" aria-label="评测集">
+    <section ref={page} className="page bench-page page-enter" aria-label="评测集">
       {view !== 'home' && (
         <nav className="bench-topbar" aria-label="评测集导航">
           <button type="button" className="bench-back" disabled={!!busy} onClick={goHome}>
@@ -317,18 +324,18 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
         </div>
       )}
 
-      {index && collectionEditor && (
-        <CollectionEditor initial={collectionEditor === 'new' ? undefined : collectionEditor} cases={index.cases}
+      {index && editor && (
+        <CollectionEditor key={editor.key} initial={editingCollection} cases={index.cases} open={editorPresence.state === 'open'}
           onClose={() => { setCollectionEditor(undefined); refreshIndex(); }}
           onSave={async (name, ids) => {
-            const saved = await unify.benchSaveCollection(cwd, name, ids, collectionEditor === 'new' ? undefined : collectionEditor);
+            const saved = await unify.benchSaveCollection(cwd, name, ids, editingCollection);
             setIndex(current => current && { ...current, collections: [...current.collections.filter(c => c.id !== saved.id), saved] });
             selectCollection(saved.id); setCollectionEditor(undefined); setNotice('案例集已保存。'); refreshIndex();
           }}
-          onDelete={collectionEditor === 'new' ? undefined : async () => {
-            await unify.benchDeleteCollection(cwd, collectionEditor);
+          onDelete={editingCollection && (async () => {
+            await unify.benchDeleteCollection(cwd, editingCollection);
             selectCollection(''); setCollectionEditor(undefined); setNotice('案例集已删除，题库中的案例已保留。'); refreshIndex();
-          }}
+          })}
         />
       )}
 
@@ -384,7 +391,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
                 <button type="button" className="bench-btn" data-variant="primary" disabled={!!busy} onClick={newCase}>
                   <Icon name="plus" size={15} />新建案例
                 </button>
-                <button type="button" className="bench-btn" disabled={!!busy} onClick={() => setCollectionEditor('new')}>
+                <button type="button" className="bench-btn" disabled={!!busy} onClick={() => editCollection('new')}>
                   新建分组
                 </button>
               </div>
@@ -415,11 +422,11 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
                     <option value="">全部项目</option>
                     {index.collections.map(c => <option key={c.id} value={c.id}>{c.name}（{c.caseIds.length}）</option>)}
                   </select>
-                  <button type="button" className="bench-btn bench-btn-subtle" disabled={!!busy} onClick={() => setCollectionEditor('new')}>
+                  <button type="button" className="bench-btn bench-btn-subtle" disabled={!!busy} onClick={() => editCollection('new')}>
                     <Icon name="plus" size={14} />新建分组
                   </button>
                   {collection && (
-                    <button type="button" className="bench-btn bench-btn-subtle" disabled={!!busy} onClick={() => setCollectionEditor(collection)}>
+                    <button type="button" className="bench-btn bench-btn-subtle" disabled={!!busy} onClick={() => editCollection(collection)}>
                       <Icon name="edit" size={13} />编辑分组
                     </button>
                   )}
@@ -516,7 +523,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
                           <p>这个分组还是空的。</p>
                           <div className="bench-empty-actions">
                             {collection && (
-                              <button type="button" className="bench-btn" disabled={!!busy} onClick={() => setCollectionEditor(collection)}>
+                              <button type="button" className="bench-btn" disabled={!!busy} onClick={() => editCollection(collection)}>
                                 <Icon name="edit" size={13} />添加已有案例
                               </button>
                             )}
@@ -538,7 +545,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
       )}
 
       {index && view === 'candidate' && (
-        <fieldset disabled={!!busy} className="bench-sheet">
+        <fieldset key={id} disabled={!!busy} className="bench-sheet">
           <div className="bench-cols">
             <article className="bench-main">
               <p className="bench-eyebrow">对话原题</p>
@@ -546,8 +553,20 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
               {evidence && (
                 <>
                   <section className="bench-doc-block">
-                    <h2>当时不满意的回答</h2>
+                    <h2>当时的回答</h2>
                     <div className="bench-prose">{evidence.answer}</div>
+                  </section>
+                  {candidate?.note && <section className="bench-doc-block"><h2>留题时的反馈</h2><p className="bench-prose">{candidate.note}</p></section>}
+                  <section className="bench-doc-block"><h2>当时的上下文</h2>
+                    <SavedMaterials record={evidence.record} />
+                    <details className="capture-context"><summary>对话历史 · {evidence.record.input.history.length} 轮</summary>
+                      {evidence.record.input.history.map(h => <div key={h.turnId}><b>{h.question}</b><pre>{h.answer}</pre></div>)}</details>
+                    {evidence.record.calls.map(c => <details className="capture-context" key={c.id}>
+                      <summary>{c.target.label} · {c.target.model ?? c.target.provider} · {c.result.status}</summary>
+                      <p>{c.scope} · {c.result.durationMs} ms</p>
+                      <pre>{c.input.prompt}</pre>
+                      {c.result.tools?.map((t, i) => <p key={i}>{t.name} · {t.status} {t.detail}</p>)}
+                    </details>)}
                   </section>
                   {evidence.followUp && (
                     <section className="bench-followup">
@@ -603,7 +622,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
       )}
 
       {index && (view === 'draft' || view === 'revision') && data && (
-        <fieldset disabled={!!busy} className="bench-sheet">
+        <fieldset key={view + id} disabled={!!busy} className="bench-sheet">
           <DraftEditor
             data={data}
             advanced={advanced}
@@ -624,7 +643,7 @@ export function BenchmarkPage({ ws, visible }: { ws: WorkspaceInfo; visible: boo
       )}
 
       {index && (view === 'case' || view === 'suite') && (
-        <fieldset disabled={!!busy} className="bench-sheet">
+        <fieldset key={view + id} disabled={!!busy} className="bench-sheet">
           {view === 'case' && data && (
             <div className="bench-case-doc">
               <header className="bench-doc-head">
@@ -983,7 +1002,7 @@ function ResultsBoard({
                       <span className="bench-section-cap">评审标准 · {r.checks.filter(check => check.pass).length} / {r.checks.length} 项通过</span>
                       <ol>
                         {r.checks.map((c, i) => (
-                          <li key={i} className="bench-check" data-pass={c.pass || undefined}>
+                          <li key={i} className="bench-check" data-pass={c.pass || undefined} style={{ '--stagger': i } as CSSProperties}>
                             <span className="bench-ico" aria-hidden="true"><Icon name={c.pass ? 'check' : 'x'} /></span>
                             <div>
                               <p className="bench-check-criterion"><span className="bench-sr-only">{c.pass ? '通过' : '未通过'}：</span>{c.criterion}</p>

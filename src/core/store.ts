@@ -49,17 +49,26 @@ const resultSchema = z.object({
     cacheWriteTokens: z.number().optional(),
   }).optional(),
   tools: z.array(toolUseSchema).optional(),
+  cacheWarnings: z.array(z.string()).optional(),
   memoryReferences: z.array(z.object({ source: z.string(), content: z.string(), effect: z.string() })).optional(),
   observerErrors: z.array(z.string()).optional(),
 }).refine((r) => r.ok === (r.status === 'succeeded'), 'ok 与 status 不一致');
 const historySchema = z.array(z.object({
   turnId: safeId, question: z.string(), answer: z.string(),
   userContent: z.string().optional(),
+  answerRunId: safeId.optional(),
+  selected: z.object({ target: safeId, label: z.string() }).optional(),
+  sentUsers: z.array(z.object({ target: safeId, provider: safeId, suffix: z.string(), replace: z.literal(true).optional() })).optional(),
 }));
 const inputSchema = z.object({
   prompt: z.string(), cwd: z.string(), history: historySchema,
+  materials: z.array(z.object({
+    name: z.string(), file: z.string(), mime: z.string(), bytes: z.number(),
+    text: z.string(), note: z.string(), extraction: z.string(),
+  })).optional(),
   userContent: z.string().optional(),
   sharedFiles: z.array(z.string()).optional(),
+  sharedContext: z.string().optional(),
   memorySnapshot: memorySnapshotSchema.optional(),
   memoryUpdates: z.array(z.string()).optional(),
 });
@@ -81,6 +90,8 @@ const recordSchema = z.object({
     id: safeId, scope: z.enum(['decision', 'answer', 'dispute-assessment', 'source-check', 'synthesis', 'exec', 'plan-review', 'result-review']), target: targetSchema,
     input: z.object({
       prompt: z.string(),
+      turnPrompt: z.string().optional(),
+      parentAnswerId: safeId.optional(),
       messages: z.array(chatMessageSchema).optional(),
       memoryReportMarker: z.string().optional(),
       memorySnapshot: memorySnapshotSchema.optional(),
@@ -255,10 +266,25 @@ function formatExecutedAnswer(planText: string | undefined, execution: RunRecord
   return execOk ? execResult.text.trim() : undefined;
 }
 
-export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, fromTargetId?: string): HistoryEntry[] {
+export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, fromTargetId?: string, comparison?: RunRecord): HistoryEntry[] {
+  if (run.kind === 'execution' && comparison && run.planSource?.turnId === comparison.id) {
+    return historyAfter(comparison, run);
+  }
   const userContent = run.input.userContent;
-  const entry = (turnId: string, answer: string): HistoryEntry => ({
-    turnId, question: run.question, answer, ...(userContent ? { userContent } : {}),
+  const sentUsers = run.calls.flatMap(call => {
+    if (call.scope !== 'answer') return [];
+    const last = call.input.messages?.at(-1);
+    const content = last?.role === 'user' ? last.content : call.input.turnPrompt;
+    const base = call.target.capabilities.askPolicy === 'text-only' ? userContent ?? run.question : run.question;
+    if (content === undefined || content === base) return [];
+    const target = { target: call.target.id, provider: call.target.provider };
+    return content.startsWith(base)
+      ? [{ ...target, suffix: content.slice(base.length) }]
+      : [{ ...target, suffix: content, replace: true as const }];
+  });
+  const entry = (turnId: string, answer: string, answerRunId?: string): HistoryEntry => ({
+    turnId, question: run.question, answer, answerRunId, ...(userContent ? { userContent } : {}),
+    ...(sentUsers.length ? { sentUsers } : {}),
   });
   if (run.kind === 'execution') {
     const answer = formatExecutedAnswer(run.planSource?.planText?.trim(), run);
@@ -273,7 +299,7 @@ export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, from
       const picked = run.results.find((r) => r.targetId === fromTargetId && r.ok && r.text.trim());
       if (picked) {
         const label = sourceDisplayName({ turnId: run.id, runId: picked.runId, targetId: picked.targetId, scope: 'answer' }, run);
-        return [...run.input.history, entry(run.id, `[已选定回答：${label}]\n${picked.text.trim()}`)];
+        return [...run.input.history, { ...entry(run.id, picked.text, picked.runId), selected: { target: picked.targetId, label } }];
       }
     }
   }
@@ -289,5 +315,5 @@ export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, from
     return [...run.input.history, entry(run.id, answer)];
   }
   const best = run.results.find((r) => r.ok && r.text.trim());
-  return [...run.input.history, ...(best ? [entry(run.id, best.text)] : [])];
+  return [...run.input.history, ...(best ? [entry(run.id, best.text, best.runId)] : [])];
 }

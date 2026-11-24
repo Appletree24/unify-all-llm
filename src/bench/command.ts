@@ -88,7 +88,7 @@ export async function benchCommand(cwd: string, args: string[], signal: AbortSig
   const model = (name?: string) => {
     const target = name && Object.hasOwn(registry, name) && registry[name];
     if (!target) throw new Error('请选择有效的目标 ID：' + (name || '未指定'));
-    return { target, timeoutMs: timeoutMillis(cfg.timeoutSec ?? 600), signal };
+    return { target, timeoutMs: timeoutMillis(cfg.timeoutSec ?? 600), signal, project: cwd };
   };
   const judge = values.judge ? model(values.judge) : undefined;
   if (cmd === 'draft' && id) {

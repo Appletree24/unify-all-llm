@@ -23,6 +23,7 @@ const paths: Record<string, ReactNode> = {
   retry: <><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 4v7h-7" /></>,
   run: <path d="m5 17 5-5-5-5M12 19h7" />,
   gauge: <><path d="M4.2 17.5a9 9 0 1 1 15.6 0" /><path d="m12 13 4-4" /></>,
+  activity: <path d="M2 12h5l3-8 4 16 3-8h5" />,
   layers: <><path d="m12 3 9 4.5-9 4.5-9-4.5z" /><path d="m3 12 9 4.5 9-4.5" /><path d="m3 16.5 9 4.5 9-4.5" /></>,
   sliders: <path d="M4 20v-6M4 10V4M12 20v-8M12 8V4M20 20v-4M20 12V4M2 14h4M10 8h4M18 16h4" />,
   folder: <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5z" />,

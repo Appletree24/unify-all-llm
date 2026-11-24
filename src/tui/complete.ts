@@ -32,6 +32,7 @@ export const COMMANDS: CommandSpec[] = [
   { name: 'branch', detail: '查看本地分支；/branch 分支名 切换' },
   { name: 'bench', detail: '将当前轮次留作评测题，可附一句预期行为' },
   { name: 'quota', detail: '监控各模型的套餐余量和重置时间' },
+  { name: 'cache', detail: '查看全局缓存读数覆盖情况及预警摘要' },
   { name: 'exec', detail: '按汇总或唯一成功回答实施，可指定执行目标', arg: 'executor' },
   { name: 'use', detail: '下轮追问沿用指定目标的回答（不带参数恢复默认）', arg: 'target' },
   { name: 'retry', detail: '重试失败的目标，或指定目标重新回答', arg: 'targets' },

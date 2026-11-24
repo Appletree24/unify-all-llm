@@ -30,6 +30,7 @@ export class ModelTests {
     const check: Check = { state: { status: 'testing', message: '测试中…' } };
     this.checks.set(target, check);
     check.pending = runOne(target, {
+      cache: { scope: 'model-check' },
       cwd: this.cwd, mode: 'ask', prompt: '请只回复 OK，无需使用工具。', timeoutMs: timeoutMillis(timeoutSec), signal,
     }).then(result => {
       check.state = result.ok && result.text.trim()

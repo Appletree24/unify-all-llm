@@ -3,6 +3,7 @@ import { graphIssue, graphStages, roleNames, type Collaboration, type GraphRole,
 import type { WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { Icon } from './ui.js';
+import { usePresence } from './motion.js';
 import { CombinationCanvas } from './CombinationCanvas.js';
 import './CollaborationGraph.css';
 
@@ -14,7 +15,8 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
   ws: WorkspaceInfo; initial?: string; connect(): void; notify(message: string, kind?: 'ok' | 'err'): void;
 }) {
   const [id,setId] = useState(initial || Object.keys(ws.collaborationGraphs)[0] || '');
-  const [editing,setEditing] = useState<Selection>();
+  const [editing,setEditing] = useState<Selection & { role: GraphRole }>();
+  const menuPresence = usePresence(editing);
   const [naming,setNaming] = useState<'rename' | 'copy'>();
   const [name,setName] = useState('');
   const [saving,setSaving] = useState(false);
@@ -23,7 +25,8 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
   const menu = useRef<HTMLDivElement>(null);
   const anchor = useRef<HTMLElement | null>(null);
   const graph = ws.collaborationGraphs[id];
-  const role = editing && graph && (editing.step === 'plan' ? graph.plans[editing.index] : graph[editing.step]);
+  const visibleEditing = menuPresence.rendered;
+  const role = visibleEditing && ((editing && graph && (editing.step === 'plan' ? graph.plans[editing.index] : graph[editing.step])) ?? visibleEditing.role);
   const targetLabel = (target: string) => ws.targets.find(t => t.id === target)?.label ?? target;
   const issue = graph && graphIssue(graph, ws.targets);
   function dismiss() {
@@ -125,7 +128,7 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
   }
   const [roleLabel,setRoleLabel] = useState('');
   function edit(step: EditableStep,index: number,element: HTMLElement,selected: GraphRole) {
-    anchor.current = element; setRoleLabel(selected.label ?? roleNames[step]); setEditing({ step,index });
+    anchor.current = element; setRoleLabel(selected.label ?? roleNames[step]); setEditing({ step,index,role:selected });
   }
   function node(step: EditableStep, selected: GraphRole, index: number) {
     const target = ws.targets.find(t => t.id === selected.target);
@@ -150,7 +153,7 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
     document.addEventListener('keydown',listener);
     return () => document.removeEventListener('keydown',listener);
   });
-  return <section className="cg-editor" aria-label="组合模版">
+  return <section className="cg-editor page-enter" aria-label="组合模版">
     {Object.keys(ws.collaborationGraphs).length > 0 ? <div className="cg-templates" aria-label="已保存的组合模版">
       {Object.entries(ws.collaborationGraphs).map(([key, value]) =>
         <button key={key} type="button" disabled={saving} aria-pressed={key === id} onClick={() => choose(key)}>{value.name}</button>)}
@@ -191,16 +194,17 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
       </CombinationCanvas>
       {issue && <p className="cg-warning"><Icon name="alert" size={14}/>{issue}<button className="link" onClick={connect}>去接入模型</button></p>}
       {saving && <p className="cg-note" role="status">正在保存…</p>}
-      {editing && role && <div ref={menu} popover="auto" role="dialog" aria-label={'编辑' + roleNames[editing.step]} className="cg-menu"
+      {visibleEditing && role && <div ref={menu} popover="auto" role="dialog" aria-label={'编辑' + roleNames[visibleEditing.step]} className="cg-menu"
+        inert={menuPresence.state === 'closing'}
         onToggle={e => { if (!e.currentTarget.matches(':popover-open')) setEditing(undefined); }}>
         <form onSubmit={e => { e.preventDefault(); updateRole({ ...role,label:roleLabel.trim() || undefined }); }}>
           <input aria-label="角色名称" maxLength={40} value={roleLabel} onChange={e => setRoleLabel(e.target.value)}/><button className="ghost" title="保存角色名"><Icon name="check" size={14}/></button>
         </form>
-        {ws.targets.filter(t => editing.step !== 'execution' || t.exec).map(t => <button key={t.id} className="cg-choice"
-          aria-pressed={t.id === role.target} disabled={t.installed === false || (editing.step === 'plan' && graph.plans.some((p,i) => i !== editing.index && p.target === t.id))}
+        {ws.targets.filter(t => visibleEditing.step !== 'execution' || t.exec).map(t => <button key={t.id} className="cg-choice"
+          aria-pressed={t.id === role.target} disabled={t.installed === false || (visibleEditing.step === 'plan' && graph.plans.some((p,i) => i !== visibleEditing.index && p.target === t.id))}
           onClick={() => updateRole({ ...role,target:t.id })}><span>{t.label}<small>{t.id}</small></span>{t.installed === false ? '未接入' : t.id === role.target ? '✓' : ''}</button>)}
         <button className="link" onClick={connect}>去接入模型</button>
-        {removable(editing.step) && <button className="link" onClick={() => remove(editing)}>移除此节点</button>}
+        {removable(visibleEditing.step) && <button className="link" onClick={() => remove(visibleEditing)}>移除此节点</button>}
       </div>}
     </>}
   </section>;

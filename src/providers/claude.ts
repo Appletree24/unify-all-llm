@@ -25,6 +25,7 @@ function mapClaudeResult(ev: Record<string, any>, req: RunRequest, acc: string):
   }
   return {
     type: 'done',
+    nativeSession: req.conversation && typeof ev.session_id === 'string' ? { id: ev.session_id, forkable: true } : undefined,
     // In ask mode the final message is the answer; in exec mode keep the whole narration.
     text: req.mode === 'ask' ? String(ev.result || acc) : acc || String(ev.result ?? ''),
     usage: {
@@ -47,10 +48,14 @@ async function* runClaudeInteractive(req: RunRequest, bin: BinaryTarget): AsyncG
     '--permission-prompts', 'host',
   ];
   if (req.mode === 'ask') {
-    args.push('--tools', 'Read,Glob,Grep,WebSearch,WebFetch', '--no-session-persistence');
+    args.push('--tools', 'Read,Glob,Grep,WebSearch,WebFetch');
   } else {
     args.push('--permission-mode', 'acceptEdits');
   }
+  if (req.conversation?.resumeId) args.push('--resume', req.conversation.resumeId);
+  else if (req.mode === 'ask' && !req.conversation) args.push('--no-session-persistence');
+  if (req.conversation?.fork) args.push('--fork-session');
+  if (req.conversation?.fork && req.mode === 'exec') args.push('--tools', 'default');
   if (req.reasoningEffort) args.push('--effort', req.reasoningEffort);
   if (req.model) args.push('--model', req.model);
 
@@ -83,6 +88,7 @@ async function* runClaudeInteractive(req: RunRequest, bin: BinaryTarget): AsyncG
                     description: typeof o.description === 'string' ? o.description : undefined,
                   }))
                 : undefined,
+              multiSelect: q.multiSelect === true,
               allowOther: true,
             }));
             const res = await interact({
@@ -179,10 +185,57 @@ async function* runClaudeInteractive(req: RunRequest, bin: BinaryTarget): AsyncG
   }
 }
 
+async function* runClaudeHeadless(req: RunRequest, bin: BinaryTarget): AsyncGenerator<ProviderEvent> {
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
+  if (req.mode === 'ask') {
+    // Read-only: can inspect the repo and search the web, cannot change anything.
+    args.push('--tools', 'Read,Glob,Grep,WebSearch,WebFetch', '--permission-prompts', 'none');
+  } else {
+    args.push('--permission-mode', 'acceptEdits');
+  }
+  if (req.conversation?.resumeId) args.push('--resume', req.conversation.resumeId);
+  else if (req.mode === 'ask' && !req.conversation) args.push('--no-session-persistence');
+  if (req.conversation?.fork) args.push('--fork-session');
+  if (req.conversation?.fork && req.mode === 'exec') args.push('--tools', 'default');
+  if (req.reasoningEffort) args.push('--effort', req.reasoningEffort);
+  if (req.model) args.push('--model', req.model);
+
+  let acc = '';
+  for await (const ev of runJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...args], {
+    cwd: req.cwd,
+    stdin: req.prompt,
+    signal: req.signal,
+    nativeExecutable: bin.nativeExecutable,
+  })) {
+    if (ev.parent_tool_use_id) continue; // subagent chatter
+
+    if (ev.type === 'stream_event') {
+      const e = ev.event;
+      if (e?.type === 'message_start' && acc) {
+        acc += '\n\n';
+        yield { type: 'delta', text: '\n\n' };
+      } else if (e?.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
+        yield { type: 'tool', name: String(e.content_block.name ?? 'tool') };
+      } else if (e?.type === 'content_block_delta') {
+        const d = e.delta;
+        if (d?.type === 'text_delta' && d.text) {
+          acc += d.text;
+          yield { type: 'delta', text: d.text };
+        } else if (d?.type === 'thinking_delta' && d.thinking) {
+          yield { type: 'reasoning', text: d.thinking };
+        }
+      }
+    } else if (ev.type === 'result') {
+      yield mapClaudeResult(ev, req, acc);
+    }
+  }
+}
+
 // Verified against Claude Code 2.1.x `-p --output-format stream-json` and bidirectional `--input-format stream-json --permission-prompts host`.
 export function createClaudeAdapter(bin: BinaryTarget = DEFAULT_CLAUDE_BIN): ProviderAdapter {
   return {
     id: 'claude',
+    nativeConversation: true,
     label: 'Claude',
     capabilities: { askPolicy: 'read-tools', exec: true },
 
@@ -192,49 +245,24 @@ export function createClaudeAdapter(bin: BinaryTarget = DEFAULT_CLAUDE_BIN): Pro
     },
 
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
-      if (req.interact) {
-        yield* runClaudeInteractive(req, bin);
+      const run = req.interact ? runClaudeInteractive : runClaudeHeadless;
+      const turn = req.conversation;
+      if (!turn?.resumeId) {
+        yield* run(req, bin);
         return;
       }
-
-      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
-      if (req.mode === 'ask') {
-        // Read-only: can inspect the repo and search the web, cannot change anything.
-        args.push('--tools', 'Read,Glob,Grep,WebSearch,WebFetch', '--permission-prompts', 'none', '--no-session-persistence');
-      } else {
-        args.push('--permission-mode', 'acceptEdits');
-      }
-      if (req.reasoningEffort) args.push('--effort', req.reasoningEffort);
-      if (req.model) args.push('--model', req.model);
-
-      let acc = '';
-      for await (const ev of runJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...args], {
-        cwd: req.cwd,
-        stdin: req.prompt,
-        signal: req.signal,
-        nativeExecutable: bin.nativeExecutable,
-      })) {
-        if (ev.parent_tool_use_id) continue; // subagent chatter
-
-        if (ev.type === 'stream_event') {
-          const e = ev.event;
-          if (e?.type === 'message_start' && acc) {
-            acc += '\n\n';
-            yield { type: 'delta', text: '\n\n' };
-          } else if (e?.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
-            yield { type: 'tool', name: String(e.content_block.name ?? 'tool') };
-          } else if (e?.type === 'content_block_delta') {
-            const d = e.delta;
-            if (d?.type === 'text_delta' && d.text) {
-              acc += d.text;
-              yield { type: 'delta', text: d.text };
-            } else if (d?.type === 'thinking_delta' && d.thinking) {
-              yield { type: 'reasoning', text: d.thinking };
-            }
-          }
-        } else if (ev.type === 'result') {
-          yield mapClaudeResult(ev, req, acc);
+      let started = false;
+      const missing = /no conversation found|session (?:not found|does not exist)|could not find (?:conversation|session)/i;
+      try {
+        for await (const event of run({ ...req, prompt: turn.turnPrompt }, bin)) {
+          if (!started && event.type === 'error' && missing.test(event.message)) throw new Error(event.message);
+          started = true;
+          yield event;
         }
+      } catch (err) {
+        if (started || req.signal?.aborted || !missing.test(String(err))) throw err;
+        req.onPublicReplay?.();
+        yield* run({ ...req, conversation: { turnPrompt: turn.turnPrompt } }, bin);
       }
     },
   };

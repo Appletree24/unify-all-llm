@@ -14,7 +14,14 @@ export { caseSchema, repoSchema, reviewSchema, taskSchema, type BenchCase, type 
 
 const nonempty = z.string().min(1);
 const sourceSchema = z.object({ turn: nonempty, call: z.string().optional() });
-const candidateSchema = z.object({ version: z.literal(1), id: nonempty, source: sourceSchema, title: nonempty, note: z.string() });
+const feedbackSchema = z.object({
+  kind: z.enum(['标注', '正例', '反例', '改写', '比较', '评分', '验收标准', '实际结果']),
+  quote: z.string().optional(), revision: z.string().optional(), comment: z.string(),
+  ranked: z.array(z.object({ call: nonempty, excerpt: z.string() })).optional(),
+  score: z.number().int().min(1).max(5).optional(),
+});
+export type BenchFeedback = z.infer<typeof feedbackSchema>;
+const candidateSchema = z.object({ version: z.literal(1), id: nonempty, source: sourceSchema, title: nonempty, note: z.string(), feedback: feedbackSchema.optional() });
 export type Candidate = z.infer<typeof candidateSchema>;
 export type BenchIndex = { collections: Collection[]; candidates: Candidate[]; drafts: { id: string; title: string }[]; cases: { id: string; title: string; kind: BenchKind }[] };
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -27,13 +34,15 @@ export function sourceAnswer(run: RunRecord, call?: string) {
   if (!match) throw new Error('这条回答不属于所选轮次');
   return match.text || match.error || '';
 }
-export function capture(cwd: string, turn: string | undefined, call?: string, note = ''): Candidate {
+export function capture(cwd: string, turn: string | undefined, call?: string, note = '', feedback?: BenchFeedback): Candidate {
   const run = loadRun(cwd, turn);
   turn = run.id;
   sourceAnswer(run, call);
   // A different observation about the same answer is a separate candidate.
-  const id = digest(JSON.stringify([turn, call ?? '', note.trim()])).slice(0, 24);
-  const candidate = candidateSchema.parse({ version: 1, id, title: run.question.slice(0, 100), source: { turn, call }, note: note.trim() });
+  const observation = feedback && feedbackSchema.parse(feedback);
+  for (const entry of observation?.ranked ?? []) sourceAnswer(run, entry.call);
+  const id = digest(JSON.stringify([turn, call ?? '', note.trim(), ...(observation ? [observation] : [])])).slice(0, 24);
+  const candidate = candidateSchema.parse({ version: 1, id, title: run.question.slice(0, 100), source: { turn, call }, note: note.trim(), feedback: observation });
   insert(inbox(cwd), id, candidate);
   return candidate;
 }
