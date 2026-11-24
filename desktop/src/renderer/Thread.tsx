@@ -576,7 +576,7 @@ export function Composer({ ws, quota, busy, state, onToggleTarget, onSynthesisCh
         <div className="composer-bar">
           <div className="chips">
             {usable.map((t) => {
-              const q = quotaSummary(quota.get(t.id)?.reading);
+              const q = quotaSummary(quota.get(t.id)?.reading, t);
               const on = state.selected.includes(t.id);
               return (
                 <button

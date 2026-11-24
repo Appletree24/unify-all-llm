@@ -16,7 +16,7 @@ node dist/cli.js
 
 ```sh
 node dist/cli.js doctor
-node dist/cli.js ask "分析这个项目的模块划分" --models codex,gemini
+node dist/cli.js ask "分析这个项目的模块划分" --models codex,gemini-pro
 node dist/cli.js ask -c "进一步说明取消与资源清理"
 node dist/cli.js exec --with codex
 ```
@@ -115,7 +115,7 @@ unify bench remove case <案例ID>
 
 ### 同一个 CLI 比较多个模型
 
-`provider` 是协议适配器，`target` 是用户选择的模型配置。内置 `claude`、`codex`、`gemini`、`deepseek` 各自也有同名默认目标。
+`provider` 是协议适配器，`target` 是用户选择的模型配置。内置 `claude`、`codex`、`gemini-pro`、`deepseek` 各自也有同名目标。
 
 ```json
 {
@@ -136,7 +136,7 @@ unify bench remove case <案例ID>
 
 替换示例中的模型名后使用。`providers`、`synthesizer`、`executor` 和 `decider` 引用目标 id；`--models fast,deep` 与 TUI `/models fast,deep` 使用相同 id。重复选择同一个 id 会报错。两个不同目标可以共用一个 provider，各自拥有独立的调用 id、结果和面板。
 
-旧的 `"models": {"codex": "<模型名>"}` 配置仍可用。`models.<目标id>` 显式覆盖该目标的 `model`。未配置 `providers` 时，使用所有可用目标，排除 `decider` 本身；需要控制调用数量时，请明确列出 `providers`。
+旧的 `"models": {"codex": "<模型名>"}` 配置仍可用。`models.<目标id>` 显式覆盖该目标的 `model`。未配置 `providers` 时，使用所有可用目标，排除 `decider` 本身；需要控制调用数量时，请明确列出 `providers`。旧配置中的内置 `gemini` 及其目标别名会在加载时跳过。如果回答目标全部被跳过，Unify 会恢复自动选择。
 
 ### 设置与思考强度
 
@@ -160,7 +160,7 @@ unify bench remove case <案例ID>
 }
 ```
 
-界面把选择保存在 `reasoningEffort.<目标 ID>`，优先于该目标别名中的 `reasoningEffort`。旧配置继续使用原有默认行为。Codex CLI 使用 `model_reasoning_effort`，Claude Code 使用 `--effort`。已有的模型 ID 和目标别名会保留在列表里。Gemini CLI 的思考配置别名可以先写入 `models` 或 `targets`，再从列表选择。[Gemini CLI 模型别名](https://geminicli.com/docs/cli/generation-settings/)
+界面把选择保存在 `reasoningEffort.<目标 ID>`，优先于该目标别名中的 `reasoningEffort`。旧配置继续使用原有默认行为。Codex CLI 使用 `model_reasoning_effort`，Claude Code 使用 `--effort`。已有的模型 ID 和目标别名会保留在列表里。
 
 DeepSeek 区分关闭思考和设置思考强度。Gemini API 和兼容推理模型使用 `reasoning_effort`。Anthropic 的兼容接口使用思考预算，界面对支持手动预算的 Claude 4 系列提供 1024、4096、8192 token 三档。具体可用档位还取决于模型及客户端版本。[DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/) · [Gemini API](https://ai.google.dev/gemini-api/docs/openai) · [Anthropic 兼容接口](https://platform.claude.com/docs/en/api/openai-sdk)
 
@@ -239,13 +239,10 @@ node dist/cli.js ask "比较这两种缓存失效策略" --models codex,deepseek
 | --- | --- | --- |
 | Claude | 限定 Read/Glob/Grep/WebSearch/WebFetch 工具 | 是 |
 | Codex | CLI `read-only` sandbox | 是 |
-| Gemini | CLI `plan` approval mode | 是 |
 | Gemini Pro（Google AI 订阅） | Antigravity CLI `plan` 模式 | 否 |
 | 官方 API | 只发送 messages，不运行本地工具 | 否 |
 | OpenAI 端点 | 只发送 messages，不运行本地工具 | 否 |
 | 自定义命令 | 任意受信任命令，无内置隔离 | 否 |
-
-Gemini 必须支持 `--approval-mode plan`。该模式允许写计划文件，且受本地策略影响，不能视为操作系统级只读沙箱。协议与模式参考 [headless](https://geminicli.com/docs/cli/headless/) 和 [plan mode](https://geminicli.com/docs/cli/plan-mode/)。不支持的 CLI 版本会报错，不回退到权限更大的模式。
 
 所有回答目标收到相同的公共问题与历史；CLI 仍可能加载自己的系统提示、项目文件、工具和设置。运行记录保存 Unify 传入的输入及已声明配置，不能复现外部 CLI 内部的完整模型上下文。因此，这适合多模型协作；单凭结果不能做严格的等算力模型评测。
 
@@ -269,7 +266,6 @@ node dist/cli.js quota --json     # 输出 JSON，配合 --watch 时每行一轮
 | --- | --- |
 | Codex | 当前 CLI 账号返回的用量窗口、剩余百分比和重置时间 |
 | Claude Code | 当前订阅返回的用量窗口、剩余百分比和重置时间，需要支持额度查询的 CLI 版本 |
-| Gemini CLI | 使用当前 Google 登录的有效访问令牌读取 Code Assist 各模型配额。令牌过期时打开 Gemini CLI 刷新登录；加密凭证、API key 和 Vertex AI 可通过自定义额度命令接入 |
 | Gemini Pro（Antigravity CLI） | 使用已登录的 `agy` 1.1.11 或更新版本查询各模型组的套餐剩余额度和重置时间 |
 | DeepSeek 官方 API | 当前 API Key 对应账户按币种显示的可用余额 |
 | 自定义命令和 OpenAI 兼容网关 | 通过用户配置的 `quotaCommands` 读取该服务的额度 |

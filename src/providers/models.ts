@@ -9,7 +9,6 @@ import { officialApis } from './official.js';
 const modelsByProvider: Readonly<Record<string, readonly string[]>> = {
   codex: ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex'],
   claude: ['sonnet', 'opus', 'haiku'],
-  gemini: ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-pro', 'gemini-2.5-flash'],
   deepseek: ['deepseek-flash', 'deepseek-v4-pro'],
   openai: ['gpt-6.2-astra', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-4.1-mini', 'o3'],
   anthropic: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'],

@@ -75,13 +75,43 @@ export function mergeConfig(user: Config, project: Config): Config {
     ...(project.memory?.projectSource ?? user.memory?.projectSource ? { projectSource: project.memory?.projectSource ?? user.memory?.projectSource } : {}),
     ...(project.memory?.maxBytes ?? user.memory?.maxBytes ? { maxBytes: project.memory?.maxBytes ?? user.memory?.maxBytes } : {}),
   } : undefined;
-  return {
+  return removeRetiredGemini({
     ...user, ...project, custom: user.custom, quotaCommands: user.quotaCommands,
     disableClaude: user.disableClaude === true || project.disableClaude === true,
     reasoningEffort: { ...user.reasoningEffort, ...project.reasoningEffort },
     models: { ...user.models, ...project.models }, targets: { ...user.targets, ...project.targets },
     ...(memory && Object.keys(memory).length ? { memory } : {}),
-  };
+  });
+}
+
+function removeRetiredGemini(config: Config): Config {
+  // A user-defined transport can reuse the former provider id.
+  if (config.custom?.gemini) return config;
+
+  const retiredIds = new Set(Object.entries(config.targets ?? {})
+    .filter(([, target]) => target.provider === 'gemini')
+    .map(([id]) => id));
+  if (!config.targets?.gemini) retiredIds.add('gemini');
+
+  for (const id of retiredIds) {
+    delete config.targets?.[id];
+    delete config.models?.[id];
+    delete config.reasoningEffort?.[id];
+  }
+  for (const field of ['synthesizer', 'executor', 'decider'] as const) {
+    const id = config[field];
+    if (id && retiredIds.has(id)) delete config[field];
+  }
+  if (config.providers) {
+    const providers = config.providers.filter(id => !retiredIds.has(id));
+    if (providers.length) config.providers = providers;
+    else delete config.providers;
+  }
+  if (config.quotaCommands?.gemini) {
+    config.quotaCommands = { ...config.quotaCommands };
+    delete config.quotaCommands.gemini;
+  }
+  return config;
 }
 
 export function timeoutMillis(seconds: number): number {

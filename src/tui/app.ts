@@ -36,7 +36,6 @@ const YELLOW = rgb(235, 190, 90);
 const PROVIDER_COLORS: Record<string, string> = {
   claude: rgb(217, 119, 87),
   codex: rgb(25, 195, 155),
-  gemini: rgb(96, 150, 255),
   deepseek: rgb(110, 130, 250),
 };
 const FALLBACK_COLORS = [rgb(230, 130, 180), rgb(120, 200, 230), rgb(170, 210, 110)];

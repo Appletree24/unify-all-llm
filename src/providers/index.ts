@@ -4,19 +4,16 @@ import { claude } from './claude.js';
 import { codex } from './codex.js';
 import { customAdapter } from './custom.js';
 import { officialAdapter, officialApis, readApiProfile } from './official.js';
-import { gemini } from './gemini.js';
 import { geminiPro } from './antigravity.js';
 import { readClaudeQuota } from '../quota/claude.js';
 import { readCodexQuota } from '../quota/codex.js';
 import { commandQuota } from '../quota/command.js';
-import { readGeminiQuota } from '../quota/gemini.js';
 
 import { effortChoices } from './effort.js';
 
 const builtin: Record<string, ProviderAdapter> = {
   claude: { ...claude, readQuota: readClaudeQuota },
   codex: { ...codex, readQuota: readCodexQuota },
-  gemini: { ...gemini, readQuota: readGeminiQuota },
 };
 export const RESERVED: Record<string, string> = { jev: 'Jev（System One 决策模型）' };
 

@@ -95,14 +95,35 @@ export const statusText: Record<RunResultRecord['status'], string> = {
   running: '生成中', succeeded: '完成', failed: '失败', cancelled: '已取消', timed_out: '超时', interrupted: '中断',
 };
 
-/** The tightest limit of a quota reading, for compact display. */
-export function quotaSummary(reading?: QuotaReading): { text: string; ratio?: number; title: string } | undefined {
+const FIVE_HOUR_LIMIT = /(?:^|[^\d])(?:5\s*小时|5\s*h(?:ours?)?\b|5-hour\b|five[_ -]?hour\b)/i;
+const GEMINI_GROUP_LIMIT = /^gemini(?:\s+models?)?(?:\s*·|\b)/i;
+const CLAUDE_GPT_GROUP_LIMIT = /\b(?:claude|gpt)\b/i;
+
+/** The representative limit of a quota reading, for compact display. */
+export function quotaSummary(
+  reading?: QuotaReading,
+  target?: { provider?: string; model?: string },
+): { text: string; ratio?: number; title: string } | undefined {
   if (!reading) return undefined;
   if (reading.status !== 'ok') return { text: '', title: reading.message };
   const scored = reading.limits.map((l) => ({
     l, ratio: l.unit === '%' ? l.remaining / 100 : l.total ? l.remaining / l.total : undefined,
   }));
-  const pick = scored.filter((s) => s.ratio !== undefined).sort((a, b) => a.ratio! - b.ratio!)[0] ?? scored[0];
+  let pool = scored;
+  let preferFiveHour = false;
+  if (target?.provider === 'gemini-pro' || (!!target?.model && /\bgemini\b/i.test(target.model))) {
+    const wantsClaudeGpt = !!target?.model && CLAUDE_GPT_GROUP_LIMIT.test(target.model);
+    const matched = scored.filter((s) =>
+      wantsClaudeGpt ? CLAUDE_GPT_GROUP_LIMIT.test(s.l.label) : GEMINI_GROUP_LIMIT.test(s.l.label),
+    );
+    if (matched.length) {
+      pool = matched;
+      preferFiveHour = true;
+    }
+  }
+  const pick = (preferFiveHour ? pool.find((s) => FIVE_HOUR_LIMIT.test(s.l.label)) : undefined)
+    ?? pool.filter((s) => s.ratio !== undefined).sort((a, b) => a.ratio! - b.ratio!)[0]
+    ?? pool[0];
   if (!pick) return { text: '', title: '没有额度信息' };
   const { l } = pick;
   const text = l.unit === '%' ? `${Math.round(l.remaining)}%` : l.total ? `${Math.round((l.remaining / l.total) * 100)}%` : `${l.remaining}${l.unit === '%' ? '' : ' ' + l.unit}`;

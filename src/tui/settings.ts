@@ -100,7 +100,7 @@ export class SettingsView {
         label: '思考强度', value: choices.length ? target.reasoningEffort ?? '默认' : '此接口不支持',
         open: () => {
           if (!choices.length) {
-            this.message = target.adapter.id === 'gemini' ? '可从已配置的模型中选择 Gemini CLI 思考别名' : '此模型或接口未提供可配置的思考档位';
+            this.message = '此模型或接口未提供可配置的思考档位';
             return;
           }
           this.page('思考强度 · ' + id, () => ['default', ...choices].map(level => ({

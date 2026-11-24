@@ -66,7 +66,7 @@ exec 选项:
 
 配置: ./unify.config.json 覆盖 ~/.unify/config.json。
   targets: { "fast": { "provider": "codex", "model": "<模型名>" } }
-  providers: ["fast", "gemini"]；concurrency: 3。
+  providers: ["fast", "gemini-pro"]；concurrency: 3。
   custom 端点和命令仅从用户配置加载，详见 README。
   disableClaude: true 完全禁用 Claude Code，包括版本检测。
   TUI: /settings /models /quota /synth /cancel [目标] /retry [目标] /exec /new /copy /exit /quit。
@@ -385,7 +385,7 @@ async function main(): Promise<number> {
             const targets = Object.values(buildRegistry(cfg));
             const found = await detectTargets(targets, abort.signal);
             for (const t of targets) process.stdout.write(`${found.get(t.id) ? '✓' : '·'} ${t.id} · ${t.adapter.id}${t.model ? ` / ${t.model}` : ''} · ask=${t.adapter.capabilities.askPolicy} · exec=${t.adapter.capabilities.exec}${cfg.disableClaude && t.adapter.id === 'claude' ? ' · 已禁用（disableClaude）' : ''}\n`);
-            process.stdout.write('检测不验证登录或端点连通性；Gemini 需支持 plan 模式。\n');
+            process.stdout.write('检测不验证登录或端点连通性。\n');
             return [...found.values()].some(Boolean) ? 0 : 1;
         }
         case undefined:

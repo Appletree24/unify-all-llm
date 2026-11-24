@@ -21,7 +21,7 @@ Unify 当前已具备多工具记忆扫描、编辑、备份恢复与分层管�
 
 | 环节 | 现状 | 问题 |
 | --- | --- | --- |
-| 多模型上下文对称性 | Claude / Codex / Gemini CLI 各自读取原生记忆文件；`text-only` API 仅通过 `src/core/context.ts` 注入提问中 `@path` 引用的本地文件 | API 模型几乎处于「失忆」状态参与对比，容易与 CLI 模型产生因背景缺失导致的假分歧 |
+| 多模型上下文对称性 | Claude / Codex 各自读取原生记忆文件；`text-only` API 仅通过 `src/core/context.ts` 注入提问中 `@path` 引用的本地文件 | API 模型几乎处于「失忆」状态参与对比，容易与 CLI 模型产生因背景缺失导致的假分歧 |
 | 记忆扫描与热路径耦合 | `src/memory/scan.ts` 面向管理页面，会递归扫描子目录并同步执行 `git blame` | 不能直接把 `effectiveContext()` 接入提问热路径，且 `effectiveContext()` 未反映自动记忆截断与项目字节上限 |
 | KV Cache 连续性 | `src/core/synth.ts` 首轮纯文本、次轮切换为 JSON 历史字符串；`context.ts` 将本轮 `@file` 拼在历史之前；汇总 prompt 将固定原则放在动态回答之后；`Usage` 未采集缓存命中字段 | 多轮追问和汇总都会破坏前缀复用，且缺少可观测指标验证缓存收益 |
 | 重试语义与快照 | `src/core/workflow.ts` 重试时克隆 `record.input`，但仍对当前磁盘重跑 `resolveSharedFileContext()` | 若中途修改了记忆或附件，重试同一问题的两个结果失去可比性 |
@@ -100,7 +100,7 @@ KV Cache（Prefix Caching）依赖从请求头部开始的严格字节级前缀�
 | **OpenAI 官方 API** | 稳定前缀有自动缓存收益（受模型最小长度阈值与保留时间限制），以响应中的 `cached_tokens` 实测为准 |
 | **Anthropic（当前走 OpenAI 兼容层）** | Anthropic 官方明确其 OpenAI 兼容层不支持 prompt caching；当前改造先带来**上下文一致性收益**，若需缓存需后续评估直连 Messages API |
 | **Gemini API / 自定义网关** | 取决于模型隐式缓存门槛或网关（vLLM/SGLang 等）配置，分别记账 |
-| **Claude Code / Codex / Gemini CLI** | 当前每轮新启无状态进程（`--no-session-persistence` / `--ephemeral` / `plan`），静态原生前缀可由各 CLI 服务端自行命中，但工具集、模式切换（ask → exec）和内部工具回合均由原生 harness 控制，不以 Unify 的 `sessionId` 承诺跨轮缓存连续性 |
+| **Claude Code / Codex** | 当前每轮新启无状态进程（`--no-session-persistence` / `--ephemeral`），静态原生前缀可由各 CLI 服务端自行命中，但工具集、模式切换（ask → exec）和内部工具回合均由原生 harness 控制，不以 Unify 的 `sessionId` 承诺跨轮缓存连续性 |
 
 **观测先行**：在 `src/core/types.ts` 的 `Usage`、`src/providers/custom.ts` 的 SSE schema 及各适配器中补齐缓存读写字段（如 `cachedInputTokens` / `cacheWriteTokens`，服务端未返回时显示「未知」），用实测数据验证收益。
 
