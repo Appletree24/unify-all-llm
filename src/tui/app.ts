@@ -33,7 +33,8 @@ import { KeyParser, type Key } from './keys.js';
 import { layout } from './markdown.js';
 import { MemoryView } from './memory.js';
 import { QuotaView } from './quota.js';
-import { Screen, charWidth, rgb, textWidth, truncate, type Cell } from './screen.js';
+import { Screen, charWidth, rgb, textWidth, truncate, type Cell, type Point, type Rect, type TextRange } from './screen.js';
+import { SourceView, type SourceReference } from './source.js';
 
 // ── palette ────────────────────────────────────────────────────────────────
 const GOLD = rgb(232, 196, 104); // the synthesis: where the voices converge
@@ -80,6 +81,7 @@ export interface TuiIO {
   rows(): number;
   write(s: string): void;
   setMouse?(on: boolean): void;
+  setClipboard?(text: string): void;
 }
 
 export class App {
@@ -128,6 +130,7 @@ export class App {
   private api?: ApiView;
   private quota?: QuotaView;
   private quotaDetails = false;
+  private source?: SourceView;
 
   private focus = 'input';
   private zoomId?: string;
@@ -147,7 +150,9 @@ export class App {
   private pending = false;
   private ticker?: NodeJS.Timeout;
   private disposed = false;
-  private rects: { id: string; x: number; y: number; w: number; h: number }[] = [];
+  private rects: (Rect & { id: string; interaction?: { item: InteractionView; top: number } })[] = [];
+  private drag?: { range: TextRange; moved: boolean };
+  private selection?: { range: TextRange; text: string };
   private inputTop = 0;
   private mouseOn = true;
   private manualModels = false;
@@ -282,11 +287,27 @@ export class App {
   }
 
   // ── flows ────────────────────────────────────────────────────────────────
+  private get hasFullScreenView(): boolean {
+    return !!(this.source || this.shareView || this.picker || this.branchView || this.api || this.settings || this.quotaDetails || this.mem);
+  }
+
   private handleInteraction(ev: WorkflowEvent): boolean {
     if (ev.type === 'interaction') {
-      this.interactions.push(new InteractionView(ev.turnId, ev.targetLabel, ev.request));
+      const paneId = ev.scope === 'answer' ? `a:${ev.targetId}`
+        : ev.scope === 'exec' || ev.scope === 'result-review' || ev.scope === 'report' ? 'exec' : 'synth';
+      if (ev.scope === 'decision' && !this.synth) {
+        this.synth = this.newPane(ev.targetId, 'synth', `决策 · ${ev.targetLabel}`, this.colorOf(ev.targetId));
+      }
+      const item = new InteractionView(ev.turnId, paneId, ev.targetLabel, ev.request);
+      this.interactions.push(item);
+      if (ev.request.kind === 'approval' && !this.prompt && this.ed.empty && !this.hasFullScreenView && !this.help) {
+        this.prompt = item;
+        this.render();
+        return true;
+      }
     } else if (ev.type === 'interaction-resolved') {
       this.interactions = this.interactions.filter(item => item.turnId !== ev.turnId || item.request.id !== ev.interactionId);
+      if (this.prompt && !this.interactions.includes(this.prompt)) this.prompt = this.interactions[0];
     } else return false;
     this.requestRender();
     return true;
@@ -295,6 +316,7 @@ export class App {
   private workflowEvent(ev: WorkflowEvent): void {
     if (this.handleInteraction(ev)) return;
     if (ev.type === 'stage' && ev.stage === 'answering') {
+      this.synth = undefined;
       this.panes = ev.targets.map((t) => this.newPane(t.id, 'answer', t.label, this.colorOf(t.id)));
     } else if (ev.type === 'call' && (ev.scope === 'synthesis' || ev.scope === 'plan-review')) {
       this.synth = this.newPane(ev.target.id, 'synth', `${ev.scope === 'plan-review' ? '方案复核' : '汇总'} · ${ev.target.label}`, GOLD);
@@ -456,6 +478,7 @@ export class App {
   private finish(): void {
     this.busy = false;
     this.interactions = [];
+    this.prompt = undefined;
     this.requestRender();
     if (!this.queue.length || this.disposed) return;
     if (!this.userCancel) return void this.ask(this.queue.shift()!);
@@ -485,19 +508,29 @@ export class App {
   }
 
   private copyText(text: string, title: string): void {
+    const copied = () => this.say('已复制「' + title + '」到剪贴板', GOLD);
+    if (this.io.setClipboard) {
+      this.io.setClipboard(text);
+      return copied();
+    }
     const [cmd, args, data]: [string, string[], Buffer] =
       process.platform === 'win32'
         ? ['clip', [], Buffer.from('\uFEFF' + text, 'utf16le')]
         : process.platform === 'darwin'
           ? ['pbcopy', [], Buffer.from(text, 'utf8')]
           : ['xclip', ['-selection', 'clipboard'], Buffer.from(text, 'utf8')];
+    const terminalClipboard = () => {
+      this.io.write('\x1b]52;c;' + Buffer.from(text, 'utf8').toString('base64') + '\x07');
+      this.say('已向终端发送剪贴板内容', GOLD);
+    };
     try {
       const child = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
-      child.on('error', () => this.say(`复制失败：找不到 ${cmd}`, RED));
-      child.on('close', (code) => code === 0 && this.say(`已复制「${title}」到剪贴板`, GOLD));
+      child.on('error', () => {}); // A spawn failure also emits close.
+      child.on('close', (code) => code === 0 ? copied() : terminalClipboard());
+      child.stdin.on('error', () => {}); // The clipboard helper may exit before reading stdin.
       child.stdin.end(data);
     } catch {
-      this.say('复制失败', RED);
+      terminalClipboard();
     }
   }
 
@@ -851,7 +884,7 @@ export class App {
     } else if (name === 'mouse') {
       this.mouseOn = !this.mouseOn;
       this.io.setMouse?.(this.mouseOn);
-      this.say(this.mouseOn ? '鼠标滚轮已开启（选择文本请按住 Shift 拖动）' : '鼠标已关闭，可直接拖动选择文本');
+      this.say(this.mouseOn ? '鼠标交互已开启 · 拖选后按 Ctrl+C 复制 · 单击路径查看文件' : '鼠标交互已关闭 · 可用终端原生选区');
     } else if (name === 'synth') {
       if (!this.installed.get(arg)) return this.say(`"${arg}" 不可用`, RED);
       this.sessionSynth = arg;
@@ -864,14 +897,45 @@ export class App {
 
   // ── input ────────────────────────────────────────────────────────────────
   handleKey(k: Key): void {
+    if (k.name === 'mousedown' || k.name === 'mousedrag' || k.name === 'mouseup') {
+      const point = { x: k.x ?? -1, y: k.y ?? -1 };
+      if (!this.pointer(k.name, point)) return this.requestRender();
+      k = { name: 'click', ...point };
+    }
+    if (this.selection) {
+      const { text } = this.selection;
+      this.selection = undefined;
+      if (k.name === 'ctrl+c' || k.name === 'ctrl+y') {
+        this.copyText(text, '选中文字');
+        return this.requestRender();
+      }
+      if (k.name === 'esc') return this.requestRender();
+    }
+    this.drag = undefined;
+    if (k.name === 'click' && !this.confirm) {
+      const ref = this.last?.sourceAt({ x: k.x ?? -1, y: k.y ?? -1 });
+      if (ref) return this.openSource(ref);
+    }
     if (k.name === 'ctrl+g' && this.interactions.length) {
-      this.prompt = this.interactions[0];
+      this.source = undefined;
+      const current = this.prompt ? this.interactions.indexOf(this.prompt) : -1;
+      this.prompt = this.interactions[(current + 1) % this.interactions.length];
+      return this.render();
+    }
+    if (this.source) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      if (k.name === 'esc' || k.name === 'ctrl+c') this.source = undefined;
+      else this.source.handleKey(k);
+      return this.requestRender();
+    }
+    if ((this.prompt || !this.hasFullScreenView) && (k.name === 'wheelup' || k.name === 'wheeldown' || k.name === 'click')) {
+      this.mouse(k);
       return this.requestRender();
     }
     if (this.prompt) {
       if (k.name === 'ctrl+d') return this.onQuit();
-      if (!this.interactions.includes(this.prompt)) {
-        if (k.name === 'esc') this.prompt = undefined;
+      if (k.name === 'tab' || k.name === 'shifttab') {
+        this.prompt = undefined;
       } else if (k.name === 'ctrl+c') {
         this.prompt = undefined;
         this.interrupt();
@@ -880,7 +944,6 @@ export class App {
         const response = item.handleKey(k);
         if (response && this.active?.record.id === item.turnId) {
           this.active.respondInteraction(item.request.id, response);
-          this.prompt = this.interactions[0];
         }
       }
       return this.requestRender();
@@ -928,10 +991,6 @@ export class App {
     if (this.mem) {
       if (k.name === 'ctrl+d') return this.onQuit();
       this.mem.handleKey(k);
-      return this.requestRender();
-    }
-    if (k.name === 'wheelup' || k.name === 'wheeldown' || k.name === 'click') {
-      this.mouse(k);
       return this.requestRender();
     }
     this.notice = '';
@@ -1020,12 +1079,51 @@ export class App {
     return item.value !== current;
   }
 
+  private openSource(ref: SourceReference): void {
+    try { this.source = new SourceView(this.cwd, ref); }
+    catch (err) { return this.say(`无法预览 ${ref.path} · ${err instanceof Error && 'code' in err ? '文件不可读取' : String(err instanceof Error ? err.message : err)}`, YELLOW); }
+    this.render();
+  }
+
+  /** Keep a selection that starts inside a model panel within that panel's text area. */
+  private pointer(action: string, point: Point): boolean {
+    if (action === 'mousedown') {
+      this.selection = undefined;
+      if (!this.last || point.x < 0 || point.y < 0 || point.x >= this.last.cols || point.y >= this.last.rows) return false;
+      const pane = this.rects.find(r => point.x >= r.x + 2 && point.x < r.x + r.w - 2 && point.y > r.y && point.y < r.y + r.h - 1);
+      const bounds = pane
+        ? { x: pane.x + 2, y: pane.y + 1, w: pane.w - 4, h: pane.h - 2 }
+        : { x: 0, y: 0, w: this.last.cols, h: this.last.rows };
+      this.drag = { range: { from: point, to: point, bounds }, moved: false };
+      return false;
+    }
+    const drag = this.drag;
+    if (!drag) return false;
+    drag.range.to = point;
+    drag.moved ||= point.x !== drag.range.from.x || point.y !== drag.range.from.y;
+    if (action === 'mousedrag') return false;
+    this.drag = undefined;
+    if (!drag.moved) return true;
+    const text = this.last?.select(drag.range);
+    if (text?.trim()) this.selection = { range: drag.range, text };
+    return false;
+  }
+
   private mouse(k: Key): void {
     const x = k.x ?? -1;
     const y = k.y ?? -1;
     const hit = this.rects.find((r) => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
+    if (hit?.interaction && y >= hit.interaction.top && y < hit.y + hit.h - 1 && this.interactions.includes(hit.interaction.item)) {
+      const { item } = hit.interaction;
+      if (k.name === 'click') {
+        this.prompt = item;
+        this.render();
+      } else item.handleKey(k);
+      return;
+    }
     if (k.name === 'click') {
       if (this.confirm) return;
+      this.prompt = undefined;
       if (hit) {
         this.focus = hit.id;
         const ai = this.panes.findIndex((p) => p.id === hit.id);
@@ -1201,9 +1299,16 @@ export class App {
   render(): void {
     if (this.disposed) return;
     const s = this.compose();
-    if (!this.prompt && this.interactions.length && (this.branchView || this.quotaDetails || this.mem)) {
+    const first = this.interactions[0];
+    if (first && ((!this.prompt && this.hasFullScreenView) || this.source)) {
       s.put(0, s.rows - 1, ' '.repeat(s.cols));
-      s.put(1, s.rows - 1, 'Ctrl+G 处理模型交互请求', `1;${YELLOW}`);
+      const hint = this.source ? first.summary + ' · Esc 返回' : first.summary;
+      s.put(1, s.rows - 1, truncate(hint, s.cols - 2), `1;${YELLOW}`);
+    }
+    if (this.drag?.moved) s.select(this.drag.range, true);
+    else if (this.selection) {
+      if (s.select(this.selection.range) === this.selection.text) s.select(this.selection.range, true);
+      else this.selection = undefined;
     }
     this.last = s;
     const lines = s.toLines();
@@ -1228,35 +1333,33 @@ export class App {
     const s = new Screen(cols, rows);
     this.cursor = null;
     this.rects = [];
-    if (this.prompt) {
-      if (this.interactions.includes(this.prompt)) this.cursor = this.prompt.draw(s, this.interactions.length);
-      else s.put(1, 1, '这项请求已结束 · Esc 返回');
-      return s;
-    }
-    if (this.shareView) { this.shareView.draw(s); return s; }
-    if (this.picker) { this.picker.draw(s); return s; }
-    if (this.branchView) {
-      this.drawBranches(s, this.branchView);
-      return s;
-    }
-    const view = this.api ?? this.settings;
-    if (view) {
-      view.draw(s);
-      return s;
-    }
-    if (this.quotaDetails && this.quota) {
-      this.quota.draw(s);
-      return s;
-    }
-    if (this.mem) {
-      this.cursor = this.mem.draw(s);
-      return s;
+    if (this.source) { this.source.draw(s); return s; }
+    if (!this.prompt) {
+      if (this.shareView) { this.shareView.draw(s); return s; }
+      if (this.picker) { this.picker.draw(s); return s; }
+      if (this.branchView) {
+        this.drawBranches(s, this.branchView);
+        return s;
+      }
+      const view = this.api ?? this.settings;
+      if (view) {
+        view.draw(s);
+        return s;
+      }
+      if (this.quotaDetails && this.quota) {
+        this.quota.draw(s);
+        return s;
+      }
+      if (this.mem) {
+        this.cursor = this.mem.draw(s);
+        return s;
+      }
     }
     this.drawHeader(s);
     const inputH = this.drawInput(s);
     this.drawFooter(s);
     this.drawBody(s, 2, rows - 3 - inputH);
-    this.drawPopup(s);
+    if (!this.prompt) this.drawPopup(s);
     return s;
   }
 
@@ -1322,13 +1425,15 @@ export class App {
     if (cx >= inner) [cx, cy] = [0, cy + 1];
     while (lines.length <= cy) lines.push([]);
 
-    const h = Math.min(Math.max(3, Math.floor(s.rows / 3)), lines.length);
+    // Keep room for at least one output row and a two-row request in a short terminal.
+    const inputBudget = this.prompt ? s.rows - 11 : s.rows;
+    const h = Math.min(Math.max(3, Math.floor(s.rows / 3)), lines.length, inputBudget);
     const first = clamp(cy - h + 1, 0, lines.length - h);
-    const queued = this.queue.slice(0, 3);
+    const queued = this.queue.slice(0, Math.min(3, inputBudget - h));
     const y = s.rows - 1 - (h + 2);
     const top = y - 1 - queued.length;
     this.inputTop = top;
-    const active = this.focus === 'input' && !this.confirm;
+    const active = this.focus === 'input' && !this.confirm && !this.prompt;
     const st = active ? GOLD : BORDER;
 
     this.drawActivity(s, top);
@@ -1340,7 +1445,7 @@ export class App {
     s.put(0, y + h + 1, '─'.repeat(s.cols), st);
     if (first === 0) s.put(0, y + 1, '❯', active ? GOLD : DIM);
     for (let i = 0; i < h; i++) s.putCells(2, y + 1 + i, lines[first + i], s.cols - 1);
-    if (chars.length === 0) {
+    if (chars.length === 0 && !this.prompt) {
       const hint = this.busy
         ? '继续输入会排队，本轮结束后发送…'
         : this.continueFrom
@@ -1356,8 +1461,15 @@ export class App {
 
   /** One line above the composer: confirmation, notice, what is running, or key hints. */
   private drawActivity(s: Screen, y: number): void {
+    if (this.prompt) {
+      const error = this.prompt.inputError;
+      const keys = this.interactions.length > 1 ? 'Ctrl+G 下一项 · ' : '';
+      const hint = error || `${keys}Enter 提交 · Esc 取消 · ↑↓ 详情 · Tab 返回`;
+      s.put(1, y, truncate(hint, s.cols - 2), `1;${YELLOW}`);
+      return;
+    }
     const first = this.interactions[0];
-    if (first) return void s.put(1, y, truncate(`Ctrl+G 处理 · ${first.model} 等待交互：${first.request.title}`, s.cols - 2), `1;${YELLOW}`);
+    if (first) return void s.put(1, y, truncate(first.summary, s.cols - 2), `1;${YELLOW}`);
     if (this.confirm) return void s.put(1, y, truncate(this.confirm.text, s.cols - 2), `1;${YELLOW}`);
     if (this.notice) return void s.put(1, y, truncate(this.notice, s.cols - 2), this.noticeColor);
     if (this.busy) {
@@ -1426,7 +1538,8 @@ export class App {
       ['Enter', '发送；生成中发送会排队，本轮结束后自动发出'],
       ['Shift+Enter / Alt+Enter / Ctrl+J', '换行'],
       ['Esc', '中断本轮（排队的消息放回输入框）'],
-      ['Ctrl+C', '中断本轮；空闲时清空输入，输入为空时连按两次退出'],
+      ['Ctrl+C', '有选区时复制，否则中断本轮或清空输入'],
+      ['鼠标', '拖选文字，单击下划线文件路径跳到源码'],
       ['↑ ↓', '多行内移动；到首/末行时翻阅历史'],
       ['Ctrl+A/E · Alt+←/→ · Ctrl+W · Ctrl+U/K', '行首/行尾 · 按词移动 · 删词 · 删到行首/行尾'],
       ['@', '模糊搜索并引用项目文件'],
@@ -1445,14 +1558,19 @@ export class App {
   }
 
   private drawBody(s: Screen, y: number, h: number): void {
-    if (this.help) return this.drawHelp(s, y, h);
-    if (this.panes.length === 0) return this.drawWelcome(s, y, h);
-    const bottom = this.bottomPane();
+    if (h < 3) return;
+    if (this.help && !this.prompt) return this.drawHelp(s, y, h);
+    const requested = this.prompt && this.findPane(this.prompt.paneId);
+    const bottom = requested && requested.kind !== 'answer' ? requested : this.bottomPane();
     const zoomed = this.zoomId ? this.findPane(this.zoomId) : undefined;
-    if (zoomed) return this.drawPane(s, 0, y, s.cols, h, zoomed, true);
+    if (zoomed && (!requested || requested === zoomed)) return this.drawPane(s, 0, y, s.cols, h, zoomed, true);
+    if (this.panes.length === 0) {
+      if (bottom) return this.drawPane(s, 0, y, s.cols, h, bottom, this.focus === bottom.id);
+      return this.drawWelcome(s, y, h);
+    }
     if (h < 12) {
       // Too short to split: show one pane at a time.
-      const one = this.findPane(this.focus) ?? bottom ?? this.panes[this.activeAnswer];
+      const one = requested ?? this.findPane(this.focus) ?? bottom ?? this.panes[this.activeAnswer];
       return this.drawPane(s, 0, y, s.cols, h, one, this.focus === one.id);
     }
     // Before the synthesis the answers own the screen; afterwards they step
@@ -1460,8 +1578,9 @@ export class App {
     const ah = bottom ? clamp(Math.round(h * 0.4), 5, h - 6) : h;
     const n = this.panes.length;
     if (Math.floor(s.cols / n) < 30) {
-      const p = this.panes[this.activeAnswer];
-      this.drawPane(s, 0, y, s.cols, ah, p, this.focus === p.id, `${this.activeAnswer + 1}/${n} · Tab 切换`);
+      const i = requested?.kind === 'answer' ? this.panes.indexOf(requested) : this.activeAnswer;
+      const p = this.panes[i];
+      this.drawPane(s, 0, y, s.cols, ah, p, this.focus === p.id, `${i + 1}/${n} · Tab 切换`);
     } else {
       const w = Math.floor(s.cols / n);
       this.panes.forEach((p, i) => {
@@ -1514,11 +1633,17 @@ export class App {
   }
 
   private drawPane(s: Screen, x: number, y: number, w: number, h: number, p: Pane, focused: boolean, hint = ''): void {
-    this.rects.push({ id: p.id, x, y, w, h });
-    const bst = focused ? p.color : BORDER;
+    const responseFocused = this.prompt?.paneId === p.id;
+    const item = responseFocused ? this.prompt : this.interactions.find(item => item.paneId === p.id);
+    const bst = responseFocused ? YELLOW : focused ? p.color : BORDER;
     const right = x + w - 1;
     const innerW = Math.max(4, w - 4);
-    const innerH = Math.max(1, h - 2);
+    const footY = y + h - 1;
+    const cardHeight = Math.min(h - 3, Math.max(2, Math.floor((h - 2) / 2)));
+    const card = item && cardHeight >= 2 ? item.draw(s, x + 2, footY, innerW, cardHeight, responseFocused, YELLOW) : undefined;
+    this.rects.push({ id: p.id, x, y, w, h, interaction: card && item ? { item, top: card.top } : undefined });
+    if (card?.cursor) this.cursor = card.cursor;
+    const innerH = (card?.top ?? footY) - y - 1;
 
     // content
     let body = p.text;
@@ -1540,11 +1665,11 @@ export class App {
     s.put(x, y + h - 1, '╰' + '─'.repeat(w - 2) + '╯', bst);
     const thumbH = p.maxScroll ? Math.max(1, Math.round((innerH * innerH) / lines.length)) : 0;
     const thumbY = p.maxScroll ? Math.round(((innerH - thumbH) * p.scroll) / p.maxScroll) : 0;
-    for (let i = 0; i < innerH; i++) {
+    for (let i = 0; i < h - 2; i++) {
       const onThumb = thumbH > 0 && i >= thumbY && i < thumbY + thumbH;
       s.put(x, y + 1 + i, '│', bst);
       s.put(right, y + 1 + i, onThumb ? '┃' : '│', onThumb ? p.color : bst);
-      const line = lines[p.scroll + i];
+      const line = i < innerH ? lines[p.scroll + i] : undefined;
       if (line) s.putCells(x + 2, y + 1 + i, line, right - 1);
     }
     if (lines.length === 0 && p.status === 'run') {
@@ -1566,7 +1691,6 @@ export class App {
     tx = s.put(tx, y, `  ${status} `, DIM, right - 1);
     if (hint && tx + textWidth(hint) + 4 < right) s.put(right - textWidth(hint) - 3, y, ` ${hint} `, DIM, right - 1);
 
-    const footY = y + h - 1;
     const pos = p.maxScroll ? ` ${Math.min(lines.length, p.scroll + innerH)}/${lines.length} ` : '';
     const footEnd = right - 1 - textWidth(pos);
     const available = Math.max(1, footEnd - x - 4);
@@ -1576,9 +1700,9 @@ export class App {
   }
 }
 
-// Wheel and click reporting in SGR coordinates. Native text selection then needs Shift+drag.
-const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
-const MOUSE_OFF = '\x1b[?1006l\x1b[?1000l';
+// SGR coordinate reporting, including motion while a mouse button is held.
+const MOUSE_ON = '\x1b[?1002h\x1b[?1006h';
+const MOUSE_OFF = '\x1b[?1006l\x1b[?1002l';
 
 /** Run the full-screen interface until the user quits. */
 export async function runTui(cwd: string, signal?: AbortSignal, open?: 'memory'): Promise<number> {

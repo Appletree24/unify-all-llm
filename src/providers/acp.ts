@@ -58,7 +58,7 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
   let prompting = false;
   let promptId = 5;
   let answer = '';
-  const tools = new Map<string, string>();
+  const tools = new Map<string, Pick<ToolUse, 'name' | 'detail'>>();
   const rejected = new Set<string>();
 
   const prompt = (content: string) => {
@@ -75,13 +75,14 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
   };
   const toolEvent = (update: Record<string, any>): Extract<ProviderEvent, { type: 'tool' }> => {
     const id = text(update.toolCallId);
+    const previous = id ? tools.get(id) : undefined;
     const command = update.kind === 'execute';
-    const name = text(update.name) ?? (id && tools.get(id)) ?? (command ? 'run_command' : text(update.title) ?? text(update.kind) ?? 'tool');
-    if (id) tools.set(id, name);
+    const name = text(update.name) ?? previous?.name ?? (command ? 'run_command' : text(update.title) ?? text(update.kind) ?? 'tool');
+    const detail = formatToolDetail(update.rawInput ?? update.args, update.locations) ?? previous?.detail ?? (command ? text(update.title) : undefined);
+    if (id) tools.set(id, { name, detail });
     const status: ToolUse['status'] = id && rejected.has(id) ? 'denied' : TOOL_STATUSES.find((state) => state === update.status);
     return {
-      type: 'tool', id, name, status,
-      detail: formatToolDetail(update.rawInput ?? update.args, update.locations) ?? (command ? text(update.title) : undefined),
+      type: 'tool', id, name, status, detail,
       error: status === 'failed' || status === 'denied' ? text(update.rawOutput?.error?.message) ?? text(update.rawOutput?.error) : undefined,
     };
   };

@@ -1,8 +1,15 @@
+import type { SourceReference } from './source.js';
+
+export interface Point { x: number; y: number }
+export interface Rect extends Point { w: number; h: number }
+export interface TextRange { from: Point; to: Point; bounds: Rect }
+
 /** A character cell. w=0 marks the right half of a wide (CJK) character. */
 export interface Cell {
   ch: string;
   st: string; // SGR parameters, e.g. "1;38;2;255;0;0"
   w: number;
+  source?: SourceReference;
 }
 
 export const rgb = (r: number, g: number, b: number) => `38;2;${r};${g};${b}`;
@@ -99,6 +106,35 @@ export class Screen {
 
   put(x: number, y: number, text: string, st = '', maxX = this.cols): number {
     return this.putCells(x, y, toCells(text, st), maxX);
+  }
+
+  sourceAt({ x, y }: Point): SourceReference | undefined {
+    const row = this.grid[y];
+    const cell = row?.[x];
+    return cell?.w === 0 ? row[x - 1]?.source : cell?.source;
+  }
+
+  select({ from, to, bounds }: TextRange, highlight = false): string {
+    const right = Math.min(bounds.x + bounds.w - 1, this.cols - 1);
+    const bottom = Math.min(bounds.y + bounds.h - 1, this.rows - 1);
+    if (right < bounds.x || bottom < bounds.y) return '';
+    const clip = (p: Point) => ({
+      x: Math.max(bounds.x, Math.min(right, p.x)),
+      y: Math.max(bounds.y, Math.min(bottom, p.y)),
+    });
+    let start = clip(from), end = clip(to);
+    if (start.y > end.y || (start.y === end.y && start.x > end.x)) [start, end] = [end, start];
+    const selected: string[] = [];
+    for (let y = start.y; y <= end.y; y++) {
+      const row = this.grid[y];
+      let left = y === start.y ? start.x : bounds.x;
+      const last = y === end.y ? end.x : right;
+      if (row[left]?.w === 0 && left > bounds.x) left--;
+      const cells = row.slice(left, last + 1);
+      selected.push(cells.map(cell => cell.ch).join('').trimEnd());
+      if (highlight) cells.forEach((cell, i) => { row[left + i] = { ...cell, st: cell.st ? `${cell.st};7` : '7' }; });
+    }
+    return selected.join('\n').replace(/\n+$/, '');
   }
 
   toLines(): string[] {

@@ -2,7 +2,8 @@ import type { InteractionResponse, PendingInteraction } from '../core/types.js';
 import { Editor } from './editor.js';
 import type { Key } from './keys.js';
 import { wrap } from './markdown.js';
-import { Screen, textWidth, toCells, truncate } from './screen.js';
+import { Screen, textWidth, truncate } from './screen.js';
+import { sourceCells } from './source.js';
 
 /** One model request has its own input buffer, separate from the conversation draft. */
 export class InteractionView {
@@ -14,7 +15,14 @@ export class InteractionView {
   private pageSize = 1;
   private error = '';
 
-  constructor(readonly turnId: string, readonly model: string, readonly request: PendingInteraction) {}
+  constructor(readonly turnId: string, readonly paneId: string, readonly model: string, readonly request: PendingInteraction) {}
+
+  get summary(): string {
+    const { kind, detail, tool, title } = this.request;
+    if (kind !== 'approval') return `Ctrl+G · ${this.model} 等待交互 · ${title}`;
+    const operation = detail?.trim().split('\n', 1)[0] || tool || title;
+    return `Ctrl+G · ${this.model} 待授权 · ${operation}`;
+  }
 
   private get question() {
     return this.request.kind === 'question' ? this.request.questions?.[this.field] : undefined;
@@ -83,33 +91,48 @@ export class InteractionView {
     if (!this.question) return { answers: Object.fromEntries(this.answers) };
   }
 
-  draw(s: Screen, pending: number): { x: number; y: number } {
-    const width = s.cols - 4;
+  draw(s: Screen, x: number, bottom: number, width: number, maxHeight: number, focused: boolean, color: string) {
     const { request, question: q } = this;
-    s.put(1, 0, truncate(`等待交互 · ${this.model} · ${pending} 项待处理`, width), '1');
-    const body = [request.title];
-    if (request.tool) body.push(request.tool);
-    if (request.detail) body.push(request.detail);
+    const showTitle = maxHeight >= 4;
+    const body: string[] = [];
+    const operation = request.detail || request.tool;
+    if (operation) body.push(operation);
     if (q) body.push(`${this.field + 1}/${request.questions!.length} ${q.header ?? ''} ${q.question}`);
+    if (!showTitle && !body.length) body.push(request.title);
     const choices = request.kind === 'approval' ? this.approvals : q?.options;
     if (choices && !this.other) {
-      choices.forEach((o, i) => body.push(`${i + 1}. ${o.label}${o.description ? ' — ' + o.description : ''}`));
+      const labels = choices.map((o, i) => `${i + 1}. ${o.label}${o.description ? ' — ' + o.description : ''}`);
+      if (request.kind === 'approval' && !choices.some(o => o.description)) body.push(labels.join('   '));
+      else body.push(...labels);
       if (q?.allowOther) body.push('0. 自定义回答');
     }
-    const lines = body.join('\n').split('\n').flatMap(line => wrap(toCells(line), width));
-    this.pageSize = s.rows - 6;
+    const lines = body.flatMap(block => block.split('\n').flatMap(line => wrap(sourceCells(line, ''), width)));
+    this.pageSize = Math.min(lines.length, maxHeight - (showTitle ? 2 : 1));
     this.scroll = Math.min(this.scroll, Math.max(0, lines.length - this.pageSize));
-    lines.slice(this.scroll, this.scroll + this.pageSize).forEach((line, i) => s.putCells(2, i + 2, line));
+    const top = bottom - this.pageSize - (showTitle ? 2 : 1);
+    const inputY = bottom - 1;
+    if (showTitle) {
+      const position = lines.length > this.pageSize ? ` ${this.scroll + this.pageSize}/${lines.length}` : '';
+      s.put(x, top, '─'.repeat(width), color);
+      s.put(x, top, truncate(` ${request.title} `, width - textWidth(position)), `1;${color}`);
+      s.put(x + width - textWidth(position), top, position, color);
+    }
+    lines.slice(this.scroll, this.scroll + this.pageSize).forEach((line, i) => s.putCells(x, top + Number(showTitle) + i, line, x + width));
+    if (!focused) {
+      s.put(x, inputY, 'Ctrl+G 回答', color);
+      return { top };
+    }
     const hint = this.other ? '输入自定义回答' : choices ? (q?.multiSelect ? '输入编号，可用空格多选' : '输入选项编号') : request.placeholder || '输入回答';
-    s.put(1, s.rows - 3, truncate(this.error || hint, width), '1');
     const secret = request.secret || q?.secret;
     const chars = this.input.chars.map(ch => secret ? '•' : ch === '\n' ? '↵' : ch);
+    const inputWidth = width - 2;
     let left = this.input.caret;
     let used = 0;
-    while (left > 0 && used + textWidth(chars[left - 1]) < width) used += textWidth(chars[--left]);
-    s.put(1, s.rows - 2, '❯');
-    s.put(3, s.rows - 2, chars.slice(left).join(''));
-    s.put(1, s.rows - 1, truncate('Enter 提交 · Esc 取消此项 · ↑↓ / PgUp/PgDn 阅读详情 · Ctrl+C 中断本轮', s.cols - 2));
-    return { x: 3 + used, y: s.rows - 2 };
+    while (left > 0 && used + textWidth(chars[left - 1]) < inputWidth) used += textWidth(chars[--left]);
+    s.put(x, inputY, '❯', color);
+    s.put(x + 2, inputY, chars.length ? chars.slice(left).join('') : truncate(hint, inputWidth), chars.length ? '' : color, x + width);
+    return { top, cursor: { x: x + 2 + used, y: inputY } };
   }
+
+  get inputError(): string { return this.error; }
 }

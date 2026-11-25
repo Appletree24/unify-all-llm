@@ -87,6 +87,90 @@ test('TUI rejects duplicate target selection and /exit remains available', async
 const type = (app, text) => app.handleKey({ name: 'char', text });
 const screen = (app) => { app.invalidate(); return app.snapshot().join('\n'); };
 
+test('TUI keeps Gemini Pro approvals inside its pane and preserves a follow-up draft', { timeout: 5000 }, async (t) => {
+  let ready = deferred(), requestApproval = deferred();
+  let cols = 100, rows = 22;
+  const peerStreamed = deferred(), requestPeerApproval = deferred(), peerReady = deferred(), peerDecision = deferred();
+  let firstPeerCall = true;
+  const other = target('alpha', async function* (req) {
+    yield { type: 'delta', text: 'ALPHA OUTPUT' };
+    if (firstPeerCall) {
+      firstPeerCall = false;
+      peerStreamed.resolve();
+      await Promise.race([requestPeerApproval.promise, aborted(req.signal)]);
+      if (req.signal.aborted) return;
+      const response = req.interact({ kind: 'approval', title: 'Alpha 请求权限确认', detail: 'read alpha.txt' });
+      peerReady.resolve();
+      peerDecision.resolve(await response);
+    }
+    yield { type: 'done', text: 'ALPHA OUTPUT' };
+  }, { askPolicy: 'read-tools', exec: false });
+  const gemini = target('gemini-pro', async function* (req) {
+    yield { type: 'delta', text: 'GEMINI PROGRESS' };
+    await requestApproval.promise;
+    const response = req.interact({
+      kind: 'approval', title: 'Gemini Pro 请求权限确认', tool: 'run_command', detail: 'node -p 1+1',
+      options: [{ id: 'allow', label: 'Allow' }, { id: 'deny', label: 'Deny' }],
+    });
+    ready.resolve();
+    const decision = await response;
+    yield { type: 'done', text: decision.cancelled ? 'CANCELLED' : `DECISION ${decision.optionId}` };
+  }, { askPolicy: 'provider-plan', exec: false });
+  gemini.label = 'Gemini Pro';
+  const app = new App({ cols: () => cols, rows: () => rows, write() {} }, workspace(t),
+    { providers: [other.id, gemini.id], synthesizer: other.id }, [other, gemini]);
+  t.after(() => app.dispose());
+  await app.init();
+
+  submit(app, 'First request');
+  await peerStreamed.promise;
+  requestApproval.resolve();
+  await ready.promise;
+  const initial = app.snapshot();
+  const outputRow = initial.findIndex(line => line.includes('GEMINI PROGRESS'));
+  const approvalRow = initial.findIndex(line => line.includes('node -p 1+1'));
+  assert.ok(outputRow >= 0 && approvalRow > outputRow);
+  assert.ok(initial[approvalRow].indexOf('node -p 1+1') >= cols / 2);
+  assert.match(initial.join('\n'), /ALPHA OUTPUT[\s\S]*Gemini Pro 请求权限确认[\s\S]*1\. Allow\s+2\. Deny[\s\S]*Enter 提交/);
+
+  requestPeerApproval.resolve();
+  await peerReady.promise;
+  assert.match(screen(app), /read alpha\.txt[\s\S]*node -p 1\+1[\s\S]*Ctrl\+G 下一项/);
+  app.handleKey({ name: 'ctrl+g' });
+  type(app, '2');
+  app.handleKey({ name: 'enter' });
+  assert.deepEqual(await peerDecision.promise, { optionId: 'decline' });
+  type(app, '1');
+  app.handleKey({ name: 'enter' });
+  await app.waitForIdle();
+  assert.match(screen(app), /DECISION allow/);
+
+  ready = deferred();
+  requestApproval = deferred();
+  submit(app, 'Second request');
+  type(app, 'follow-up draft');
+  requestApproval.resolve();
+  await ready.promise;
+  assert.match(screen(app), /Gemini Pro 请求权限确认[\s\S]*Ctrl\+G 回答[\s\S]*follow-up draft/);
+  app.handleKey({ name: 'ctrl+g' });
+  assert.match(screen(app), /Gemini Pro 请求权限确认[\s\S]*输入选项编号[\s\S]*follow-up draft/);
+  app.handleKey({ name: 'tab' });
+  type(app, ' kept');
+  assert.match(screen(app), /Ctrl\+G 回答[\s\S]*follow-up draft kept/);
+
+  cols = 45;
+  rows = 12;
+  app.handleKey({ name: 'ctrl+g' });
+  assert.match(screen(app), /Gemini Pro[\s\S]*GEMINI PROGRESS[\s\S]*node -p 1\+1[\s\S]*follow-up draft kept/);
+  app.handleKey({ name: 'pgdn' });
+  assert.match(screen(app), /1\. Allow\s+2\. Deny/);
+  app.handleKey({ name: 'esc' });
+  await app.waitForIdle();
+  cols = 100;
+  rows = 22;
+  assert.match(screen(app), /CANCELLED[\s\S]*follow-up draft kept/);
+});
+
 test('TUI lists local branches, switches through /branch, and preserves conflicting edits', async (t) => {
   const cwd = workspace(t);
   const git = (...args) => execFileSync('git', args, { cwd, stdio: 'pipe', encoding: 'utf8' }).trimEnd();
@@ -131,6 +215,52 @@ test('TUI lists local branches, switches through /branch, and preserves conflict
   await waitForScreen(/overwritten by checkout|local changes/i);
   assert.equal(git('symbolic-ref', '--short', 'HEAD'), 'feature/git');
   assert.equal(readFileSync(file, 'utf8'), 'local edit\n');
+});
+
+test('TUI drags to select rendered text and clicks file references to jump to their lines', async (t) => {
+  const { KeyParser } = await import('../dist/tui/keys.js');
+  const cwd = workspace(t);
+  writeFileSync(join(cwd, 'jump.ts'), 'first\nsecond\nTARGET LINE\nfourth\n');
+  writeFileSync(join(cwd, 'notes file.ts'), 'first\nMARKDOWN LINK TARGET\nthird\n');
+  const a = target('a', async function* () {
+    yield { type: 'done', text: '你好 selected\n\x60jump.ts:3\x60\n[打开文档](<notes file.ts#L2>)' };
+  });
+  const b = target('b', async function* () { yield { type: 'done', text: 'OTHER OUTPUT' }; });
+  const writes = [];
+  const copied = [];
+  const app = new App({
+    cols: () => 112, rows: () => 30, write: (value) => writes.push(value), setClipboard: (value) => copied.push(value),
+  }, cwd, { providers: ['a', 'b'], synthesizer: 'b' }, [a, b]);
+  t.after(() => app.dispose());
+  await app.init();
+  submit(app, 'Find the source');
+  await app.waitForIdle();
+  type(app, 'unsent draft');
+  const before = screen(app).split('\n');
+  const start = before.findIndex(line => line.includes('你好 selected'));
+  const path = before.findIndex(line => line.includes('jump.ts:3'));
+  const link = before.findIndex(line => line.includes('打开文档'));
+  assert.ok(start >= 0 && path > start && link > path);
+  const parser = new KeyParser();
+  const mouse = (button, x, y, final = 'M') => {
+    for (const key of parser.feed('\x1b[<' + [button, x + 1, y + 1].join(';') + final)) app.handleKey(key);
+  };
+  const click = (x, y) => { mouse(0, x, y); mouse(0, x, y, 'm'); };
+
+  mouse(0, 3, start); // The second cell of the first wide character.
+  mouse(32, 80, path);
+  mouse(0, 80, path, 'm');
+  assert.match(screen(app), /unsent draft/);
+  assert.ok(writes.some(chunk => /\x1b\[(?:[0-9;]+;)?7m/.test(chunk)));
+  app.handleKey({ name: 'ctrl+c' });
+  assert.deepEqual(copied, ['你好 selected\njump.ts:3']);
+
+  click(3, path);
+  assert.match(screen(app), /jump\.ts:3[\s\S]*› 3 │ TARGET LINE/);
+  app.handleKey({ name: 'esc' });
+  assert.match(screen(app), /unsent draft/);
+  click(3, link);
+  assert.match(screen(app), /notes file\.ts:2[\s\S]*› 2 │ MARKDOWN LINK TARGET/);
 });
 
 function quotaClock(t) {
@@ -243,6 +373,11 @@ test('key parser understands kitty, modifyOtherKeys and word-motion chords', asy
   assert.deepEqual(names('\x1b[27u\x1b[99;5u\x1b[9;2u\x1b[127;3u'), ['esc', 'ctrl+c', 'shifttab', 'wordback']);
   assert.deepEqual(names('\x1b[1;5D\x1b[1;3C\x1bb\x1bf\x1b\x7f\x1b[3;5~\x1b[D'), ['wordleft', 'wordright', 'wordleft', 'wordright', 'wordback', 'worddel', 'left']);
   assert.deepEqual(new KeyParser().feed('\x1b[200~a\x1b[13;2ub\x1b[201~'), [{ name: 'paste', text: 'a\x1b[13;2ub' }]);
+  const parser = new KeyParser();
+  assert.deepEqual(parser.feed('\x1b[<0;3;4M\x1b[<32;5'), [{ name: 'mousedown', x: 2, y: 3 }]);
+  assert.deepEqual(parser.feed(';6M\x1b[<0;5;6m\x1b[<65;5;6M'), [
+    { name: 'mousedrag', x: 4, y: 5 }, { name: 'mouseup', x: 4, y: 5 }, { name: 'wheeldown', x: 4, y: 5 },
+  ]);
 });
 
 test('editor follows readline conventions across lines and words', async () => {

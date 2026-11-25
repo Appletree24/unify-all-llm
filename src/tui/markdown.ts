@@ -1,4 +1,5 @@
 import { rgb, toCells, type Cell } from './screen.js';
+import { sourceCells, sourceReference } from './source.js';
 import { tex } from './tex.js';
 
 const DIM = rgb(120, 125, 135);
@@ -65,7 +66,7 @@ const INLINE = new RegExp(
     '~~(?!\\s)(.+?)~~', // 5 strike
     '\\*(?![\\s*])(.+?)(?<!\\s)\\*', // 6 italic
     '(?<![\\p{L}\\p{N}_])_(?![\\s_])(.+?)(?<!\\s)_(?![\\p{L}\\p{N}_])', // 7 italic
-    '!?\\[([^\\]\\n]+)\\]\\(([^)\\s]+)(?:\\s+"[^"]*")?\\)', // 8,9 link
+    '!?\\[([^\\]\\n]+)\\]\\((<[^>\\n]+>|[^)\\s]+)(?:\\s+"[^"]*")?\\)', // 8,9 link
     '\\$(?![\\s$])([^$\\n]+?)(?<!\\s)\\$(?!\\d)', // 10 $math$
     '\\\\\\((.+?)\\\\\\)', // 11 \(math\)
     '\\\\([\\\\`*_{}\\[\\]()#+\\-.!$~|>])', // 12 escaped character
@@ -77,19 +78,20 @@ function inline(text: string, base: string): Cell[] {
   const cells: Cell[] = [];
   let last = 0;
   for (const m of text.matchAll(INLINE)) {
-    if (m.index! > last) cells.push(...toCells(text.slice(last, m.index), base));
+    if (m.index! > last) cells.push(...sourceCells(text.slice(last, m.index), base));
     last = m.index! + m[0].length;
-    if (m[2] !== undefined) cells.push(...toCells(m[2], CODE));
+    if (m[2] !== undefined) cells.push(...sourceCells(m[2], CODE));
     else if (m[3] !== undefined || m[4] !== undefined) cells.push(...inline(m[3] ?? m[4], add(base, '1')));
     else if (m[5] !== undefined) cells.push(...inline(m[5], add(base, '9')));
     else if (m[6] !== undefined || m[7] !== undefined) cells.push(...inline(m[6] ?? m[7], add(base, '3')));
     else if (m[8] !== undefined) {
-      cells.push(...inline(m[8], add(base, '4')));
-      if (m[9] !== m[8] && !m[9].startsWith('#')) cells.push(...toCells(` (${m[9]})`, DIM));
+      const source = sourceReference(m[9], true);
+      cells.push(...inline(m[8], add(base, '4')).map(cell => ({ ...cell, source })));
+      if (!source && m[9] !== m[8] && !m[9].startsWith('#')) cells.push(...toCells(` (${m[9]})`, DIM));
     } else if (m[10] !== undefined || m[11] !== undefined) cells.push(...toCells(tex(m[10] ?? m[11]).replace(/\s*\n\s*/g, ' '), MATH));
     else if (m[12] !== undefined) cells.push(...toCells(m[12], base));
   }
-  if (last < text.length) cells.push(...toCells(text.slice(last), base));
+  if (last < text.length) cells.push(...sourceCells(text.slice(last), base));
   return cells;
 }
 
@@ -154,7 +156,7 @@ function mathBlock(src: string, width: number): Cell[][] {
  */
 export function layout(text: string, width: number, accent: string, muted = false): Cell[][] {
   const src = text.replace(/\r/g, '').replace(/\t/g, '  ').split('\n');
-  if (muted) return src.flatMap((l) => wrap(toCells(l, DIM), width));
+  if (muted) return src.flatMap((l) => wrap(sourceCells(l, DIM), width));
 
   const out: Cell[][] = [];
   const codeBar = toCells('│ ', RULE);
@@ -166,7 +168,7 @@ export function layout(text: string, width: number, accent: string, muted = fals
     if (fence) {
       out.push(toCells(`┌─ ${fence[2] || 'code'}`, RULE));
       for (i++; i < src.length && !src[i].trim().startsWith(fence[1]); i++) {
-        out.push(...withPrefix(wrap(toCells(src[i], BLOCK), width - 2), codeBar));
+        out.push(...withPrefix(wrap(sourceCells(src[i], BLOCK), width - 2), codeBar));
       }
       if (i < src.length) out.push(toCells('└─', RULE));
       continue;
@@ -203,7 +205,7 @@ export function layout(text: string, width: number, accent: string, muted = fals
     }
 
     if (raw.startsWith('⚙ ')) {
-      out.push(...wrap(toCells(raw, DIM), width, 2));
+      out.push(...wrap(sourceCells(raw, DIM), width, 2));
       continue;
     }
     if (raw.startsWith('✗ ')) {

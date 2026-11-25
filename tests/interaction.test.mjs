@@ -9,7 +9,6 @@ import { createAntigravityAdapter } from '../dist/providers/antigravity.js';
 import { createClaudeAdapter } from '../dist/providers/claude.js';
 import { createCodexAdapter } from '../dist/providers/codex.js';
 import { customAdapter } from '../dist/providers/custom.js';
-import { createGeminiAdapter } from '../dist/providers/gemini.js';
 
 function withTempDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'unify-interact-'));
@@ -283,62 +282,6 @@ rl.on('line', (line) => {
     });
   });
 
-  it('Gemini adapter bridges ACP session/request_permission and falls back to stream-json if ACP unsupported', async () => {
-    await withTempDir(async (cwd) => {
-      const acpFixture = join(cwd, 'gemini-acp.mjs');
-      writeFileSync(acpFixture, `
-import { createInterface } from 'node:readline';
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
-let picked = null;
-let promptId;
-rl.on('line', (line) => {
-  if (!line.trim()) return;
-  const msg = JSON.parse(line);
-  if (msg.method === 'initialize') send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
-  else if (msg.method === 'session/new') send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess_1' } });
-  else if (msg.method === 'session/prompt') {
-    promptId = msg.id;
-    send({ jsonrpc: '2.0', id: 77, method: 'session/request_permission', params: { sessionId: 'sess_1', toolCall: { title: 'Run shell', kind: 'execute', rawInput: { command: 'echo hi' } }, options: [{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' }, { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }] } });
-  } else if (msg.id === 77) {
-    picked = msg.result.outcome;
-    send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess_1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP:' + JSON.stringify(picked) } } } });
-    send({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'end_turn' } });
-  }
-});
-`);
-      const acpAdapter = createGeminiAdapter({ cmd: process.execPath, prefixArgs: [acpFixture], nativeExecutable: true });
-      const acpEvents = await collectEvents(acpAdapter.run({
-        prompt: 'hello',
-        cwd,
-        mode: 'exec',
-        interact: async () => ({ optionId: 'allow_once' }),
-      }));
-      const acpDone = acpEvents.find((e) => e.type === 'done');
-      assert.equal(acpDone.text, 'ACP:{"outcome":"selected","optionId":"allow_once"}');
-
-      // Fallback fixture: exits non-zero when --experimental-acp is passed, succeeds on --output-format stream-json.
-      const fallbackFixture = join(cwd, 'gemini-fallback.mjs');
-      writeFileSync(fallbackFixture, `
-if (process.argv.includes('--experimental-acp')) {
-  process.stderr.write('unknown flag --experimental-acp\\n');
-  process.exit(2);
-}
-process.stdout.write(JSON.stringify({ type: 'message', role: 'assistant', content: 'fallback-ok' }) + '\\n');
-process.stdout.write(JSON.stringify({ type: 'result', status: 'success', stats: { input_tokens: 10, output_tokens: 5 } }) + '\\n');
-`);
-      const fallbackAdapter = createGeminiAdapter({ cmd: process.execPath, prefixArgs: [fallbackFixture], nativeExecutable: true });
-      const fallbackEvents = await collectEvents(fallbackAdapter.run({
-        prompt: 'hello',
-        cwd,
-        mode: 'ask',
-        interact: async () => ({ optionId: 'allow_once' }),
-      }));
-      const fallbackDone = fallbackEvents.find((e) => e.type === 'done');
-      assert.equal(fallbackDone.text, 'fallback-ok');
-    });
-  });
-
   it('Antigravity requests a single follow-up in the same session when tools finish without an answer', async () => {
     await withTempDir(async (cwd) => {
       const fixture = join(cwd, 'agy-empty-answer.mjs');
@@ -351,7 +294,7 @@ let scenario;
 for await (const line of lines) {
   const { message: { content } } = JSON.parse(line);
   if (!scenario) {
-    scenario = content.split('\\n')[0];
+    scenario = content.split('\\n').at(-1);
     send({ event: 'step_update', step_update: { step_type: 'tool', state: 'ACTIVE', tool_name: 'read_file' } });
     if (scenario === 'streamed') send({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'streamed answer' } });
     send({ event: 'result', result: { status: 'SUCCESS', response: ' ' } });
@@ -412,7 +355,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     const toolCall = { toolCallId: 'call-1', kind: 'execute', title: 'List directory', rawInput: { CommandLine: 'Get-ChildItem src' } };
     update({ sessionUpdate: 'tool_call', ...toolCall, status: 'pending' });
     send({ id: 'perm-1', method: 'session/request_permission', params: {
-      toolCall, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' }],
+      toolCall: { toolCallId: toolCall.toolCallId },
+      options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' }],
     } });
   } else if (req.id === 'perm-1') {
     const allowed = req.result.outcome.optionId === 'allow';

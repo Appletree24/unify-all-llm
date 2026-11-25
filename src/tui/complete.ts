@@ -45,7 +45,7 @@ export const COMMANDS: CommandSpec[] = [
   { name: 'new', detail: '开始新对话' },
   { name: 'copy', detail: '复制当前回答' },
   { name: 'memory', detail: '查看和管理各工具的记忆；/memory web 打开网页界面' },
-  { name: 'mouse', detail: '开关鼠标滚轮（关闭后可直接拖选文本）' },
+  { name: 'mouse', detail: '开关鼠标滚动、拖选和路径点击' },
   { name: 'help', detail: '快捷键与命令' },
   { name: 'exit', detail: '退出' },
   { name: 'quit', detail: '退出' },

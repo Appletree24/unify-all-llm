@@ -5,7 +5,7 @@ export interface Key {
    *  'altenter' is any modified Enter (Shift, Alt or Ctrl): it inserts a newline. */
   name: string;
   text?: string;
-  /** Screen cell of a mouse event ('wheelup' | 'wheeldown' | 'click'), 0-based. */
+  /** Screen cell of a mouse event, 0-based. */
   x?: number;
   y?: number;
 }
@@ -40,8 +40,11 @@ function modified(code: number, mod: number): Key | undefined {
 /** Turns raw-mode stdin chunks into keys. Bracketed pastes arrive as a single 'paste'. */
 export class KeyParser {
   private paste: string | null = null;
+  private mouseReport = '';
 
   feed(s: string): Key[] {
+    s = this.mouseReport + s;
+    this.mouseReport = '';
     const out: Key[] = [];
     let i = 0;
     while (i < s.length) {
@@ -75,12 +78,19 @@ export class KeyParser {
           continue;
         }
         const m = /^\x1b(?:\[([0-9;:?<]*)([@-~])|O([A-Z]))/.exec(rest);
+        if (!m && /^\x1b\[<[0-9;]*$/.test(rest)) {
+          this.mouseReport = rest;
+          break;
+        }
         if (m && m[1]?.startsWith('<')) {
           // SGR mouse report: ESC [ < button ; x ; y (M press | m release)
           const [b, x, y] = m[1].slice(1).split(';').map(Number);
           const at = { x: x - 1, y: y - 1 };
-          if (b & 64) out.push({ name: b & 1 ? 'wheeldown' : 'wheelup', ...at });
-          else if (m[2] === 'M' && (b & 35) === 0) out.push({ name: 'click', ...at });
+          if (b & 64) {
+            if (m[2] === 'M' && (b & 3) < 2) out.push({ name: b & 1 ? 'wheeldown' : 'wheelup', ...at });
+          } else if ((b & 131) === 0) {
+            out.push({ name: m[2] === 'm' ? 'mouseup' : b & 32 ? 'mousedrag' : 'mousedown', ...at });
+          }
           i += m[0].length;
           continue;
         }
