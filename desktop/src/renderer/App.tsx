@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import type { ComposerSelection, DistillPreparation, DistillSourceRef, ExecPreview, OpenedWorkspace, Push, QuotaNotice, RunRecord, SessionChanges, SessionSummary, TargetQuota, WorkspaceInfo } from '../shared/api.js';
+import { isReviewOrReport } from '../../../src/core/collaboration.js';
+import type { ComposerSelection, DistillPreparation, DistillSourceRef, ExecPreview, OpenedWorkspace, Push, QuotaNotice, RunRecord, SessionChanges, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { onPush, unify } from './api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
 import { CachePage } from './CachePage.js';
 import { BenchmarkPage } from './Benchmark.js';
-import { SessionList } from './Sessions.js';
+import { WorkspaceSessions, type SessionIndex } from './Sessions.js';
 import { Card, Composer, DistillDialog, ExecDialog, Turn, type ComposerState, type FollowUpChoice, type TurnActions } from './Thread.js';
 import type { PendingInteractionItem } from './QuestionPanel.js';
 import { FeedbackDialog, type FeedbackContext } from './FeedbackDialog.js';
@@ -49,23 +50,40 @@ function subscribeTheme(listener: () => void) {
   return () => darkTheme.removeEventListener('change', listener);
 }
 
+// Run ids and interaction ids are local to their workspace (folders can be copies).
+function useWorkspaceData<T>(cwd: string | undefined, empty: T) {
+  const [byWorkspace, setByWorkspace] = useState<Record<string, T>>({});
+  const initial = useRef(empty);
+  const update = useCallback((dir: string, change: (previous: T) => T) => {
+    setByWorkspace(all => {
+      const previous = all[dir] ?? initial.current;
+      const next = change(previous);
+      return previous === next ? all : { ...all, [dir]: next };
+    });
+  }, []);
+  return [cwd ? byWorkspace[cwd] ?? initial.current : initial.current, update] as const;
+}
+
 export function App() {
   const isDark = useSyncExternalStore(subscribeTheme, () => darkTheme.matches);
   const themeAction = isDark ? '切换至亮色主题' : '切换至暗色主题';
   const [platform, setPlatform] = useState<string>('');
   const [ws, setWs] = useState<WorkspaceInfo | null | undefined>(undefined);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const cwd = ws?.cwd;
+  const [indexes, setIndexes] = useState<Record<string, SessionIndex>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [sessionQuery, setSessionQuery] = useState('');
   const [current, setCurrent] = useState<string | null>(null);
-  const [records, setRecords] = useState<Record<string, RunRecord>>({});
-  const [interactions, setInteractions] = useState<Record<string, PendingInteractionItem[]>>({});
-  const [notices, setNotices] = useState<Record<string, string[]>>({});
+  const [records, setRecords] = useWorkspaceData<Record<string, RunRecord>>(cwd, {});
+  const [interactions, setInteractions] = useWorkspaceData<Record<string, PendingInteractionItem[]>>(cwd, {});
+  const [notices, setNotices] = useWorkspaceData<Record<string, string[]>>(cwd, {});
   const [view, setView] = useState<View>(() => new URLSearchParams(window.location.search).get('view') === 'quota' ? 'quota' : 'chat');
   const [quota, setQuota] = useState<TargetQuota[]>();
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [quotaNotice, setQuotaNotice] = useState<QuotaNotice>();
   const [toast, setToast] = useState<Toast>();
   const [execPreview, setExecPreview] = useState<{ key: number; preview: ExecPreview }>();
-  const [distillModal, setDistillModal] = useState<{ key: number; source: DistillSourceRef; prep: DistillPreparation }>();
+  const [distillModal, setDistillModal] = useState<{ key: number; cwd: string; source: DistillSourceRef; prep: DistillPreparation }>();
   const [pendingMemoryUpdates, setPendingMemoryUpdates] = useState<string[]>([]);
   const [feedback, setFeedback] = useState<FeedbackContext>();
   const [inserted, setInserted] = useState<{ session: string; text: string }>();
@@ -89,11 +107,12 @@ export function App() {
   const execPresence = usePresence(execPreview);
   const distillPresence = usePresence(distillModal);
   const zoomPresence = usePresence(zoom);
-  const cwd = ws?.cwd;
   const activeCwd = useRef(cwd);
-  const sessionListRequest = useRef(0);
+  const sessionListRequest = useRef(new Map<string, number>());
+  const lastSessions = useRef(new Map<string, string | null>());
   const openSessionRequest = useRef(0);
-  useLayoutEffect(() => { activeCwd.current = cwd; }, [cwd]);
+  const lastOpenedRequest = useRef(0);
+
 
   const toastSequence = useRef(0);
   const notify = useCallback((msg: string, kind: Toast['kind'] = 'info') => setToast({ id: ++toastSequence.current, msg, kind }), []);
@@ -103,17 +122,21 @@ export function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const refreshSessions = useCallback(() => {
-    const requestedCwd = activeCwd.current;
-    const request = ++sessionListRequest.current;
-    void unify.sessions().then((list) => {
-      if (requestedCwd === activeCwd.current && request === sessionListRequest.current) setSessions(list);
-    }, () => undefined);
+  const refreshSessions = useCallback((dir = activeCwd.current) => {
+    if (!dir) return;
+    const requests = sessionListRequest.current;
+    const request = (requests.get(dir) ?? 0) + 1;
+    requests.set(dir, request);
+    const finish = (index: SessionIndex) => {
+      if (requests.get(dir) === request) setIndexes(all => ({ ...all, [dir]: index }));
+    };
+    void unify.sessions(dir).then(sessions => finish({ sessions }), err => finish({ error: errText(err) }));
   }, []);
   const refreshQuota = useCallback((force = false) => {
     const requestedCwd = activeCwd.current;
+    if (!requestedCwd) return;
     setQuotaLoading(true);
-    unify.quota(force).then((quotas) => {
+    unify.quota(requestedCwd, force).then((quotas) => {
       if (requestedCwd === activeCwd.current) setQuota(quotas);
     }, () => undefined).finally(() => {
       if (requestedCwd === activeCwd.current) setQuotaLoading(false);
@@ -122,6 +145,20 @@ export function App() {
 
   const openQuota = useCallback(() => { setQuotaNotice(undefined); setView('quota'); }, []);
   const showWorkspace = useCallback((opened: OpenedWorkspace | null) => {
+    if (activeCwd.current !== opened?.info.cwd) {
+      activeCwd.current = opened?.info.cwd;
+      setCurrent(null);
+      setQuota(undefined);
+      setQuotaLoading(false);
+      setZoom(undefined);
+      setExecPreview(undefined);
+      setDistillModal(undefined);
+      setSettingsGraph(undefined);
+      setFeedback(undefined);
+      setInserted(undefined);
+      setRevisionId(undefined);
+      if (opened) setExpanded(dirs => new Set(dirs).add(opened.info.cwd));
+    }
     setWs(opened?.info ?? null);
     setComposerSelection(opened?.selection);
   }, []);
@@ -129,11 +166,12 @@ export function App() {
   // ── bootstrap and pushes ────────────────────────────────────────────────
   useEffect(() => {
     void unify.platform().then(setPlatform);
+    void unify.recentWorkspaces().then(setRecent);
     void unify.workspace().then(showWorkspace);
     return onPush((p: Push) => {
-      if (p.type === 'run') setRecords((r) => ({ ...r, [p.record.id]: p.record }));
+      if (p.type === 'run') setRecords(p.cwd, (r) => ({ ...r, [p.record.id]: p.record }));
       else if (p.type === 'interaction') {
-        setInteractions((prev) => {
+        setInteractions(p.cwd, (prev) => {
           const list = prev[p.callId] ?? [];
           if (list.some((x) => x.request.id === p.request.id)) return prev;
           return {
@@ -142,7 +180,7 @@ export function App() {
           };
         });
       } else if (p.type === 'interaction-resolved') {
-        setInteractions((prev) => {
+        setInteractions(p.cwd, (prev) => {
           const list = prev[p.callId];
           if (!list) return prev;
           const next = list.filter((x) => x.request.id !== p.interactionId);
@@ -152,12 +190,12 @@ export function App() {
           return copy;
         });
       } else if (p.type === 'notice') {
-        setNotices((n) => ({ ...n, [p.turnId]: [...(n[p.turnId] ?? []), p.message] }));
-        if (p.category === 'cache') notify(p.message);
+        setNotices(p.cwd, (n) => ({ ...n, [p.turnId]: [...(n[p.turnId] ?? []), p.message] }));
+        if (p.cwd === activeCwd.current && p.category === 'cache') notify(p.message);
       }
       else if (p.type === 'workspace') setWs((w) => (w && w.cwd === p.info.cwd ? p.info : w));
       else if (p.type === 'end') {
-        setInteractions((prev) => {
+        setInteractions(p.cwd, (prev) => {
           let changed = false;
           const copy: Record<string, PendingInteractionItem[]> = {};
           for (const [cid, list] of Object.entries(prev)) {
@@ -167,31 +205,15 @@ export function App() {
           }
           return changed ? copy : prev;
         });
-        refreshSessions();
+        refreshSessions(p.cwd);
       }
       else if (p.type === 'quota' && p.cwd === activeCwd.current) setQuota(p.quotas);
       else if (p.type === 'quota-notice') setQuotaNotice(p.notice);
       else if (p.type === 'open-quota') openQuota();
     });
-  }, [refreshSessions, openQuota, showWorkspace, notify]);
+  }, [refreshSessions, openQuota, showWorkspace, notify, setRecords, setInteractions, setNotices]);
 
-  // A different project starts from a clean slate.
-  useEffect(() => {
-    setCurrent(null);
-    setSessions([]);
-    setFollowUp(undefined);
-    setPendingMemoryUpdates([]);
-    setDistillModal(undefined);
-    setFeedback(undefined); setInserted(undefined);
-    setRecords({});
-    setInteractions({});
-    setNotices({});
-    setQuota(undefined);
-    setQuotaLoading(false);
-    if (!cwd) return;
-    refreshSessions();
-    refreshQuota();
-  }, [cwd, refreshSessions, refreshQuota]);
+  useEffect(() => { if (cwd) refreshQuota(); }, [cwd, refreshQuota]);
 
   const composer = useMemo<ComposerState>(() => {
     const available = new Set(ws?.targets.filter((target) => target.installed !== false).map((target) => target.id));
@@ -216,43 +238,57 @@ export function App() {
     });
   };
 
-  useEffect(() => { if (menu) void unify.recentWorkspaces().then(setRecent); }, [menu]);
-
   const toggleSidebar = useCallback(() => {
     const active = document.activeElement;
     if (sidebarElement.current?.contains(active) || active?.closest('.session-menu')) sidebarToggle.current?.focus();
     setSidebar(open => !open);
   }, []);
 
-  const openWorkspace = useCallback(async (dir?: string) => {
+  const openSession = useCallback(async (id: string | null | undefined, dir = activeCwd.current) => {
+    if (!dir) return;
+    const request = ++openSessionRequest.current;
     setMenu(false);
     try {
-      const opened = await unify.openWorkspace(dir);
-      if (opened) { showWorkspace(opened); setView('chat'); }
-    } catch (err) { notify(errText(err), 'err'); }
-  }, [notify, showWorkspace]);
-
-  const openSession = useCallback(async (id: string | null) => {
-    const requestedCwd = activeCwd.current;
-    const request = ++openSessionRequest.current;
-    setCurrent(id);
-    setFollowUp(undefined);
-    setPendingMemoryUpdates([]);
-    setView('chat');
-    setZoom(undefined);
-    if (!id) return;
-    try {
-      const runs = await unify.session(id);
-      if (requestedCwd !== activeCwd.current || request !== openSessionRequest.current) return;
-      setRecords((r) => {
-        const next = { ...r };
-        for (const run of runs) if (!(next[run.id] && isActive(next[run.id]))) next[run.id] = run;
+      const selected = id === undefined ? lastSessions.current.get(dir) ?? null : id;
+      const opened = await unify.openWorkspace(dir, selected ?? undefined);
+      // A later click may fail (for example, a disconnected drive). Reflect the
+      // latest successful activation so the page stays in sync with the main process.
+      if (request < lastOpenedRequest.current) return;
+      lastOpenedRequest.current = request;
+      if (activeCwd.current !== dir) showWorkspace(opened);
+      lastSessions.current.set(dir, selected);
+      setExpanded(dirs => new Set(dirs).add(dir));
+      setCurrent(selected);
+      setFollowUp(undefined);
+      setPendingMemoryUpdates([]);
+      setRevisionId(undefined);
+      setView('chat');
+      setZoom(undefined);
+      if (selected) setRecords(dir, all => {
+        const next = Object.fromEntries(Object.entries(all).filter(([, run]) => run.sessionId !== selected));
+        for (const run of opened.records) next[run.id] = run;
         return next;
       });
     } catch (err) {
-      if (requestedCwd === activeCwd.current && request === openSessionRequest.current) notify(errText(err), 'err');
+      if (request === openSessionRequest.current) {
+        refreshSessions(dir);
+        notify(errText(err), 'err');
+      }
     }
-  }, [notify]);
+  }, [notify, showWorkspace, setRecords, refreshSessions]);
+
+  const addWorkspace = async () => {
+    setMenu(false);
+    try {
+      const dir = await unify.addWorkspace();
+      if (!dir) return;
+      setRecent(dirs => dirs.includes(dir) ? dirs : [dir, ...dirs]);
+      setExpanded(dirs => new Set(dirs).add(dir));
+      setSessionQuery('');
+      setSidebar(true);
+      if (!activeCwd.current) await openSession(null, dir);
+    } catch (err) { notify(errText(err), 'err'); }
+  };
 
   // ── derived ─────────────────────────────────────────────────────────────
   const turns = useMemo(
@@ -272,39 +308,28 @@ export function App() {
   const quotaMap = useMemo(() => new Map((quota ?? []).map((q) => [q.targetId, q])), [quota]);
 
   // ── actions ─────────────────────────────────────────────────────────────
-  const updateSession = async (id: string, changes: SessionChanges) => {
-    if (!cwd) return;
-    await unify.updateSession(cwd, id, changes);
-    if (cwd === activeCwd.current) refreshSessions();
+  const updateSession = async (dir: string, id: string, changes: SessionChanges) => {
+    await unify.updateSession(dir, id, changes);
+    refreshSessions(dir);
   };
 
-  const deleteSession = async (id: string) => {
-    if (!cwd) return;
-    try { await unify.deleteSession(cwd, id); }
-    finally { if (cwd === activeCwd.current) refreshSessions(); }
-    if (cwd !== activeCwd.current) return;
-
-    const deletedTurns = Object.values(records).filter((record) => record.sessionId === id);
-    const turnIds = new Set(deletedTurns.map((record) => record.id));
-    const callIds = new Set(deletedTurns.flatMap((record) => record.calls.map((call) => call.id)));
-    setSessions((list) => list.filter((session) => session.id !== id));
-    setRecords((all) => Object.fromEntries(Object.entries(all).filter(([, record]) => record.sessionId !== id)));
-    setNotices((all) => Object.fromEntries(Object.entries(all).filter(([turnId]) => !turnIds.has(turnId))));
-    setInteractions((all) => Object.fromEntries(Object.entries(all).filter(([callId]) => !callIds.has(callId))));
-    if (current === id) {
-      openSessionRequest.current++;
-      setCurrent(null);
-      setFollowUp(undefined);
-      setPendingMemoryUpdates([]);
-      setZoom(undefined);
+  const deleteSession = async (dir: string, id: string) => {
+    try { await unify.deleteSession(dir, id); }
+    finally { refreshSessions(dir); }
+    if (lastSessions.current.get(dir) === id) {
+      lastSessions.current.delete(dir);
+      if (activeCwd.current === dir) void openSession(null, dir);
     }
+    setRecords(dir, all => Object.fromEntries(Object.entries(all).filter(([, record]) => record.sessionId !== id)));
     notify('已将对话移到系统回收站', 'ok');
   };
 
   const send = async (question: string, source?: RunRecord, materials?: MaterialSelection[]): Promise<boolean> => {
+    if (!cwd) return false;
+    const request = openSessionRequest.current;
     try {
       const reviseTurn = source?.collaboration ? source.id : revision?.id;
-      const ids = await unify.ask({
+      const ids = await unify.ask(cwd, {
         question, selected: composer.selected, manual: composerSelection?.selected !== undefined, graph: composer.graph, reviseTurn,
         synthesize: composer.synth !== 'off', synthesizer: composer.synth && composer.synth !== 'off' ? composer.synth : undefined,
         sessionId: current ?? undefined,
@@ -312,11 +337,13 @@ export function App() {
         continueFrom: reviseTurn && !source ? undefined : activeFollowUp?.targetId,
         memoryUpdates: current && pendingMemoryUpdates.length ? pendingMemoryUpdates : undefined,
       });
+      refreshSessions(cwd);
+      if (request !== openSessionRequest.current) return true;
+      lastSessions.current.set(cwd, ids.sessionId);
       setFollowUp(undefined);
       setPendingMemoryUpdates([]);
       setCurrent(ids.sessionId);
       setRevisionId(undefined);
-      refreshSessions();
       return true;
     } catch (err) {
       if (source) throw err;
@@ -326,26 +353,26 @@ export function App() {
   };
 
   const actions: TurnActions = {
-    confirmGraph: record => { void unify.exec(record.id,undefined,record.collaboration!.execution.target).then(() => refreshSessions(),err => notify(errText(err),'err')); },
+    confirmGraph: record => { void unify.exec(cwd!,record.id,undefined,record.collaboration!.execution.target).then(() => refreshSessions(cwd),err => notify(errText(err),'err')); },
     reviseGraph: record => { setRevisionId(record.id); setFollowUp(undefined); document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(); },
-    closeGraph: record => { void unify.closeCollaboration(record.id).then(() => setRevisionId(undefined),err => notify(errText(err),'err')); },
+    closeGraph: record => { void unify.closeCollaboration(cwd!, record.id).then(() => { if (cwd === activeCwd.current) setRevisionId(undefined); },err => notify(errText(err),'err')); },
     zoom: (turnId, runId, trigger) => {
       if (runId) zoomTrigger.current = trigger;
       setZoom(runId ? { turnId, runId } : undefined);
     },
     exec: (turnId, from) => {
-      unify.previewExec(turnId, from).then(preview => setExecPreview({ key: ++modalSequence.current, preview }), err => notify(errText(err), 'err'));
+      unify.previewExec(cwd!, turnId, from).then(preview => { if (cwd === activeCwd.current) setExecPreview({ key: ++modalSequence.current, preview }); }, err => notify(errText(err), 'err'));
     },
     retry: (turnId, targetIds) => {
-      unify.retry(turnId, targetIds).then((ids) => { setCurrent(ids.sessionId); refreshSessions(); }, (err) => notify(errText(err), 'err'));
+      unify.retry(cwd!, turnId, targetIds).then(() => { refreshSessions(cwd); }, (err) => notify(errText(err), 'err'));
     },
-    cancel: (turnId) => { void unify.cancel(turnId); },
-    cancelTarget: (turnId, targetId) => { void unify.cancelTarget(turnId, targetId); },
+    cancel: (turnId) => { void unify.cancel(cwd!, turnId); },
+    cancelTarget: (turnId, targetId) => { void unify.cancelTarget(cwd!, turnId, targetId); },
     openInteraction: item => jumpToInteraction(item),
     feedback: (record, call, quote) => setFeedback({ record, call, quote }),
     sendChoices: async (text, source) => { await send(text, source); },
     respondInteraction: async (turnId, interactionId, response) => {
-      if (!await unify.respondInteraction(turnId, interactionId, response)) {
+      if (!await unify.respondInteraction(cwd!, turnId, interactionId, response)) {
         throw new Error('这项请求已经结束');
       }
     },
@@ -354,10 +381,12 @@ export function App() {
       if (ws) void unify.captureBench(ws.cwd, turn, call).then(() => notify('已留作评测候选，可在侧栏「评测集」整理'), err => notify(errText(err), 'err'));
     },
     distill: (source) => {
-      unify.prepareDistill(source).then((prep) => setDistillModal({ key: ++modalSequence.current, source, prep }), (err) => notify(errText(err), 'err'));
+      if (cwd) unify.prepareDistill(cwd, source).then((prep) => {
+        if (cwd === activeCwd.current) setDistillModal({ key: ++modalSequence.current, cwd, source, prep });
+      }, (err) => notify(errText(err), 'err'));
     },
   };
-  const cancelCurrent = () => { for (const t of turns) if (isActive(t)) void unify.cancel(t.id); };
+  const cancelCurrent = () => { for (const t of turns) if (isActive(t)) void unify.cancel(cwd!, t.id); };
 
   // ── keyboard ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -379,7 +408,7 @@ export function App() {
   // Keep the thread pinned to the newest output unless the user scrolled up.
   const thread = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
-  useLayoutEffect(() => { stick.current = true; }, [current]);
+  useLayoutEffect(() => { stick.current = true; }, [cwd, current]);
   useLayoutEffect(() => {
     const el = thread.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
@@ -432,10 +461,10 @@ export function App() {
                   {menu && <div className="menu-back" onClick={() => setMenu(false)} />}
                   <div className="menu" data-presence={projectMenu.state} inert={!menu}>
                     {recent.filter((p) => p !== ws.cwd).slice(0, 8).map((p) => (
-                      <button key={p} onClick={() => void openWorkspace(p)}><b>{p.split(/[\\/]/).filter(Boolean).pop()}</b><span>{p}</span></button>
+                      <button key={p} onClick={() => void openSession(undefined, p)}><b>{p.split(/[\\/]/).filter(Boolean).pop()}</b><span>{p}</span></button>
                     ))}
-                    <button onClick={() => void openWorkspace()}><b>打开其他文件夹…</b></button>
-                    <button onClick={() => { setMenu(false); void unify.reveal('project'); }}><b>在文件管理器中显示</b></button>
+                    <button onClick={() => void addWorkspace()}><b>添加工作区…</b></button>
+                    <button onClick={() => { setMenu(false); void unify.reveal(ws.cwd, 'project'); }}><b>在文件管理器中显示</b></button>
                   </div>
                 </>
               )}
@@ -462,8 +491,17 @@ export function App() {
       {ws && (
         <aside id="workspace-sidebar" className="sidebar" ref={sidebarElement} aria-hidden={!sidebar} inert={!sidebar}>
           <button className="new-chat" onClick={() => void openSession(null)}><Icon name="plus" />新对话<kbd>Ctrl N</kbd></button>
-          <SessionList key={ws.cwd} sidebarOpen={sidebar} sessions={sessions} current={view === 'chat' ? current : null} live={liveSessions}
-            open={(id) => void openSession(id)} update={updateSession} remove={deleteSession} onError={(msg) => notify(msg, 'err')} />
+          <WorkspaceSessions sidebarOpen={sidebar} paths={recent} indexes={indexes} activeCwd={ws.cwd}
+            query={sessionQuery} setQuery={setSessionQuery}
+            current={view === 'chat' ? current : null} live={liveSessions} expanded={expanded}
+            toggle={dir => setExpanded(dirs => {
+              const next = new Set(dirs);
+              if (next.has(dir)) next.delete(dir);
+              else next.add(dir);
+              return next;
+            })}
+            add={() => void addWorkspace()} refresh={refreshSessions} open={(dir, id) => void openSession(id, dir)}
+            update={updateSession} remove={deleteSession} onError={msg => notify(msg, 'err')} />
           <nav className="side-nav">
             <button className={view === 'bench' ? 'on' : ''} onClick={() => setView('bench')}><Icon name="bookmark" />评测集</button>
             <button className={view === 'quota' ? 'on' : ''} onClick={openQuota}><Icon name="gauge" />额度</button>
@@ -480,12 +518,12 @@ export function App() {
             <InteractionBanner items={pendingInteractions} onJump={jumpToInteraction} label="前往处理" className="page-interact" />
           )}
           {ws && <BenchmarkPage key={ws.cwd} ws={ws} visible={view === 'bench'} />}
-          {!ws ? <Welcome onOpen={(d) => void openWorkspace(d)} />
+          {!ws ? <Welcome onOpen={dir => dir ? void openSession(undefined, dir) : void addWorkspace()} />
             : view === 'bench' ? null
             : view === 'quota' ? <QuotaPage quota={quota} loading={quotaLoading} refresh={() => refreshQuota(true)} />
             : view === 'cache' ? <CachePage />
             : view === 'memory' ? <MemoryPage cwd={ws.cwd} notify={notify} />
-            : view === 'settings' ? <SettingsPage key={ws.cwd} ws={ws} onChange={setWs} notify={notify} initialGraph={settingsGraph} />
+            : view === 'settings' ? <SettingsPage key={ws.cwd} ws={ws} onChange={info => { if (activeCwd.current === info.cwd) setWs(info); }} notify={notify} initialGraph={settingsGraph} />
             : turns.length === 0 ? (
               <div className="home-stage">
                 {ws.configError && <div className="error block home-alert"><Icon name="alert" size={14} /><span>配置有误：{ws.configError}</span></div>}
@@ -516,11 +554,11 @@ export function App() {
               </div>
             ) : (
               <>
-                <div key={current} className="thread page-enter" ref={thread} onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
+                <div key={`${ws.cwd}:${current}`} className="thread page-enter" ref={thread} onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
                   {ws.configError && <div className="error block"><Icon name="alert" size={14} /><span>配置有误：{ws.configError}</span></div>}
                   {turns.map((r) => (
                     <Turn
-                      key={r.id} record={r} notices={notices[r.id] ?? []} interactions={interactions} showReasoning={ws.showReasoning} actions={actions}
+                      key={r.id} cwd={ws.cwd} record={r} notices={notices[r.id] ?? []} interactions={interactions} showReasoning={ws.showReasoning} actions={actions}
                       isLatestComparison={r.id === latestComparisonId} isLatestTurn={r.id === turns.at(-1)?.id} followUp={activeFollowUp}
                       choiceBlocker={!r.collaboration && !composer.graph && !composer.selected.length ? '先选择一个回答模型' : undefined}
                       execution={r.collaboration ? turns.find(t => t.planSource?.turnId === r.id) : undefined}
@@ -546,7 +584,7 @@ export function App() {
             onMouseDown={(e) => { if (e.target === e.currentTarget) setZoom(undefined); }}>
             <Card
               key={zoomResult.runId} record={zoomed} result={zoomResult} zoomed showReasoning={ws?.showReasoning ?? false} interactions={interactions[zoomResult.runId]} actions={actions}
-              kind={zoomCall?.scope === 'plan-review' || zoomCall?.scope === 'result-review' ? zoomCall.scope : zoomed.synthesis?.result.runId === zoomResult.runId ? 'synthesis' : zoomed.kind === 'execution' ? 'exec' : 'answer'}
+              kind={zoomCall && isReviewOrReport(zoomCall.scope) ? zoomCall.scope : zoomed.synthesis?.result.runId === zoomResult.runId ? 'synthesis' : zoomed.kind === 'execution' ? 'exec' : 'answer'}
             />
           </div>
         )}
@@ -563,13 +601,13 @@ export function App() {
           key={execPresence.rendered.key}
           initial={execPresence.rendered.preview} open={execPresence.state === 'open'} onClose={() => setExecPreview(undefined)}
           onError={(m) => notify(m, 'err')}
-          onStarted={(ids) => { setExecPreview(undefined); setCurrent(ids.sessionId); setView('chat'); refreshSessions(); }}
+          onStarted={() => { setExecPreview(undefined); refreshSessions(execPresence.rendered?.preview.cwd); }}
         />
       )}
       {distillPresence.rendered && (
         <DistillDialog
           key={distillPresence.rendered.key}
-          open={distillPresence.state === 'open'}
+          cwd={distillPresence.rendered.cwd} open={distillPresence.state === 'open'}
           initial={distillPresence.rendered.prep}
           source={distillPresence.rendered.source}
           onClose={() => setDistillModal(undefined)}

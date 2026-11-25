@@ -20,6 +20,7 @@ const statePath = () => join(app.getPath('userData'), 'state.json');
 
 interface State {
   recent: string[];
+  activeWorkspace?: string;
   theme?: 'light' | 'dark';
   bounds?: { x: number; y: number; width: number; height: number; maximized?: boolean };
   quotaReminders: QuotaReminderHistory;
@@ -45,6 +46,7 @@ function readState(): State {
     }));
     return {
       recent: Array.isArray(s.recent) ? s.recent.filter((p: unknown) => typeof p === 'string') : [], bounds: s.bounds,
+      activeWorkspace: typeof s.activeWorkspace === 'string' ? s.activeWorkspace : undefined,
       theme: s.theme === 'dark' || s.theme === 'light' ? s.theme : undefined,
       quotaReminders: reminders && typeof reminders === 'object' && !Array.isArray(reminders) ? reminders : {},
       composerSelections,
@@ -64,6 +66,7 @@ const isDir = (p: string) => { try { return statSync(p).isDirectory(); } catch {
 let state: State;
 let win: BrowserWindow | undefined;
 let workspace: Workspace | undefined;
+const workspaces = new Map<string, Workspace>();
 let quitting = false;
 let pendingQuotaNotice: QuotaNotice | undefined;
 let activeQuotaNotification: Notification | undefined;
@@ -130,27 +133,36 @@ const palette = () => nativeTheme.shouldUseDarkColors
   ? { bg: '#0e0f11', symbol: '#c9cbd1' }
   : { bg: '#f7f7f8', symbol: '#3a3d44' };
 
-function openWorkspace(dir: string): Workspace {
+function registerWorkspace(dir: string): string {
   const cwd = resolve(dir);
   if (!isDir(cwd)) throw new Error(`目录不存在：${cwd}`);
-  if (workspace?.cwd === cwd) return workspace;
-  if (workspace?.busy) throw new Error('当前项目还有操作在进行，请等待完成后再切换');
-  void workspace?.dispose();
-  workspace = new Workspace(cwd, push, monitorQuota);
-  state.recent = [cwd, ...state.recent.filter((p) => p !== cwd)].slice(0, 12);
-  writeState(state);
-  return workspace;
+  if (!state.recent.includes(cwd)) state.recent.unshift(cwd);
+  return cwd;
 }
 
-const need = (): Workspace => {
-  if (!workspace) throw new Error('请先打开一个项目文件夹');
-  return workspace;
-};
+function knownWorkspace(cwd: string): Workspace {
+  if (!state.recent.includes(cwd) || !isDir(cwd)) throw new Error(`工作区不可用：${cwd}`);
+  let ws = workspaces.get(cwd);
+  if (!ws) {
+    ws = new Workspace(cwd, (event) => push({ ...event, cwd }), monitorQuota);
+    workspaces.set(cwd, ws);
+  }
+  return ws;
+}
+
+function activateWorkspace(ws: Workspace): void {
+  if (workspace !== ws) {
+    workspace?.deactivate();
+    workspace = ws;
+    ws.activate();
+    state.activeWorkspace = ws.cwd;
+    writeState(state);
+  }
+}
 
 const currentWorkspace = (cwd: string): Workspace => {
-  const ws = need();
-  if (cwd !== ws.cwd) throw new Error('项目已切换，请在当前项目中重试');
-  return ws;
+  if (!workspace || cwd !== workspace.cwd) throw new Error('项目已切换，请在当前项目中重试');
+  return workspace;
 };
 
 const describeWorkspace = (ws: Workspace): OpenedWorkspace => ({
@@ -172,14 +184,19 @@ const api: UnifyApi = {
     }
     return workspace ? describeWorkspace(workspace) : null;
   },
-  async openWorkspace(dir) {
-    let target = dir;
-    if (!target) {
-      const picked = await dialog.showOpenDialog(win!, { title: '选择项目文件夹', properties: ['openDirectory', 'createDirectory'] });
-      if (picked.canceled || !picked.filePaths[0]) return null;
-      target = picked.filePaths[0];
-    }
-    return describeWorkspace(openWorkspace(target));
+  async addWorkspace() {
+    const picked = await dialog.showOpenDialog(win!, { title: '添加工作区', properties: ['openDirectory', 'createDirectory'] });
+    if (picked.canceled || !picked.filePaths[0]) return null;
+    const cwd = registerWorkspace(picked.filePaths[0]);
+    writeState(state);
+    return cwd;
+  },
+  async openWorkspace(dir, sessionId) {
+    const ws = knownWorkspace(dir);
+    const records = sessionId ? ws.session(sessionId) : [];
+    if (sessionId && !records.length) throw new Error('找不到这段对话');
+    activateWorkspace(ws);
+    return { ...describeWorkspace(ws), records };
   },
   async saveComposerSelection(cwd, selection) {
     const ws = currentWorkspace(cwd);
@@ -209,15 +226,14 @@ const api: UnifyApi = {
     });
     if (selected && workspace === ws) await ws.switchBranch(selected);
   },
-  async sessions() { return need().sessions(); },
-  async session(id) { return need().session(id); },
-  async updateSession(cwd, id, changes) { currentWorkspace(cwd).updateSession(id, changes); },
-  async deleteSession(cwd, id) { await currentWorkspace(cwd).deleteSession(id, (path) => shell.trashItem(path)); },
-  async ask(req) { return need().ask(req); },
-  async retry(turnId, targetIds) { return need().retry(turnId, targetIds); },
-  async cancel(turnId) { need().cancel(turnId); },
-  async cancelTarget(turnId, targetId) { return need().cancelTarget(turnId, targetId); },
-  async respondInteraction(turnId, interactionId, response) { return need().respondInteraction(turnId, interactionId, response); },
+  async sessions(cwd) { return knownWorkspace(cwd).sessions(); },
+  async updateSession(cwd, id, changes) { knownWorkspace(cwd).updateSession(id, changes); },
+  async deleteSession(cwd, id) { await knownWorkspace(cwd).deleteSession(id, (path) => shell.trashItem(path)); },
+  async ask(cwd, req) { return currentWorkspace(cwd).ask(req); },
+  async retry(cwd, turnId, targetIds) { return currentWorkspace(cwd).retry(turnId, targetIds); },
+  async cancel(cwd, turnId) { currentWorkspace(cwd).cancel(turnId); },
+  async cancelTarget(cwd, turnId, targetId) { return currentWorkspace(cwd).cancelTarget(turnId, targetId); },
+  async respondInteraction(cwd, turnId, interactionId, response) { return currentWorkspace(cwd).respondInteraction(turnId, interactionId, response); },
   async stageMaterial(cwd, name, mime, data) { return stageMaterial(currentWorkspace(cwd).cwd, name, mime, data); },
   async discardMaterial(cwd, id) { discardMaterial(cwd, id); },
   async revealMaterial(cwd, turn, index) {
@@ -240,24 +256,24 @@ const api: UnifyApi = {
   async benchRead(cwd, id, published) { return (published ? getCase : getDraft)(currentWorkspace(cwd).cwd, id); },
   async benchPublish(cwd, data, judge, options) { return currentWorkspace(cwd).benchPublish(data, judge, options); },
   async benchRun(cwd, ids, targets, judge, collection) { return currentWorkspace(cwd).benchRun(ids, targets, judge, collection); },
-  async previewExec(turnId, from, executor) { return need().previewExec(turnId, from, executor); },
-  async closeCollaboration(turnId) { need().closeCollaboration(turnId); },
-  async exec(turnId, from, executor) { return need().exec(turnId, from, executor); },
-  async quota(force) { return need().quota(force); },
+  async previewExec(cwd, turnId, from, executor) { return currentWorkspace(cwd).previewExec(turnId, from, executor); },
+  async closeCollaboration(cwd, turnId) { currentWorkspace(cwd).closeCollaboration(turnId); },
+  async exec(cwd, turnId, from, executor) { return currentWorkspace(cwd).exec(turnId, from, executor); },
+  async quota(cwd, force) { return currentWorkspace(cwd).quota(force); },
   cacheReport() { return readCacheReport(); },
-  async settings() { return need().settings(); },
+  async settings(cwd) { return currentWorkspace(cwd).settings(); },
   async agyModels(cwd) { return readAgyModels(currentWorkspace(cwd).cwd); },
-  async testTarget(id) { return need().testTarget(id); },
-  async setSetting(key, value, entry) { return need().setSetting(key, value, entry); },
+  async testTarget(cwd, id) { return currentWorkspace(cwd).testTarget(id); },
+  async setSetting(cwd, key, value, entry) { return currentWorkspace(cwd).setSetting(key, value, entry); },
   async saveCollaboration(cwd, id, graph) { currentWorkspace(cwd).setSetting('collaborationGraphs', graph, id); },
-  async saveApi(id, model, apiKey) { return need().saveApi(id, model, apiKey); },
-  async memoryUrl() { return need().memoryUrl(); },
-  async prepareDistill(source) { return need().prepareDistill(source); },
-  async distillCandidates(source, targetId) { return need().distillCandidates(source, targetId); },
-  async checkDistillDuplicate(targetPath, text) { return need().checkDistillDuplicate(targetPath, text); },
-  async applyDistill(req) { return need().applyDistill(req); },
-  async reveal(what, id) {
-    const ws = need();
+  async saveApi(cwd, id, model, apiKey) { return currentWorkspace(cwd).saveApi(id, model, apiKey); },
+  async memoryUrl(cwd) { return currentWorkspace(cwd).memoryUrl(); },
+  async prepareDistill(cwd, source) { return currentWorkspace(cwd).prepareDistill(source); },
+  async distillCandidates(cwd, source, targetId) { return currentWorkspace(cwd).distillCandidates(source, targetId); },
+  async checkDistillDuplicate(cwd, targetPath, text) { return currentWorkspace(cwd).checkDistillDuplicate(targetPath, text); },
+  async applyDistill(cwd, req) { return currentWorkspace(cwd).applyDistill(req); },
+  async reveal(cwd, what, id) {
+    const ws = currentWorkspace(cwd);
     const settings = what.endsWith('config') ? ws.settings() : undefined;
     const path = what === 'project' ? ws.cwd
       : what === 'run' ? ws.runDir(String(id))
@@ -363,10 +379,10 @@ if (!app.requestSingleInstanceLock()) {
 
   // Model calls are child processes; wait for cancellation and record writes before exiting.
   app.on('before-quit', (event) => {
-    if (quitting || !workspace) return;
+    if (quitting || !workspaces.size) return;
     event.preventDefault();
     quitting = true;
-    const done = workspace.dispose();
+    const done = Promise.all(Array.from(workspaces.values(), ws => ws.dispose()));
     const limit = new Promise((r) => setTimeout(r, 8000));
     void Promise.race([done, limit]).finally(() => app.quit());
   });
@@ -379,8 +395,8 @@ if (!app.requestSingleInstanceLock()) {
     nativeTheme.themeSource = state.theme ?? 'system';
     await prepareProviderPath();
     const fromArgs = process.argv.slice(app.isPackaged ? 1 : 2).find((a) => !a.startsWith('-') && isDir(a));
-    const initial = process.env.UNIFY_CWD ?? fromArgs ?? state.recent.find(isDir);
-    if (initial) { try { openWorkspace(initial); } catch { /* fall back to the welcome screen */ } }
+    const initial = process.env.UNIFY_CWD ?? fromArgs ?? (state.activeWorkspace && isDir(state.activeWorkspace) ? state.activeWorkspace : state.recent.find(isDir));
+    if (initial) { try { activateWorkspace(knownWorkspace(registerWorkspace(initial))); } catch { /* fall back to the welcome screen */ } }
     createWindow();
   });
 }

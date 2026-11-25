@@ -80,7 +80,7 @@ export function CombinationCanvas({ graph, busy, onLayout, onInsert, children }:
       for (const from of levels[i - 1]) for (const to of levels[i]) {
         const wire = wireBetween(from.rect, to.rect, box);
         if (to.id === 'confirm' && !currentGraph.current.check) wire.insert = 'check';
-        if (to.id === 'end' && !currentGraph.current.audit) wire.insert = 'audit';
+        if (from.id === 'execution' && !currentGraph.current.audit) wire.insert = 'audit';
         next.push(wire);
       }
     }

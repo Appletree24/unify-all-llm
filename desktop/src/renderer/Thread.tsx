@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from 'react';
 import { synthesisFormatter } from '../../../src/core/synth.js';
-import { graphIssue, graphPlanResult, graphStages, roleNames, type Collaboration } from '../../../src/core/collaboration.js';
+import { graphIssue, graphPlanResult, graphStages, isReviewOrReport, roleNames, type Collaboration } from '../../../src/core/collaboration.js';
 import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSourceRef, DuplicateCheckResult, ExecPreview, InteractionOption, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { useAnimatedDialog, usePresence } from './motion.js';
@@ -12,7 +12,7 @@ import { MaterialInput, SavedMaterials, useMaterialInput } from './MaterialInput
 import type { MaterialSelection } from '../shared/api.js';
 import { CollectQuestionsButton, FollowUpQuestions, LiveQuestions, type PendingInteractionItem, type Respond } from './QuestionPanel.js';
 
-type CardKind = 'answer' | 'synthesis' | 'exec' | 'plan-review' | 'result-review';
+type CardKind = 'answer' | 'synthesis' | 'exec' | 'plan-review' | 'result-review' | 'report';
 
 /** When each call was first seen running, for elapsed-time labels. */
 const firstSeen = new Map<string, number>();
@@ -83,9 +83,9 @@ export function Card({ record, result, kind, showReasoning, interactions, action
   if (running && !firstSeen.has(result.runId)) firstSeen.set(result.runId, Date.now());
   const call = record.calls.find((c) => c.id === result.runId);
   const target = call?.target ?? record.targets.find((t) => t.id === result.targetId);
-  const prefix = { answer: '', synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核' }[kind];
+  const prefix = { answer: '', synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核', report: roleNames.report }[kind];
   const label = (prefix ? prefix + ' · ' : '') + (target?.label ?? result.targetId);
-  const review = kind === 'plan-review' || kind === 'result-review';
+  const canAnnotate = !isReviewOrReport(kind);
   const meta = [result.model, result.reasoningEffort && `思考 ${result.reasoningEffort}`].filter(Boolean).join(' · ');
   const elapsed = running ? now - (firstSeen.get(result.runId) ?? now) : result.durationMs;
   const turnRunning = isActive(record);
@@ -218,8 +218,8 @@ export function Card({ record, result, kind, showReasoning, interactions, action
           )}
           {text && <button className="copy-answer" data-copied={copied || undefined} title={copied ? '已复制' : '复制'}
             aria-label={copied ? '已复制' : '复制'} onClick={() => void copyAnswer()}><Icon key={String(copied)} name={copied ? 'check' : 'copy'} /></button>}
-          {!review && !turnRunning && !running && <button title="标注、改写、评分或留作评测" onClick={() => actions.feedback(record, result.runId, quote)}>{quote ? '标注选段' : '反馈 / 留题'}</button>}
-          {!review && result.ok && !turnRunning && text && actions.distill && (
+          {canAnnotate && !turnRunning && !running && <button title="标注、改写、评分或留作评测" onClick={() => actions.feedback(record, result.runId, quote)}>{quote ? '标注选段' : '反馈 / 留题'}</button>}
+          {canAnnotate && result.ok && !turnRunning && text && actions.distill && (
             <button
               title="存为记忆…（可先划选一段文字）"
               onClick={() => {
@@ -263,7 +263,7 @@ export function Card({ record, result, kind, showReasoning, interactions, action
 
 // ── one round: question, answers, synthesis ───────────────────────────────
 function GraphProgress({ graph, record, execution, pending }: { graph: Collaboration; record: RunRecord; execution?: RunRecord; pending: boolean }) {
-  const scope = { plan:'answer', merge:'synthesis', check:'plan-review', execution:'exec', audit:'result-review' } as const;
+  const scope = { plan:'answer', merge:'synthesis', check:'plan-review', execution:'exec', audit:'result-review', report:'report' } as const;
   const calls = [...record.calls, ...(execution?.calls ?? [])];
   return <nav className="cg-progress" aria-label={graph.name + '进度'}><b>{graph.name}</b>{graphStages(graph).map(step => {
     const matching = step === 'confirm' ? [] : calls.filter(c => c.scope === scope[step]);
@@ -275,14 +275,20 @@ function GraphProgress({ graph, record, execution, pending }: { graph: Collabora
     const label = step === 'confirm' ? roleNames.confirm : step === 'plan' ? graph.plans[0].label ?? '方案' : graph[step]?.label ?? roleNames[step];
     return <button key={step} aria-current={current ? 'step' : undefined} className={current ? 'current' : failed ? 'failed' : ''}
       aria-label={ended ? label + '，已完成' : failed ? label + '，失败' : undefined}
-      disabled={!dest} onClick={() => dest && document.getElementById(dest)?.scrollIntoView({block:'center'})}>
+      disabled={!dest} onClick={() => {
+        const card = dest && document.getElementById(dest);
+        if (!card) return;
+        const details = card.closest('details');
+        if (details) details.open = true;
+        card.scrollIntoView({block:'center'});
+      }}>
       {ended ? <span className="cg-step-done" aria-hidden="true">✓</span> : failed ? <span aria-hidden="true">×</span> : current ? <span className="cg-step-dot" aria-hidden="true" /> : null}
       {label}
     </button>;
   })}</nav>;
 }
-export function Turn({ record, notices, interactions, showReasoning, actions, isLatestComparison, isLatestTurn, followUp, execution, graphExecutor, choiceBlocker }: {
-  record: RunRecord; notices: string[]; interactions?: Record<string, PendingInteractionItem[]>; showReasoning: boolean; actions: TurnActions;
+export function Turn({ cwd, record, notices, interactions, showReasoning, actions, isLatestComparison, isLatestTurn, followUp, execution, graphExecutor, choiceBlocker }: {
+  cwd: string; record: RunRecord; notices: string[]; interactions?: Record<string, PendingInteractionItem[]>; showReasoning: boolean; actions: TurnActions;
   isLatestComparison?: boolean; isLatestTurn?: boolean; followUp?: FollowUpChoice; execution?: RunRecord; graphExecutor?: string; choiceBlocker?: string;
 }) {
   const active = isActive(record);
@@ -304,22 +310,29 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
     <Card key={c.id} record={record} result={c.result} kind={c.scope as 'plan-review' | 'result-review'} showReasoning={showReasoning} actions={actions} interactions={interactions?.[c.id]} />);
   if (record.kind === 'execution') {
     const result = record.results[0];
+    const report = record.calls.find(c => c.scope === 'report');
     const src = record.planSource;
-    const srcLabel = src ? (src.scope === 'synthesis' ? '汇总' : src.scope === 'plan-review' ? '复核后的方案' : record.targets.find((t) => t.id === src.targetId)?.label ?? src.targetId) : '';
+    const srcLabel = src ? (src.scope === 'synthesis' ? '汇总' : src.scope === 'plan-review' ? '复核后的方案' : (record.collaborationTargets ?? record.targets).find((t) => t.id === src.targetId)?.label ?? src.targetId) : '';
+    const work = <>
+      {result ? <Card key={result.runId} record={record} result={result} kind="exec" showReasoning={showReasoning} interactions={interactions?.[result.runId]} actions={actions} />
+        : active && <div className="pending"><Spinner />正在准备实施…</div>}
+      {reviewCards}
+    </>;
     return (
       <section className="turn exec-turn" id={'turn-' + record.id}>
         <div className="q small">
           <div className="q-kicker"><Icon name="run" size={13} />实施方案{srcLabel && <> · 依据「{srcLabel}」</>}<span>{time}</span></div>
         </div>
         {noticesView}
-        {result ? <Card key={result.runId} record={record} result={result} kind="exec" showReasoning={showReasoning} interactions={interactions?.[result.runId]} actions={actions} />
-          : <div className="pending"><Spinner />正在准备实施…</div>}
-        {reviewCards}
+        {report ? <>
+          <details className="cg-work-record"><summary>{record.targets[0]?.label} 实施记录{reviewCards.length > 0 && '与复核记录'}</summary>{work}</details>
+          <Card key={report.id} record={record} result={report.result} kind="report" showReasoning={showReasoning} interactions={interactions?.[report.id]} actions={actions} />
+        </> : work}
         {requests}
         {record.error && <div className="error"><Icon name="alert" size={14} /><span>{record.error}</span></div>}
         <div className="turn-foot">
-          {active ? <button className="ghost" onClick={() => actions.cancel(record.id)}><Icon name="stop" size={14} />停止实施</button>
-            : result?.ok ? <span className="hint"><Icon name="check" size={14} />实施完成，请用 git diff 检查改动</span> : null}
+          {active ? <button className="ghost" onClick={() => actions.cancel(record.id)}><Icon name="stop" size={14} />{report ? '停止汇报' : '停止实施'}</button>
+            : result?.ok && !record.collaboration?.report ? <span className="hint"><Icon name="check" size={14} />实施完成，请用 git diff 检查改动</span> : null}
           {record.collaboration && isLatestTurn && !active && <button className="btn" onClick={() => actions.reviseGraph?.(record)}>带回方案讨论</button>}
         </div>
       </section>
@@ -380,7 +393,7 @@ export function Turn({ record, notices, interactions, showReasoning, actions, is
             {anyOk && showChoices && !choices.length && <CollectQuestionsButton blocked={choiceBlocker} send={text => actions.sendChoices(text, record)} />}
             {actions.benchmark && <button className="ghost" onClick={() => actions.feedback(record)}>{answers.length > 1 ? '比较回答 / 整轮留题' : '整轮反馈 / 留题'}</button>}
             {(record.collaboration ? isLatestComparison && !execution && ['failed','partial','interrupted','cancelled'].includes(record.status) : failed.length > 0) && <button className="ghost" onClick={() => actions.retry(record.id)}><Icon name="retry" size={14} />{record.collaboration ? '重新运行协作方案' : '重试未成功的 ' + failed.length + ' 个'}</button>}
-            <button className="ghost subtle" onClick={() => void unify.reveal('run', record.id)}><Icon name="folder" size={14} />记录</button>
+            <button className="ghost subtle" onClick={() => void unify.reveal(cwd, 'run', record.id)}><Icon name="folder" size={14} />记录</button>
           </>
         )}
       </div>
@@ -701,7 +714,7 @@ export function ExecDialog({ initial, open, onClose, onStarted, onError }: {
   };
   const update = async (from: string | undefined, executor: string) => {
     setError('');
-    try { setPreview(await unify.previewExec(preview.turnId, from, executor)); }
+    try { setPreview(await unify.previewExec(preview.cwd, preview.turnId, from, executor)); }
     catch (err) { reportError(err); }
   };
 
@@ -734,7 +747,7 @@ export function ExecDialog({ initial, open, onClose, onStarted, onError }: {
           onClick={async () => {
             setBusy(true);
             setError('');
-            try { onStarted(await unify.exec(preview.turnId, fromValue || undefined, preview.executor.id)); }
+            try { onStarted(await unify.exec(preview.cwd, preview.turnId, fromValue || undefined, preview.executor.id)); }
             catch (err) { reportError(err); setBusy(false); }
           }}
         >
@@ -746,8 +759,8 @@ export function ExecDialog({ initial, open, onClose, onStarted, onError }: {
 }
 
 // ── save to memory (distill) dialog ───────────────────────────────────────
-export function DistillDialog({ initial, source, open, onClose, onSaved, onError }: {
-  initial: DistillPreparation;
+export function DistillDialog({ cwd, initial, source, open, onClose, onSaved, onError }: {
+  cwd: string; initial: DistillPreparation;
   source: DistillSourceRef;
   open: boolean;
   onClose(): void;
@@ -782,16 +795,16 @@ export function DistillDialog({ initial, source, open, onClose, onSaved, onError
     if (!targetPath || !text.trim()) { setDuplicates(undefined); return; }
     let stale = false;
     const timer = setTimeout(() => {
-      void unify.checkDistillDuplicate(targetPath, text).then((res) => { if (!stale) setDuplicates(res); }, () => undefined);
+      void unify.checkDistillDuplicate(cwd, targetPath, text).then((res) => { if (!stale) setDuplicates(res); }, () => undefined);
     }, 200);
     return () => { stale = true; clearTimeout(timer); };
-  }, [open, targetPath, text]);
+  }, [cwd, open, targetPath, text]);
 
   const runDistill = async () => {
     setDistilling(true);
     setError('');
     try {
-      const list = await unify.distillCandidates({ ...source, selectedText: text.trim() || source.selectedText });
+      const list = await unify.distillCandidates(cwd, { ...source, selectedText: text.trim() || source.selectedText });
       setCandidates(list);
       if (list.length === 1) setText(list[0].text);
     } catch (err) {
@@ -806,7 +819,7 @@ export function DistillDialog({ initial, source, open, onClose, onSaved, onError
     setSaving(true);
     setError('');
     try {
-      const res = await unify.applyDistill({
+      const res = await unify.applyDistill(cwd, {
         source,
         targetPath,
         text: text.trim(),

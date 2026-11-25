@@ -6,8 +6,9 @@ import { atomicWrite } from '../../../src/core/atomic-write.js';
 import { loadConfig, parseConfig, timeoutMillis, readJson, type Config } from '../../../src/core/config.js';
 import { currentGitBranch, listGitBranches, switchGitBranch } from '../../../src/core/git-branches.js';
 import { projectConfigPath, userConfigPath, writeSetting } from '../../../src/core/settings.js';
+import { readSessionSettings, sessionSettingsPath, summarizeSessions } from '../../../src/core/sessions.js';
 import { listRunIds, loadRun, saveRun, type RunRecord } from '../../../src/core/store.js';
-import { graphIssue } from '../../../src/core/collaboration.js';
+import { graphIssue, roleNames } from '../../../src/core/collaboration.js';
 import { discussionFormat } from '../shared/decision-format.js';
 import { commitMaterials } from './materials.js';
 import { defaultTargetIds, detectTargets } from '../../../src/core/targets.js';
@@ -22,7 +23,7 @@ import { buildRegistry } from '../../../src/providers/index.js';
 import { targetModelIds, modelIds } from '../../../src/providers/models.js';
 import { officialApis, readApiProfile, saveApiProfile } from '../../../src/providers/official.js';
 import { QUOTA_REFRESH_MS, readTargetQuotas, type TargetQuota } from '../../../src/quota/index.js';
-import { SESSION_TITLE_LIMIT, type AskRequest, type ExecPreview, type InteractionResponse, type Push, type SessionChanges, type SessionSummary, type SettingsInfo, type TargetInfo, type WorkspaceInfo } from '../shared/api.js';
+import { SESSION_TITLE_LIMIT, type AskRequest, type ExecPreview, type InteractionResponse, type WorkspacePush, type SessionChanges, type SessionSummary, type SettingsInfo, type TargetInfo, type WorkspaceInfo } from '../shared/api.js';
 
 const ACTIVE = new Set<RunRecord['status']>(['created', 'deciding', 'answering', 'synthesizing']);
 const SESSION_BUSY = '这个对话还有请求在进行，请等待完成或先取消';
@@ -49,17 +50,27 @@ export class Workspace {
   private readonly runCache = new Map<string, { mtime: number; run: RunRecord }>();
   private quotaCache?: { at: number; value: Promise<TargetQuota[]> };
   private quotaRun?: AbortController;
-  private readonly quotaTimer: NodeJS.Timeout;
+  private quotaTimer?: NodeJS.Timeout;
   private disposed = false;
   private readonly benchAbort = new AbortController();
   private memory?: Promise<MemoryServer>;
   private readonly modelTests: ModelTests;
 
-  constructor(readonly cwd: string, private readonly push: (p: Push) => void, private readonly onQuota: (quotas: TargetQuota[]) => void) {
+  constructor(readonly cwd: string, private readonly push: (p: WorkspacePush) => void, private readonly onQuota: (quotas: TargetQuota[]) => void) {
     this.modelTests = new ModelTests(cwd, () => this.pushInfo());
+  }
+
+  // Listing history in the sidebar only needs the run files. Start providers
+  // and quota polling when this project becomes the active workspace.
+  activate(): void {
     this.reload();
     void this.refreshGitBranch();
     this.quotaTimer = setInterval(() => this.refreshQuota(), QUOTA_REFRESH_MS);
+  }
+
+  deactivate(): void {
+    clearInterval(this.quotaTimer);
+    this.quotaTimer = undefined;
   }
 
   /** Re-read both config layers; an invalid file is reported instead of crashing the window. */
@@ -172,35 +183,8 @@ export class Workspace {
     return listRunIds(this.cwd).map((id) => this.load(id)).filter((r): r is RunRecord => !!r);
   }
 
-  private sessionSettingsPath(first: RunRecord): string {
-    return join(this.runDir(first.id), 'desktop-session.json');
-  }
-
-  private sessionSettings(first: RunRecord): SessionChanges {
-    try {
-      const data = readJson(this.sessionSettingsPath(first)) as SessionChanges | undefined;
-      return { title: typeof data?.title === 'string' ? data.title : undefined, pinned: data?.pinned === true };
-    } catch { return {}; }
-  }
-
   sessions(): SessionSummary[] {
-    const map = new Map<string, RunRecord[]>();
-    for (const run of this.runs()) {
-      const list = map.get(run.sessionId);
-      if (list) list.push(run); else map.set(run.sessionId, [run]);
-    }
-    return [...map.entries()].map(([id, runs]) => {
-      const first = runs[0];
-      const last = runs[runs.length - 1];
-      const { title, pinned } = this.sessionSettings(first);
-      return {
-        id, title: title ?? first.question.replace(/\s+/g, ' ').trim().slice(0, SESSION_TITLE_LIMIT),
-        pinned: pinned ?? false, createdAt: first.createdAt,
-        updatedAt: last.updatedAt, turns: runs.filter((r) => r.kind === 'comparison').length,
-        status: runs.find((run) => ACTIVE.has(run.status))?.status ?? last.status,
-        hasExec: runs.some((r) => r.kind === 'execution'),
-      };
-    }).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
+    return summarizeSessions(this.cwd, this.runs());
   }
 
   session(id: string): RunRecord[] {
@@ -211,7 +195,7 @@ export class Workspace {
     if (this.deletions.has(id)) throw new Error('正在删除这段对话');
     const [first] = this.session(id);
     if (!first) throw new Error('找不到这段对话');
-    const settings = this.sessionSettings(first);
+    const settings = readSessionSettings(this.cwd, first);
     if (changes.title !== undefined) {
       const title = typeof changes.title === 'string' ? changes.title.replace(/\s+/g, ' ').trim() : '';
       if (!title || title.length > SESSION_TITLE_LIMIT) throw new Error(`请输入 1–${SESSION_TITLE_LIMIT} 字的对话标题`);
@@ -221,7 +205,7 @@ export class Workspace {
       if (typeof changes.pinned !== 'boolean') throw new Error('无效的置顶设置');
       settings.pinned = changes.pinned;
     }
-    atomicWrite(this.sessionSettingsPath(first), JSON.stringify(settings, null, 2) + '\n');
+    atomicWrite(sessionSettingsPath(this.cwd, first), JSON.stringify(settings, null, 2) + '\n');
   }
 
   async deleteSession(id: string, trash: (path: string) => Promise<void>): Promise<void> {
@@ -442,8 +426,10 @@ export class Workspace {
     this.assertSessionIdle(source.sessionId);
     if (source.collaboration) {
       this.assertGraphPending(source);
-      const audit = source.collaboration.audit;
-      if (audit && !this.installed.get(audit.target)) throw new Error(`复核目标 ${audit.target} 不可用，请先接入该目标`);
+      for (const stage of ['audit', 'report'] as const) {
+        const role = source.collaboration[stage];
+        if (role && !this.installed.get(role.target)) throw new Error(`${roleNames[stage]}目标 ${role.target} 不可用，请先接入该目标`);
+      }
     }
     const executor = chooseExecutor(this.targets, executorId, this.installed);
     return this.start((onEvent) => startExecution({ cwd: this.cwd, config: this.cfg, targets: this.targets, executor, source, from, interactive: true, onEvent }));
@@ -452,7 +438,7 @@ export class Workspace {
   // ── quota, settings, memory ────────────────────────────────────────────
 
   private refreshQuota(force = false): void {
-    if (!this.disposed) void this.quota(force).catch(() => undefined);
+    if (this.quotaTimer && !this.disposed) void this.quota(force).catch(() => undefined);
   }
 
   private invalidateQuota(): void {

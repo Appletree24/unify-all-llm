@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { SESSION_TITLE_LIMIT, type SessionChanges, type SessionSummary } from '../shared/api.js';
 import { useAnimatedDialog, usePresence } from './motion.js';
@@ -9,6 +9,96 @@ function dayGroup(iso: string): string {
   const today = new Date();
   const diff = (Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()) - Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())) / 86_400_000;
   return diff <= 0 ? '今天' : diff === 1 ? '昨天' : diff < 7 ? '7 天内' : diff < 30 ? '30 天内' : '更早';
+}
+
+export interface SessionIndex {
+  sessions?: SessionSummary[];
+  error?: string;
+}
+
+interface WorkspaceSessionsProps {
+  sidebarOpen: boolean;
+  query: string;
+  setQuery(query: string): void;
+  paths: string[];
+  indexes: Record<string, SessionIndex>;
+  activeCwd: string;
+  current: string | null;
+  live: ReadonlySet<string>;
+  expanded: ReadonlySet<string>;
+  toggle(cwd: string): void;
+  add(): void;
+  refresh(cwd: string): void;
+  open(cwd: string, id: string | null): void;
+  update(cwd: string, id: string, changes: SessionChanges): Promise<void>;
+  remove(cwd: string, id: string): Promise<void>;
+  onError(message: string): void;
+}
+
+const folderName = (dir: string) => dir.split(/[\\/]/).filter(Boolean).at(-1) || dir;
+const noLiveSessions = new Set<string>();
+const matches = (session: SessionSummary, search: string) => session.title.toLowerCase().includes(search);
+
+export function WorkspaceSessions({ paths, indexes, activeCwd, current, expanded, live, add, toggle,
+  open, refresh, update, remove, sidebarOpen, onError, query, setQuery }: WorkspaceSessionsProps) {
+  const search = query.trim().toLowerCase();
+  const names = paths.map(folderName);
+  const noMatches = search && paths.every(dir => indexes[dir]?.sessions?.every(session => !matches(session, search)));
+
+  return (
+    <>
+      <label className="session-search">
+        <Icon name="search" size={15} />
+        <input type="search" aria-label="搜索所有工作区的对话" placeholder="搜索所有工作区的对话" value={query}
+          onChange={event => setQuery(event.target.value)} />
+      </label>
+      <div className="workspaces-heading"><span>工作区</span>
+        <button type="button" title="添加工作区" aria-label="添加工作区" onClick={add}><Icon name="plus" size={15} /></button>
+      </div>
+      <nav className="sessions" aria-label="按工作区浏览对话">
+        {paths.map((dir, i) => (
+          <WorkspaceGroup key={dir} dir={dir} name={names[i]} showPath={names.indexOf(names[i]) !== names.lastIndexOf(names[i])}
+            index={indexes[dir]} expanded={expanded.has(dir)} search={search} active={dir === activeCwd}
+            toggle={() => toggle(dir)} refresh={refresh} newChat={() => open(dir, null)}
+            sidebarOpen={sidebarOpen} current={dir === activeCwd ? current : null} live={dir === activeCwd ? live : noLiveSessions}
+            open={id => open(dir, id)} update={(id, changes) => update(dir, id, changes)} remove={id => remove(dir, id)} onError={onError} />
+        ))}
+        {noMatches && <p className="side-empty">没有匹配的对话</p>}
+      </nav>
+    </>
+  );
+}
+
+function WorkspaceGroup({ dir, name, showPath, index, expanded, search, active, toggle, refresh, newChat, ...list }:
+  Omit<SessionListProps, 'sessions'> & {
+    dir: string; name: string; showPath: boolean; index?: SessionIndex; expanded: boolean; search: string;
+    active: boolean; toggle(): void; refresh(cwd: string): void; newChat(): void;
+  }) {
+  const sectionId = useId();
+  const visible = expanded || !!search;
+  useEffect(() => { if (visible) refresh(dir); }, [visible, refresh, dir]);
+  const sessions = useMemo(() => search ? index?.sessions?.filter(session => matches(session, search)) : index?.sessions, [index, search]);
+  if (search && sessions?.length === 0) return null;
+
+  return (
+    <section className="workspace-group" aria-label={dir}>
+      <div className={`workspace-heading${active ? ' active' : ''}`}>
+        <button type="button" className="workspace-disclosure" title={dir} aria-expanded={visible} aria-controls={sectionId}
+          disabled={!!search} onClick={toggle}>
+          <Icon name="chevron" size={12} /><Icon name="folder" size={15} />
+          <span className="workspace-name">{name}{showPath && <small>{dir}</small>}</span>
+        </button>
+        <button type="button" className="workspace-new" title={`在 ${name} 中新建对话`} aria-label={`在 ${dir} 中新建对话`}
+          onClick={newChat}><Icon name="plus" size={14} /></button>
+      </div>
+      {visible && <div className="workspace-sessions" id={sectionId}>
+        {index?.error ? <p className="side-empty" title={index.error}>无法读取对话 <button onClick={() => refresh(dir)}>重试</button></p>
+          : !sessions ? <p className="side-empty"><Spinner /> 正在读取对话…</p>
+          : !sessions.length ? <p className="side-empty">暂无对话</p>
+          : <SessionList {...list} sessions={sessions} />}
+      </div>}
+    </section>
+  );
 }
 
 interface SessionListProps {
@@ -25,8 +115,7 @@ interface SessionListProps {
 type SessionAction = 'rename' | 'delete';
 const errorMessage = (err: unknown) => err instanceof Error ? err.message : String(err);
 
-export function SessionList({ sidebarOpen, sessions, current, live, open, update, remove, onError }: SessionListProps) {
-  const [query, setQuery] = useState('');
+function SessionList({ sidebarOpen, sessions, current, live, open, update, remove, onError }: SessionListProps) {
   const [menu, setMenu] = useState<{ id: string; anchor: HTMLButtonElement; style: CSSProperties }>();
   const [dialog, setDialog] = useState<{ key: number; action: SessionAction; session: SessionSummary }>();
   const dialogSequence = useRef(0);
@@ -44,7 +133,11 @@ export function SessionList({ sidebarOpen, sessions, current, live, open, update
     menuItems.current?.querySelector('button')?.focus({ preventScroll: true });
     const close = () => setMenu(undefined);
     window.addEventListener('resize', close);
-    return () => window.removeEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
   }, [menu, sidebarOpen]);
 
   const openMenu = (id: string, anchor: HTMLButtonElement) => {
@@ -62,28 +155,19 @@ export function SessionList({ sidebarOpen, sessions, current, live, open, update
     setMenu(undefined);
   };
 
-  const search = query.trim().toLowerCase();
   const groups = useMemo(() => {
     const groups = new Map<string, SessionSummary[]>();
     for (const session of sessions) {
-      if (search && !session.title.toLowerCase().includes(search)) continue;
       const group = session.pinned ? '置顶' : dayGroup(session.updatedAt);
       const items = groups.get(group);
       if (items) items.push(session);
       else groups.set(group, [session]);
     }
     return groups;
-  }, [sessions, search]);
+  }, [sessions]);
 
   return (
     <>
-      <label className="session-search">
-        <Icon name="search" size={15} />
-        <input type="search" aria-label="搜索对话标题" placeholder="搜索对话标题" value={query}
-          onChange={(event) => setQuery(event.target.value)} />
-      </label>
-      <nav className="sessions" aria-label="对话历史" onScroll={() => setMenu(undefined)}>
-        {!groups.size && <p className="side-empty">{search ? '没有匹配的对话' : '还没有对话记录'}</p>}
         {[...groups].map(([group, list]) => (
           <div key={group} className="session-group">
             <div className="label">{group}</div>
@@ -146,7 +230,6 @@ export function SessionList({ sidebarOpen, sessions, current, live, open, update
             })}
           </div>
         ))}
-      </nav>
       {visibleDialog && (
         <SessionDialog key={visibleDialog.key} action={visibleDialog.action} session={visibleDialog.session}
           open={dialogPresence.state === 'open'} onClose={() => setDialog(undefined)}

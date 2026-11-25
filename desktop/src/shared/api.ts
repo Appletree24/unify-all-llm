@@ -85,7 +85,7 @@ export interface SessionChanges {
   pinned?: boolean;
 }
 
-export const SESSION_TITLE_LIMIT = 120;
+export { SESSION_TITLE_LIMIT } from '../../../src/core/types.js';
 
 export interface AskRequest {
   materials?: MaterialSelection[];
@@ -140,46 +140,48 @@ export interface SettingsInfo {
   apis: ApiInfo[];
 }
 
-export type Push =
+export type WorkspacePush =
   | { type: 'run'; record: RunRecord }
   | { type: 'interaction'; turnId: string; callId: string; scope: CallRecord['scope']; targetId: string; targetLabel: string; request: PendingInteraction }
   | { type: 'interaction-resolved'; turnId: string; callId: string; interactionId: string }
   | { type: 'notice'; turnId: string; message: string; category?: 'cache' }
   | { type: 'end'; turnId: string; sessionId: string; status: RunRecord['status'] }
   | { type: 'quota'; cwd: string; quotas: TargetQuota[] }
-  | { type: 'quota-notice'; notice: QuotaNotice }
-  | { type: 'open-quota' }
   | { type: 'workspace'; info: WorkspaceInfo };
+
+export type Push = (WorkspacePush & { cwd: string })
+  | { type: 'quota-notice'; notice: QuotaNotice }
+  | { type: 'open-quota' };
 
 export interface UnifyApi {
   platform(): Promise<NodeJS.Platform>;
   setTheme(theme: 'light' | 'dark'): Promise<void>;
   workspace(): Promise<OpenedWorkspace | null>;
-  openWorkspace(dir?: string): Promise<OpenedWorkspace | null>;
+  addWorkspace(): Promise<string | null>;
+  openWorkspace(dir: string, sessionId?: string): Promise<OpenedWorkspace & { records: RunRecord[] }>;
   saveComposerSelection(cwd: string, selection: ComposerSelection): Promise<void>;
   recentWorkspaces(): Promise<string[]>;
   chooseGitBranch(cwd: string, x: number, y: number): Promise<void>;
-  sessions(): Promise<SessionSummary[]>;
-  session(id: string): Promise<RunRecord[]>;
+  sessions(cwd: string): Promise<SessionSummary[]>;
   updateSession(cwd: string, id: string, changes: SessionChanges): Promise<void>;
   deleteSession(cwd: string, id: string): Promise<void>;
-  ask(req: AskRequest): Promise<{ turnId: string; sessionId: string }>;
-  retry(turnId: string, targetIds?: string[]): Promise<{ turnId: string; sessionId: string }>;
-  cancel(turnId: string): Promise<void>;
-  closeCollaboration(turnId: string): Promise<void>;
-  cancelTarget(turnId: string, targetId: string): Promise<boolean>;
-  respondInteraction(turnId: string, interactionId: string, response: InteractionResponse): Promise<boolean>;
-  previewExec(turnId: string, from?: string, executor?: string): Promise<ExecPreview>;
-  exec(turnId: string, from: string | undefined, executor: string): Promise<{ turnId: string; sessionId: string }>;
-  quota(force?: boolean): Promise<TargetQuota[]>;
+  ask(cwd: string, req: AskRequest): Promise<{ turnId: string; sessionId: string }>;
+  retry(cwd: string, turnId: string, targetIds?: string[]): Promise<{ turnId: string; sessionId: string }>;
+  cancel(cwd: string, turnId: string): Promise<void>;
+  closeCollaboration(cwd: string, turnId: string): Promise<void>;
+  cancelTarget(cwd: string, turnId: string, targetId: string): Promise<boolean>;
+  respondInteraction(cwd: string, turnId: string, interactionId: string, response: InteractionResponse): Promise<boolean>;
+  previewExec(cwd: string, turnId: string, from?: string, executor?: string): Promise<ExecPreview>;
+  exec(cwd: string, turnId: string, from: string | undefined, executor: string): Promise<{ turnId: string; sessionId: string }>;
+  quota(cwd: string, force?: boolean): Promise<TargetQuota[]>;
   cacheReport(): Promise<CacheReport>;
-  settings(): Promise<SettingsInfo>;
+  settings(cwd: string): Promise<SettingsInfo>;
   agyModels(cwd: string): Promise<AgyModel[]>;
-  testTarget(id: string): Promise<void>;
-  setSetting(key: keyof Config, value: unknown, entry?: string): Promise<WorkspaceInfo>;
+  testTarget(cwd: string, id: string): Promise<void>;
+  setSetting(cwd: string, key: keyof Config, value: unknown, entry?: string): Promise<WorkspaceInfo>;
   saveCollaboration(cwd: string, id: string, graph: NonNullable<Config['collaborationGraphs']>[string] | undefined): Promise<void>;
-  saveApi(id: string, model: string, apiKey?: string): Promise<WorkspaceInfo>;
-  memoryUrl(): Promise<string>;
+  saveApi(cwd: string, id: string, model: string, apiKey?: string): Promise<WorkspaceInfo>;
+  memoryUrl(cwd: string): Promise<string>;
   stageMaterial(cwd: string, name: string, mime: string, data: ArrayBuffer): Promise<StagedMaterial>;
   discardMaterial(cwd: string, id: string): Promise<void>;
   revealMaterial(cwd: string, turn: string, index: number): Promise<void>;
@@ -194,11 +196,11 @@ export interface UnifyApi {
   benchRead(cwd: string, id: string, published: boolean): Promise<BenchCase>;
   benchPublish(cwd: string, data: BenchCase, judge?: string, options?: Publication): Promise<string>;
   benchRun(cwd: string, ids: string[], targets: string[], judge?: string, collectionId?: string): Promise<BenchResult[]>;
-  prepareDistill(source: DistillSourceRef): Promise<DistillPreparation>;
-  distillCandidates(source: DistillSourceRef, targetId?: string): Promise<DistillCandidate[]>;
-  checkDistillDuplicate(targetPath: string, text: string): Promise<DuplicateCheckResult>;
-  applyDistill(req: DistillSaveRequest): Promise<DistillApplyResult>;
-  reveal(what: 'project' | 'run' | 'user-config' | 'project-config', id?: string): Promise<void>;
+  prepareDistill(cwd: string, source: DistillSourceRef): Promise<DistillPreparation>;
+  distillCandidates(cwd: string, source: DistillSourceRef, targetId?: string): Promise<DistillCandidate[]>;
+  checkDistillDuplicate(cwd: string, targetPath: string, text: string): Promise<DuplicateCheckResult>;
+  applyDistill(cwd: string, req: DistillSaveRequest): Promise<DistillApplyResult>;
+  reveal(cwd: string, what: 'project' | 'run' | 'user-config' | 'project-config', id?: string): Promise<void>;
   copy(text: string): Promise<void>;
 }
 

@@ -97,7 +97,7 @@ export function MemoryPage({ cwd, notify }: { cwd: string; notify: Notify }) {
   const [url, setUrl] = useState<string>();
   useEffect(() => {
     setUrl(undefined);
-    unify.memoryUrl().then(setUrl, (err) => notify(errText(err), 'err'));
+    unify.memoryUrl(cwd).then(setUrl, (err) => notify(errText(err), 'err'));
   }, [cwd, notify]);
   if (!url) return <div className="page page-enter"><div className="pending"><Spinner />正在扫描记忆…</div></div>;
   return <iframe className="memory-frame page-enter" src={url} title="记忆管理" />;
@@ -132,7 +132,7 @@ function NumberField({ value, fallback, onSave }: { value?: number; fallback: nu
   return <input className="num" inputMode="numeric" value={draft} placeholder={String(fallback)} onChange={(e) => setDraft(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }} />;
 }
 
-function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceInfo): void; notify: Notify }) {
+function ApiRow({ cwd, api, onSaved, notify }: { cwd: string; api: ApiInfo; onSaved(ws: WorkspaceInfo): void; notify: Notify }) {
   const [open, setOpen] = useState(false);
   const formId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
@@ -155,7 +155,7 @@ function ApiRow({ api, onSaved, notify }: { api: ApiInfo; onSaved(ws: WorkspaceI
             const form = e.currentTarget;
             setBusy(true);
             try {
-              onSaved(await unify.saveApi(api.id, model, key.trim() || undefined));
+              onSaved(await unify.saveApi(cwd, api.id, model, key.trim() || undefined));
               setKey('');
               if (form.contains(document.activeElement)) trigger.current?.focus();
               setOpen(false);
@@ -198,12 +198,12 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
     );
     return () => { active = false; };
   }, [ws.cwd, hasAgy, agyAttempt]);
-  const load = () => unify.settings().then(setInfo, (err) => notify(errText(err), 'err'));
+  const load = () => unify.settings(ws.cwd).then(setInfo, (err) => notify(errText(err), 'err'));
   useEffect(() => { void load(); }, [ws]);
 
   const save = async (key: keyof Config, value: unknown, entry?: string) => {
     try {
-      onChange(await unify.setSetting(key, value, entry));
+      onChange(await unify.setSetting(ws.cwd, key, value, entry));
       notify('已保存', 'ok');
     } catch (err) { notify(errText(err), 'err'); }
   };
@@ -228,7 +228,7 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
         <CollaborationGraph key={ws.cwd} ws={ws} initial={initialGraph} notify={notify} connect={() => setTab('general')} />
       ) : <div className="page-enter">
       <Section title="官方 API">
-        {info.apis.map((api) => <ApiRow key={api.id} api={api} notify={notify} onSaved={(next) => { onChange(next); void load(); }} />)}
+        {info.apis.map((api) => <ApiRow cwd={ws.cwd} key={api.id} api={api} notify={notify} onSaved={(next) => { onChange(next); void load(); }} />)}
       </Section>
 
       <Section title="模型与思考强度">
@@ -253,7 +253,7 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
                 {agy && agyError && t.installed !== false && <button className="btn" title={agyError} onClick={() => setAgyAttempt(n => n + 1)}>重试模型列表</button>}
                 <button className="btn" disabled={t.test?.status === 'testing' || !!ws.configError}
                   aria-label={`测试 ${t.label}（${t.id}）可用性`}
-                  onClick={() => void unify.testTarget(t.id).catch(err => notify(errText(err), 'err'))}>
+                  onClick={() => void unify.testTarget(ws.cwd, t.id).catch(err => notify(errText(err), 'err'))}>
                   {t.test?.status === 'testing' ? <><Spinner />测试中…</> : '测试可用性'}
                 </button>
               </Row>
@@ -306,8 +306,8 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
 
       <Section title="高级">
         <Row label="配置文件">
-          <button className="btn" onClick={() => void unify.reveal('project-config')}>项目配置</button>
-          <button className="btn" onClick={() => void unify.reveal('user-config')}>用户配置</button>
+          <button className="btn" onClick={() => void unify.reveal(ws.cwd, 'project-config')}>项目配置</button>
+          <button className="btn" onClick={() => void unify.reveal(ws.cwd, 'user-config')}>用户配置</button>
         </Row>
         <Row label="全局禁用 Claude Code"><Switch label="全局禁用 Claude Code" checked={cfg.disableClaude ?? false} onChange={(v) => void save('disableClaude', v)} /></Row>
       </Section>

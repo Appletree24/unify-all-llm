@@ -5,7 +5,7 @@ import { Spinner } from './ui.js';
 
 const stages: Record<string, string> = {
   answer: '回答', decision: '路由', 'dispute-assessment': '分歧判断', 'source-check': '原文核查', synthesis: '汇总',
-  'plan-review': '方案复核', exec: '执行', 'result-review': '执行复核', benchmark: '评测', distill: '记忆提炼', 'model-check': '模型检查',
+  'plan-review': '方案复核', exec: '执行', 'result-review': '执行复核', report: '结果汇报', benchmark: '评测', distill: '记忆提炼', 'model-check': '模型检查',
 };
 
 export function CachePage() {

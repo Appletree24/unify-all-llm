@@ -9,7 +9,7 @@ import './CollaborationGraph.css';
 
 type EditableStep = Exclude<GraphStep, 'confirm'>;
 type Selection = { step: EditableStep; index: number };
-const symbols = { plan: 'chat', merge: 'layers', check: 'check', execution: 'run', audit: 'search' };
+const symbols = { plan: 'chat', merge: 'layers', check: 'check', execution: 'run', audit: 'search', report: 'chat' };
 
 export function CollaborationGraph({ ws, initial, connect, notify }: {
   ws: WorkspaceInfo; initial?: string; connect(): void; notify(message: string, kind?: 'ok' | 'err'): void;
@@ -27,6 +27,7 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
   const graph = ws.collaborationGraphs[id];
   const visibleEditing = menuPresence.rendered;
   const role = visibleEditing && ((editing && graph && (editing.step === 'plan' ? graph.plans[editing.index] : graph[editing.step])) ?? visibleEditing.role);
+  const selectedTarget = visibleEditing?.step === 'report' ? graph?.report?.target : role?.target;
   const targetLabel = (target: string) => ws.targets.find(t => t.id === target)?.label ?? target;
   const issue = graph && graphIssue(graph, ws.targets);
   function dismiss() {
@@ -104,7 +105,7 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
       : { ...graph,[editing.step]:value });
   }
   function removable(step: EditableStep) {
-    return step === 'audit' || step === 'check' || (step === 'plan' && graph.plans.length > 1);
+    return step === 'audit' || step === 'check' || step === 'report' || (step === 'plan' && graph.plans.length > 1);
   }
   function remove(selection: Selection) {
     const { step,index } = selection;
@@ -190,7 +191,12 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
           {step === 'confirm' ? <span className="cg-gate" data-node="confirm" data-port="confirm" tabIndex={0}><Icon name="check" size={14}/>本人确认</span>
             : step === 'plan' ? graph.plans.map((p,i) => node('plan',p,i)) : node(step,graph[step]!,0)}
         </div>)}
-        <div className="cg-level end"><span className="cg-terminal" data-node="end" data-port="end" tabIndex={0}>交付</span></div>
+        <div className="cg-level end">
+          {graph.report ? <span className="cg-terminal" data-node="end" data-port="end" tabIndex={0}>交付</span>
+            : <button type="button" className="cg-terminal" data-node="end" data-port="end" disabled={saving}
+                aria-haspopup="dialog" aria-expanded={editing?.step === 'report'} aria-label="交付，选择结果汇报模型" title="选择结果汇报模型"
+                onClick={e => edit('report', 0, e.currentTarget, { target: graph.plans[0].target })}>交付 ＋</button>}
+        </div>
       </CombinationCanvas>
       {issue && <p className="cg-warning"><Icon name="alert" size={14}/>{issue}<button className="link" onClick={connect}>去接入模型</button></p>}
       {saving && <p className="cg-note" role="status">正在保存…</p>}
@@ -201,10 +207,10 @@ export function CollaborationGraph({ ws, initial, connect, notify }: {
           <input aria-label="角色名称" maxLength={40} value={roleLabel} onChange={e => setRoleLabel(e.target.value)}/><button className="ghost" title="保存角色名"><Icon name="check" size={14}/></button>
         </form>
         {ws.targets.filter(t => visibleEditing.step !== 'execution' || t.exec).map(t => <button key={t.id} className="cg-choice"
-          aria-pressed={t.id === role.target} disabled={t.installed === false || (visibleEditing.step === 'plan' && graph.plans.some((p,i) => i !== visibleEditing.index && p.target === t.id))}
-          onClick={() => updateRole({ ...role,target:t.id })}><span>{t.label}<small>{t.id}</small></span>{t.installed === false ? '未接入' : t.id === role.target ? '✓' : ''}</button>)}
+          aria-pressed={t.id === selectedTarget} disabled={t.installed === false || (visibleEditing.step === 'plan' && graph.plans.some((p,i) => i !== visibleEditing.index && p.target === t.id))}
+          onClick={() => updateRole({ ...role,target:t.id })}><span>{t.label}<small>{t.id}</small></span>{t.installed === false ? '未接入' : t.id === selectedTarget ? '✓' : ''}</button>)}
         <button className="link" onClick={connect}>去接入模型</button>
-        {removable(visibleEditing.step) && <button className="link" onClick={() => remove(visibleEditing)}>移除此节点</button>}
+        {removable(visibleEditing.step) && (visibleEditing.step !== 'report' || graph.report) && <button className="link" onClick={() => remove(visibleEditing)}>移除此节点</button>}
       </div>}
     </>}
   </section>;

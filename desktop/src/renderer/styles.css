@@ -97,7 +97,25 @@ kbd { font: 11px var(--sans); color: var(--faint); margin-left: auto; }
 .session-search input { width: 100%; min-width: 0; padding: 5px 0; border: 0; background: transparent; color: var(--ink); font: 13px/1.6 var(--sans); }
 .session-search input:focus-visible { outline: 0; }
 .session-search input::placeholder { color: var(--dim); }
-.sessions { flex: 1; overflow-y: auto; margin: 6px -4px 8px; padding: 0 4px; }
+.workspaces-heading, .workspace-heading { display: flex; align-items: center; justify-content: space-between; }
+.workspaces-heading { margin: 10px 0 2px; padding-left: 9px; font-size: 12px; color: var(--dim); }
+.workspaces-heading button, .workspace-new { display: grid; place-items: center; width: 26px; height: 26px; flex: none; border-radius: 6px; color: var(--dim); }
+.workspaces-heading button:hover, .workspace-new:hover { color: var(--ink); background: var(--active); }
+.sessions { flex: 1; overflow-y: auto; margin: 0 -4px 8px; padding: 0 4px; }
+.workspace-heading { border-radius: 7px; color: var(--dim); }
+.workspace-heading:hover, .workspace-heading:focus-within { background: var(--hover); }
+.workspace-heading.active { color: var(--ink); }
+.workspace-heading.active .workspace-disclosure > .icon:nth-child(2) { color: var(--accent); }
+.workspace-disclosure { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 7px 4px; text-align: left; color: inherit; }
+.workspace-disclosure:disabled { opacity: 1; cursor: default; }
+.workspace-disclosure[aria-expanded="false"] > .icon:first-child { transform: rotate(-90deg); }
+.workspace-name, .workspace-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-name { font-size: 13px; font-weight: 550; }
+.workspace-name small { display: block; direction: rtl; text-align: left; font: 10px var(--mono); color: var(--dim); }
+.workspace-sessions { margin: 0 0 4px 10px; padding-left: 6px; border-left: 1px solid var(--line); }
+.workspace-sessions .label { padding: 5px 8px 2px; }
+.workspace-sessions .side-empty { padding: 5px 8px; }
+.workspace-sessions .side-empty button { color: var(--accent); }
 .side-empty { color: var(--faint); font-size: 12.5px; padding: 14px 10px; }
 .session-row { display: flex; align-items: center; border-radius: 8px; padding-right: 3px; }
 .session-row:hover { background: var(--hover); }

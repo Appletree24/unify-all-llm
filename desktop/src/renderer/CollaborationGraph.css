@@ -63,6 +63,7 @@
 .cg-step-done { color:var(--ok); animation:icon-enter var(--dur-fast) var(--ease-spring); }
 .cg-confirm { border-left:3px solid var(--accent); padding:10px 14px; background:var(--accent-soft); margin-top:10px; }
 .cg-confirm footer { margin-top:7px; }
+.cg-work-record > summary { cursor:pointer; color:var(--dim); font-size:13px; padding:6px 0; }
 .cg-confirm .btn.primary { background:var(--accent); border-color:var(--accent); color:var(--bg); }
 .cg-mode { border:1px solid var(--line); border-radius:999px; background:color-mix(in srgb,var(--sunken) 55%,transparent); padding:4px 10px 4px 9px; color:var(--dim); white-space:nowrap; font-size:12.5px; cursor:pointer; transition:color var(--dur-fast),background-color var(--dur-fast),border-color var(--dur-fast); }
 .cg-mode:hover,.cg-mode:focus-within { color:var(--ink); background:var(--hover); border-color:var(--line-2); }
