@@ -10,6 +10,7 @@ import type { AgyModel } from '../../../src/providers/agy-models.js';
 import type { TargetQuota } from '../../../src/quota/types.js';
 import type { QuotaNotice } from '../../../src/quota/reminders.js';
 import type { CacheReport } from '../../../src/core/cache-monitor.js';
+import type { MobileNetwork, MobileShareInfo } from '../../../src/mobile/types.js';
 export type { CacheReport };
 import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSaveRequest, DistillSourceRef, DuplicateCheckResult } from '../../../src/memory/distill.js';
 
@@ -64,6 +65,16 @@ export interface ComposerSelection {
   graph?: string;
 }
 
+export function resolveComposerSelection(workspace: WorkspaceInfo | null | undefined, selection?: ComposerSelection) {
+  const available = new Set(workspace?.targets.filter(target => target.installed !== false).map(target => target.id));
+  const selected = (selection?.selected ?? workspace?.defaults ?? []).filter(id => available.has(id));
+  const synth = selection?.synth ?? '';
+  return {
+    selected, synth: synth === 'off' || available.has(synth) ? synth : '',
+    graph: selection?.graph && workspace && Object.hasOwn(workspace.collaborationGraphs, selection.graph) ? selection.graph : undefined,
+  };
+}
+
 export interface OpenedWorkspace {
   info: WorkspaceInfo;
   selection?: ComposerSelection;
@@ -99,6 +110,8 @@ export interface AskRequest {
   synthesizer?: string;
   /** Continue this session's latest comparison; omit to start a new one. */
   sessionId?: string;
+  /** Latest visible turn when submitting from a shared conversation. */
+  expectedTurnId?: string;
   /** The turn whose decision form the user is answering. */
   replyTo?: string;
   /** Optional targetId (or 'synthesis') from the previous turn to carry into follow-up history. */
@@ -150,6 +163,7 @@ export type WorkspacePush =
   | { type: 'workspace'; info: WorkspaceInfo };
 
 export type Push = (WorkspacePush & { cwd: string })
+  | { type: 'mobile-sharing'; share: MobileShareInfo | null }
   | { type: 'quota-notice'; notice: QuotaNotice }
   | { type: 'open-quota' };
 
@@ -163,6 +177,9 @@ export interface UnifyApi {
   recentWorkspaces(): Promise<string[]>;
   chooseGitBranch(cwd: string, x: number, y: number): Promise<void>;
   sessions(cwd: string): Promise<SessionSummary[]>;
+  mobileSharing(): Promise<{ networks: MobileNetwork[]; share: MobileShareInfo | null }>;
+  shareSession(cwd: string, id: string, address: string): Promise<MobileShareInfo>;
+  stopSharing(cwd: string, id: string): Promise<void>;
   updateSession(cwd: string, id: string, changes: SessionChanges): Promise<void>;
   deleteSession(cwd: string, id: string): Promise<void>;
   ask(cwd: string, req: AskRequest): Promise<{ turnId: string; sessionId: string }>;

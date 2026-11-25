@@ -14,6 +14,8 @@ import { collectQuotaReminders, type QuotaReminderHistory } from '../../../src/q
 import type { ComposerSelection, Method, OpenedWorkspace, Push, QuotaNotice, Reply, TargetQuota, UnifyApi } from '../shared/api.js';
 import { prepareProviderPath } from './env.js';
 import { Workspace } from './workspace.js';
+import { MobileShare, mobileNetworks } from '../../../src/mobile/share.js';
+import { resolveComposerSelection } from '../shared/api.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const statePath = () => join(app.getPath('userData'), 'state.json');
@@ -66,6 +68,7 @@ const isDir = (p: string) => { try { return statSync(p).isDirectory(); } catch {
 let state: State;
 let win: BrowserWindow | undefined;
 let workspace: Workspace | undefined;
+let mobileShare: MobileShare | undefined;
 const workspaces = new Map<string, Workspace>();
 let quitting = false;
 let pendingQuotaNotice: QuotaNotice | undefined;
@@ -74,6 +77,7 @@ let activeQuotaNotification: Notification | undefined;
 let activeInteractionNotification: Notification | undefined;
 
 const push = (p: Push) => {
+  if (p.type === 'run' && mobileShare?.ws.cwd === p.cwd) mobileShare.update(p.record);
   if (win && !win.isDestroyed()) win.webContents.send('unify:push', p);
   if (p.type === 'interaction' && !win?.isFocused() && Notification.isSupported()) {
     try {
@@ -96,6 +100,12 @@ const push = (p: Push) => {
     } catch { /* The prompt is still visible inside the app window. */ }
   }
 };
+
+function stopMobileShare() {
+  mobileShare?.close();
+  mobileShare = undefined;
+  push({ type: 'mobile-sharing', share: null });
+}
 
 function openQuotaPage(): void {
   pendingQuotaNotice = undefined;
@@ -227,8 +237,46 @@ const api: UnifyApi = {
     if (selected && workspace === ws) await ws.switchBranch(selected);
   },
   async sessions(cwd) { return knownWorkspace(cwd).sessions(); },
-  async updateSession(cwd, id, changes) { knownWorkspace(cwd).updateSession(id, changes); },
-  async deleteSession(cwd, id) { await knownWorkspace(cwd).deleteSession(id, (path) => shell.trashItem(path)); },
+  async mobileSharing() { return { networks: mobileNetworks(), share: mobileShare?.ready ? mobileShare.info() : null }; },
+  async shareSession(cwd, id, address) {
+    if (mobileShare) throw new Error('请先停止正在进行的共享');
+    const ws = currentWorkspace(cwd);
+    const share = new MobileShare({
+      cwd, session: sessionId => ws.session(sessionId), liveTurn: turnId => ws.liveTurn(turnId),
+      async ask(question, parent, signal) {
+        const prefs = state.composerSelections[cwd];
+        const { selected, synth, graph } = resolveComposerSelection(ws.info(), prefs);
+        const result = await ws.ask({
+          question, sessionId: id, expectedTurnId: parent, selected, graph, manual: prefs?.selected !== undefined,
+          synthesize: synth !== 'off', synthesizer: synth && synth !== 'off' ? synth : undefined,
+        }, signal);
+        return result.turnId;
+      },
+    }, id, join(here, 'mobile'));
+    mobileShare = share;
+    try {
+      const info = await share.listen(address);
+      push({ type: 'mobile-sharing', share: info });
+      return info;
+    } catch (err) {
+      if (mobileShare === share) stopMobileShare();
+      throw err;
+    }
+  },
+  async stopSharing(cwd, id) {
+    if (mobileShare?.id === id && mobileShare.ws.cwd === cwd) stopMobileShare();
+  },
+  async updateSession(cwd, id, changes) {
+    knownWorkspace(cwd).updateSession(id, changes);
+    if (changes.title && mobileShare?.id === id && mobileShare.ws.cwd === cwd) {
+      mobileShare.rename(changes.title.replace(/\s+/g, ' ').trim());
+      if (mobileShare.ready) push({ type: 'mobile-sharing', share: mobileShare.info() });
+    }
+  },
+  async deleteSession(cwd, id) {
+    await knownWorkspace(cwd).deleteSession(id, (path) => shell.trashItem(path));
+    if (mobileShare?.id === id && mobileShare.ws.cwd === cwd) stopMobileShare();
+  },
   async ask(cwd, req) { return currentWorkspace(cwd).ask(req); },
   async retry(cwd, turnId, targetIds) { return currentWorkspace(cwd).retry(turnId, targetIds); },
   async cancel(cwd, turnId) { currentWorkspace(cwd).cancel(turnId); },
@@ -382,6 +430,7 @@ if (!app.requestSingleInstanceLock()) {
     if (quitting || !workspaces.size) return;
     event.preventDefault();
     quitting = true;
+    stopMobileShare();
     const done = Promise.all(Array.from(workspaces.values(), ws => ws.dispose()));
     const limit = new Promise((r) => setTimeout(r, 8000));
     void Promise.race([done, limit]).finally(() => app.quit());

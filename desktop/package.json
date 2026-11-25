@@ -25,6 +25,7 @@
     "electron-builder": "^25.1.0",
     "esbuild": "0.28.2",
     "highlight.js": "11.12.0",
+    "qrcode": "1.5.4",
     "react": "19.2.9",
     "react-dom": "19.2.9"
   },

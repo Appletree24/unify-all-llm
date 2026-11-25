@@ -71,6 +71,16 @@ kbd { font: 11px var(--sans); color: var(--faint); margin-left: auto; }
 .tb-btn { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 7px; color: var(--dim); }
 .tb-btn:hover { background: var(--hover); color: var(--ink); }
 .theme-toggle { margin-left: auto; flex: none; }
+.share-button { margin-left: auto; flex: none; }
+.share-button.sharing { color: var(--accent); }
+.share-button ~ .theme-toggle { margin-left: 0; }
+.share-dialog { -webkit-app-region: no-drag; text-align: left; white-space: normal; }
+.share-dialog header { display: flex; align-items: center; justify-content: space-between; }
+.share-dialog header h2 { margin: 0; }
+.share-dialog canvas { display: block; width: min(224px, 100%); height: auto; margin: 12px auto; }
+.share-dialog .share-title, .share-dialog small { display: block; text-align: center; overflow-wrap: anywhere; }
+.share-dialog small { color: var(--dim); }
+.share-network { display: grid; gap: 4px; margin: 14px 0; }
 .brand { display: flex; align-items: center; gap: 6px; font-weight: 600; color: var(--ink); padding: 0 4px; }
 .brand .icon { color: var(--accent); }
 .sep { color: var(--line-2); }

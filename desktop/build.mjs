@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
+import { mobileBundle } from '../mobile/build.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const out = join(root, 'dist');
@@ -24,6 +25,7 @@ if (process.platform === 'darwin' && spawnSync('xcrun', ['--find', 'swiftc']).st
 
 const common = { bundle: true, sourcemap: production ? false : 'linked', minify: production, logLevel: 'info', legalComments: 'none' };
 const configs = [
+  { ...common, ...mobileBundle(join(out, 'mobile')) },
   {
     ...common, entryPoints: [join(root, 'src/main/index.ts')], outfile: join(out, 'main.mjs'),
     platform: 'node', format: 'esm', target: 'node22', external: ['electron'],

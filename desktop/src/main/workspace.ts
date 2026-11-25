@@ -191,6 +191,10 @@ export class Workspace {
     return this.runs().filter((r) => r.sessionId === id);
   }
 
+  liveTurn(turnId: string): WorkflowHandle | undefined {
+    return this.handles.get(turnId);
+  }
+
   updateSession(id: string, changes: SessionChanges): void {
     if (this.deletions.has(id)) throw new Error('正在删除这段对话');
     const [first] = this.session(id);
@@ -291,6 +295,7 @@ export class Workspace {
           callId: e.callId,
           interactionId: e.interactionId,
         });
+        flush();
       } else {
         if (e.type === 'notice') this.push(e);
         flush();
@@ -314,17 +319,20 @@ export class Workspace {
     }
   }
 
-  async ask(req: AskRequest): Promise<{ turnId: string; sessionId: string }> {
+  async ask(req: AskRequest, signal?: AbortSignal): Promise<{ turnId: string; sessionId: string }> {
     if (this.configError) throw new Error(`配置有误：${this.configError}`);
     await this.detecting;
+    signal?.throwIfAborted();
     if (this.disposed) throw new Error('项目已关闭');
     let previous: RunRecord | undefined;
     if (req.sessionId) {
       this.assertSessionIdle(req.sessionId);
       const runs = this.session(req.sessionId);
       if (!runs.length) throw new Error('找不到可以继续的对话');
+      if (runs.some(r => ACTIVE.has(r.status))) throw new Error(SESSION_BUSY);
+      if (req.expectedTurnId && runs.at(-1)?.id !== req.expectedTurnId) throw new Error('对话已有新一轮，请查看后再次发送');
       if (req.replyTo && runs.at(-1)?.id !== req.replyTo) throw new Error('对话已有新一轮，请在最新轮次提交选择');
-      previous = req.reviseTurn ? runs.at(-1) : runs.findLast((r) => r.kind === 'comparison');
+      previous = req.reviseTurn ? runs.at(-1) : runs.findLast((r) => r.kind === 'comparison') ?? runs.at(-1);
     }
     const config = req.synthesizer ? parseConfig({ ...this.cfg, synthesizer: req.synthesizer }) : this.cfg;
     const workspace = this.info();

@@ -2,8 +2,10 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import { isReviewOrReport } from '../../../src/core/collaboration.js';
 import type { ComposerSelection, DistillPreparation, DistillSourceRef, ExecPreview, OpenedWorkspace, Push, QuotaNotice, RunRecord, SessionChanges, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { onPush, unify } from './api.js';
+import { resolveComposerSelection } from '../shared/api.js';
 import { MemoryPage, QuotaPage, SettingsPage, Welcome } from './Pages.js';
 import { CachePage } from './CachePage.js';
+import { MobileSharing } from './MobileSharing.js';
 import { BenchmarkPage } from './Benchmark.js';
 import { WorkspaceSessions, type SessionIndex } from './Sessions.js';
 import { Card, Composer, DistillDialog, ExecDialog, Turn, type ComposerState, type FollowUpChoice, type TurnActions } from './Thread.js';
@@ -215,12 +217,7 @@ export function App() {
 
   useEffect(() => { if (cwd) refreshQuota(); }, [cwd, refreshQuota]);
 
-  const composer = useMemo<ComposerState>(() => {
-    const available = new Set(ws?.targets.filter((target) => target.installed !== false).map((target) => target.id));
-    const selected = (composerSelection?.selected ?? ws?.defaults ?? []).filter((id) => available.has(id));
-    const synth = composerSelection?.synth ?? '';
-    return { selected, synth: synth === 'off' || available.has(synth) ? synth : '', graph: composerSelection?.graph && ws?.collaborationGraphs[composerSelection.graph] ? composerSelection.graph : undefined };
-  }, [ws, composerSelection]);
+  const composer = useMemo<ComposerState>(() => resolveComposerSelection(ws, composerSelection), [ws, composerSelection]);
 
   const changeComposerSelection = (selection: ComposerSelection) => {
     if (!cwd) return;
@@ -333,6 +330,7 @@ export function App() {
         question, selected: composer.selected, manual: composerSelection?.selected !== undefined, graph: composer.graph, reviseTurn,
         synthesize: composer.synth !== 'off', synthesizer: composer.synth && composer.synth !== 'off' ? composer.synth : undefined,
         sessionId: current ?? undefined,
+        expectedTurnId: turns.at(-1)?.id,
         replyTo: source?.id, materials, materialWorkspace: cwd,
         continueFrom: reviseTurn && !source ? undefined : activeFollowUp?.targetId,
         memoryUpdates: current && pendingMemoryUpdates.length ? pendingMemoryUpdates : undefined,
@@ -482,6 +480,7 @@ export function App() {
             )}
           </>
         )}
+        {ws && <MobileSharing cwd={ws.cwd} sessionId={view === 'chat' ? current : null} onError={msg => notify(msg, 'err')} />}
         <button type="button" className="tb-btn theme-toggle" title={themeAction} aria-label={themeAction}
           onClick={() => void unify.setTheme(isDark ? 'light' : 'dark').catch(err => notify(errText(err), 'err'))}>
           <Icon key={isDark ? 'sun' : 'moon'} name={isDark ? 'sun' : 'moon'} />
