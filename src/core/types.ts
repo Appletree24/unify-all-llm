@@ -78,6 +78,8 @@ export interface Capabilities {
   exec: boolean;
 }
 
+export const SESSION_TITLE_LIMIT = 120;
+
 export interface InteractionOption {
   id: string;
   label: string;

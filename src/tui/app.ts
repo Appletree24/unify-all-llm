@@ -2,8 +2,16 @@ import { capture } from '../bench/cases.js';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { currentGitBranch, listGitBranches, switchGitBranch, type GitBranches } from '../core/git-branches.js';
-import { loadConfig, type Config, type RunRecord } from '../core/store.js';
+import { loadConfig, saveRun, type Config, type RunRecord } from '../core/store.js';
+import { graphIssue, graphPlanResult, roleNames } from '../core/collaboration.js';
+import { readSessionRuns, runningStatus, summarizeSessions } from '../core/sessions.js';
+import { synthesisFormatter } from '../core/synth.js';
+import { InteractionView } from './interaction.js';
+import { Picker } from './picker.js';
+import { MobileShare, mobileNetworks } from '../mobile/share.js';
+import { ShareView } from './share-view.js';
 import type { ModelTarget, ProviderEvent } from '../core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
 import { defaultContext } from '../memory/scan.js';
@@ -87,6 +95,12 @@ export class App {
   private lastRun?: RunRecord;
   private lastExecution?: RunRecord;
   private active?: WorkflowHandle;
+  private graphId?: string;
+  private picker?: Picker;
+  private share?: MobileShare;
+  private shareView?: ShareView;
+  private interactions: InteractionView[] = [];
+  private prompt?: InteractionView;
   private detecting = new AbortController();
 
   private ed = new Editor();
@@ -184,6 +198,7 @@ export class App {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.stopSharing();
     this.quota?.dispose();
     if (this.ticker) clearInterval(this.ticker);
     this.ctl?.abort();
@@ -267,7 +282,18 @@ export class App {
   }
 
   // ── flows ────────────────────────────────────────────────────────────────
+  private handleInteraction(ev: WorkflowEvent): boolean {
+    if (ev.type === 'interaction') {
+      this.interactions.push(new InteractionView(ev.turnId, ev.targetLabel, ev.request));
+    } else if (ev.type === 'interaction-resolved') {
+      this.interactions = this.interactions.filter(item => item.turnId !== ev.turnId || item.request.id !== ev.interactionId);
+    } else return false;
+    this.requestRender();
+    return true;
+  }
+
   private workflowEvent(ev: WorkflowEvent): void {
+    if (this.handleInteraction(ev)) return;
     if (ev.type === 'stage' && ev.stage === 'answering') {
       this.panes = ev.targets.map((t) => this.newPane(t.id, 'answer', t.label, this.colorOf(t.id)));
     } else if (ev.type === 'call' && (ev.scope === 'synthesis' || ev.scope === 'plan-review')) {
@@ -279,39 +305,64 @@ export class App {
     this.requestRender();
   }
 
-  private async ask(question: string, retryIds?: string[]): Promise<void> {
+  private ask(question: string, retryIds?: string[], revise?: RunRecord): string | void {
     if (this.switchingBranch) return this.say('正在切换 Git 分支，请稍候', YELLOW);
-    if (!this.selected.length) return this.say('没有可用的模型，输入 /settings 接入官方 API，或检查 CLI 登录状态', RED);
-    const previous = this.lastRun;
-    const continueFrom = retryIds ? undefined : this.continueFrom;
-    this.continueFrom = undefined;
+    const previous = revise ?? this.lastRun;
+    const graph = retryIds || revise ? previous?.collaboration : this.selectedGraph;
+    if (graph) {
+      const issue = graphIssue(graph, this.all.map(t => ({ id: t.id, installed: this.installed.get(t.id), exec: t.adapter.capabilities.exec })));
+      if (issue) return this.say(issue, YELLOW);
+    } else if (!this.selected.length && !retryIds) {
+      return this.say('没有可用的模型，输入 /settings 接入官方 API，或检查 CLI 登录状态', RED);
+    }
+    try {
+      const ctl = new AbortController();
+      const display = displaySynthesisEvents(ev => this.workflowEvent(ev));
+      this.active = startComparison({
+        cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
+        previous, continueFrom: retryIds || revise ? undefined : this.continueFrom,
+        collaboration: graph, collaborationTargets: revise?.collaborationTargets,
+        manualSelection: this.manualModels, signal: ctl.signal, interactive: true,
+        retry: retryIds && previous ? { record: previous, targetIds: retryIds } : undefined,
+        onEvent: (ev, record) => { this.share?.update(record); display(ev, record); },
+      });
+      this.ctl = ctl;
+    } catch (err) { return this.say(err instanceof Error ? err.message : String(err), RED); }
     this.begin();
-    this.ctl = new AbortController();
+    this.continueFrom = undefined;
     this.question = question;
     this.turn++;
     this.panes = [];
-    this.synth = undefined;
-    this.exec = undefined;
-    this.lastRun = undefined;
+    this.synth = this.exec = undefined;
+    this.lastRun = this.active.record;
     this.lastExecution = undefined;
     this.zoomId = undefined;
     this.focus = 'input';
     this.activeAnswer = 0;
     this.render();
+    this.share?.update(this.active.record);
+    void this.observeQuestion(this.active);
+    return this.active.record.id;
+  }
+
+  private async observeQuestion(handle: WorkflowHandle): Promise<void> {
     try {
-      this.active = startComparison({
-        cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
-        previous, continueFrom, manualSelection: this.manualModels, signal: this.ctl.signal,
-        retry: retryIds && previous ? { record: previous, targetIds: retryIds } : undefined,
-        onEvent: displaySynthesisEvents((ev) => this.workflowEvent(ev)),
-      });
-      this.lastRun = this.active.record;
-      this.addUsage(await this.active.done);
+      const result = await handle.done;
+      this.addUsage(result);
+      if (result.error) this.say(result.error, RED);
+      else if (graphPlanResult(result)) this.say('方案已就绪 · /exec 确认实施 · /revise 修改要求 · /close-plan 终止', GOLD);
     } catch (err) {
       this.say(`出错: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
       this.finish();
     }
+  }
+
+  private requireLatest(run: RunRecord): RunRecord {
+    const latest = readSessionRuns(this.cwd, run.sessionId).at(-1);
+    if (latest?.id !== run.id) throw new Error('这段会话已有更新，请用 /resume 打开最新轮次');
+    if (latest.collaborationClosed) throw new Error('这份方案已终止');
+    return latest;
   }
 
   private startExec(executorId?: string): void {
@@ -323,6 +374,14 @@ export class App {
     const focused = this.panes.find((p) => p.id === this.focus);
     const from = run.collaboration ? undefined : focused?.id.slice(2);
     try {
+      if (run.collaboration) {
+        this.requireLatest(run);
+        for (const stage of ['audit', 'report'] as const) {
+          const role = run.collaboration[stage];
+          if (role && !this.installed.get(role.target)) throw new Error(`${roleNames[stage]}目标 ${role.target} 不可用`);
+        }
+        if (executorId && executorId !== run.collaboration.execution.target) throw new Error('该模版已指定执行模型 ' + run.collaboration.execution.target);
+      }
       const plan = selectPlan(run, from);
       const chosen = chooseExecutor(this.all, executorId ?? run.collaboration?.execution.target ?? this.cfg.executor, this.installed);
       this.confirm = {
@@ -334,6 +393,10 @@ export class App {
   }
 
   private async runExec(executor: ModelTarget, source: RunRecord, from?: string): Promise<void> {
+    if (source.collaboration) {
+      try { this.requireLatest(source); }
+      catch (err) { return this.say(err instanceof Error ? err.message : String(err), YELLOW); }
+    }
     const pane = (this.exec = this.newPane(executor.id, 'exec', `实施 · ${executor.label}`, VIOLET));
     this.focus = 'input';
     this.zoomId = undefined;
@@ -342,15 +405,21 @@ export class App {
     this.render();
     try {
       this.active = startExecution({
-        cwd: this.cwd, config: this.cfg, targets: this.all, executor, source, from, signal: ctl.signal,
-        onEvent: (ev) => {
-          if (ev.type === 'call' && ev.scope === 'result-review') this.exec = this.newPane(ev.target.id, 'exec', `实施复核 · ${ev.target.label}`, GOLD);
-          if (ev.type === 'provider') this.apply(ev.scope === 'result-review' ? this.exec! : pane, ev.event);
+        cwd: this.cwd, config: this.cfg, targets: this.all, executor, source, from, signal: ctl.signal, interactive: true,
+        onEvent: (ev, record) => {
+          this.share?.update(record);
+          if (this.handleInteraction(ev)) return;
+          if (ev.type === 'call' && (ev.scope === 'result-review' || ev.scope === 'report')) {
+            const stage = ev.scope === 'report' ? '结果汇报' : '实施复核';
+            this.exec = this.newPane(ev.target.id, 'exec', `${stage} · ${ev.target.label}`, GOLD);
+          }
+          if (ev.type === 'provider') this.apply(this.exec!, ev.event);
         },
       });
-      this.lastExecution = await this.active.done;
-      this.addUsage(this.lastExecution);
-      if (pane.status === 'ok') this.say('实施完成，请用 git diff 检查改动', GOLD);
+      this.lastExecution = this.active.record;
+      this.share?.update(this.lastExecution);
+      this.addUsage(await this.active.done);
+      if (pane.status === 'ok' && !source.collaboration?.report) this.say('实施完成，请用 git diff 检查改动', GOLD);
     } catch (err) {
       this.say(`实施失败: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
@@ -386,6 +455,7 @@ export class App {
   /** End of a turn: send the next queued message, or hand the queue back after an interrupt. */
   private finish(): void {
     this.busy = false;
+    this.interactions = [];
     this.requestRender();
     if (!this.queue.length || this.disposed) return;
     if (!this.userCancel) return void this.ask(this.queue.shift()!);
@@ -401,7 +471,7 @@ export class App {
   }
 
   private addUsage(run: RunRecord): void {
-    const supporting = run.calls.filter(c => ['plan-review', 'result-review', 'dispute-assessment', 'source-check'].includes(c.scope));
+    const supporting = run.calls.filter(c => ['plan-review', 'result-review', 'report', 'dispute-assessment', 'source-check'].includes(c.scope));
     for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...supporting.map(c => c.result)]) {
       this.tokens.input += r.usage?.inputTokens ?? 0;
       this.tokens.output += r.usage?.outputTokens ?? 0;
@@ -411,16 +481,20 @@ export class App {
   private copy(): void {
     const p = this.findPane(this.focus) ?? this.bottomPane() ?? this.panes[this.activeAnswer];
     if (!p || !p.text.trim()) return this.say('没有可复制的内容', YELLOW);
+    this.copyText(p.text, p.title);
+  }
+
+  private copyText(text: string, title: string): void {
     const [cmd, args, data]: [string, string[], Buffer] =
       process.platform === 'win32'
-        ? ['clip', [], Buffer.from('﻿' + p.text, 'utf16le')]
+        ? ['clip', [], Buffer.from('\uFEFF' + text, 'utf16le')]
         : process.platform === 'darwin'
-          ? ['pbcopy', [], Buffer.from(p.text, 'utf8')]
-          : ['xclip', ['-selection', 'clipboard'], Buffer.from(p.text, 'utf8')];
+          ? ['pbcopy', [], Buffer.from(text, 'utf8')]
+          : ['xclip', ['-selection', 'clipboard'], Buffer.from(text, 'utf8')];
     try {
       const child = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
       child.on('error', () => this.say(`复制失败：找不到 ${cmd}`, RED));
-      child.on('close', (code) => code === 0 && this.say(`已复制「${p.title}」到剪贴板`, GOLD));
+      child.on('close', (code) => code === 0 && this.say(`已复制「${title}」到剪贴板`, GOLD));
       child.stdin.end(data);
     } catch {
       this.say('复制失败', RED);
@@ -429,6 +503,7 @@ export class App {
 
   private newConversation(): void {
     if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
+    this.stopSharing();
     this.panes = [];
     this.synth = this.exec = undefined;
     this.lastRun = undefined;
@@ -449,6 +524,7 @@ export class App {
     this.all = [...this.all.filter(t => t.adapter.id !== api.id), ...updated];
     for (const t of updated) this.installed.set(t.id, true);
     this.selected = [api.id];
+    this.graphId = undefined;
     this.manualModels = true;
     this.quota?.dispose();
     this.quota = undefined;
@@ -489,6 +565,150 @@ export class App {
     }
   }
 
+  private get selectedGraph() {
+    return this.graphId ? this.cfg.collaborationGraphs?.[this.graphId] : undefined;
+  }
+
+  private stopSharing(): void {
+    this.shareView = undefined;
+    this.share?.close();
+    this.share = undefined;
+  }
+
+  private shareCommand(arg: string): void {
+    if (arg === 'off') {
+      this.stopSharing();
+      return this.say('手机共享已关闭');
+    }
+    if (arg) return this.say('输入 /share 开启共享，或 /share off 停止', YELLOW);
+    if (this.share) {
+      if (this.share.ready) this.shareView = new ShareView(this.share.info().url);
+      else this.say('正在开启手机共享…');
+      return;
+    }
+    const id = this.lastRun?.sessionId;
+    if (!id) return this.say('请先提问，或用 /resume 打开要共享的会话', YELLOW);
+    const networks = mobileNetworks();
+    if (!networks.length) return this.say('未找到局域网或私有 VPN IPv4 地址', YELLOW);
+    if (networks.length === 1) return void this.startSharing(id, networks[0].address);
+    this.picker = new Picker('手机共享 · 选择手机能访问的网络地址', networks.map(n => ({
+      id: n.address, label: n.name + ' · ' + n.address, detail: '同一可信 Wi-Fi，或两端已接入的私有 VPN',
+    })), undefined, address => void this.startSharing(id, address), () => { this.picker = undefined; });
+  }
+
+  private async startSharing(id: string, address: string): Promise<void> {
+    let share: MobileShare | undefined;
+    try {
+      share = new MobileShare({
+        cwd: this.cwd,
+        session: sessionId => {
+          const runs = readSessionRuns(this.cwd, sessionId);
+          const live = this.active?.record;
+          return this.busy && live ? runs.map(r => r.id === live.id ? live : r) : runs;
+        },
+        liveTurn: turnId => {
+          if (!this.busy || this.active?.record.id !== turnId) return;
+          return { waitingForInput: this.active.waitingForInput, cancel: () => this.interrupt() };
+        },
+        ask: (question, parent, signal) => {
+          signal.throwIfAborted();
+          if (this.disposed || this.lastRun?.sessionId !== id) throw new Error('终端已切换会话，请重新扫码');
+          if (this.busy) throw new Error('请等待当前轮次结束后发送');
+          if (this.confirm) throw new Error('终端正在等待确认，请处理后再发送');
+          const runs = readSessionRuns(this.cwd, id);
+          if (runs.some(r => runningStatus(r.status))) throw new Error('这段会话有请求正在进行');
+          if ((this.lastExecution ?? this.lastRun).id !== runs.at(-1)?.id) throw new Error('会话已更新，请先在终端用 /resume 恢复最新轮次');
+          if (parent !== runs.at(-1)?.id) throw new Error('对话已有新一轮，请查看后再次发送');
+          this.shareView = undefined;
+          const turnId = this.ask(question);
+          if (!turnId) throw new Error(this.notice);
+          return turnId;
+        },
+      }, id, fileURLToPath(new URL('../mobile/', import.meta.url)));
+      this.share = share;
+      const info = await share.listen(address);
+      if (this.share === share) this.shareView = new ShareView(info.url);
+    } catch (err) {
+      if (share && this.share !== share) return;
+      this.stopSharing();
+      this.say(err instanceof Error ? err.message : String(err), RED);
+    }
+    this.requestRender();
+  }
+
+  private chooseGraph(id?: string): void {
+    const graphs = this.cfg.collaborationGraphs ?? {};
+    if (id === undefined) {
+      const choices = [{ id: '', label: '普通问答', detail: '使用当前回答和汇总模型' },
+        ...Object.entries(graphs).map(([id, g]) => ({
+          id, label: g.name, detail: `${id} · ${g.plans.map(p => p.target).join(' + ')} → 实施 ${g.execution.target}`,
+        }))];
+      this.picker = new Picker('选择协作模版', choices, this.graphId ?? '',
+        picked => this.chooseGraph(picked), () => { this.picker = undefined; });
+    } else {
+      if (id && !Object.hasOwn(graphs, id)) return this.say('找不到模版，输入 /graph 查看列表', YELLOW);
+      this.graphId = id || undefined;
+      this.say(id ? `已选择模版「${graphs[id].name}」，输入任务即可开始` : '已切换为普通问答', GOLD);
+    }
+  }
+
+  private resumeSession(id?: string): void {
+    try {
+      if (this.busy) return this.say('请在当前请求结束后恢复会话', YELLOW);
+      if (!id) {
+        const sessions = summarizeSessions(this.cwd, readSessionRuns(this.cwd));
+        if (!sessions.length) return this.say('当前项目还没有历史会话');
+        const choices = sessions.map(s => ({
+          id: s.id, label: `${s.pinned ? '★ ' : ''}${s.title || '（空问题）'} · ${s.turns} 轮`,
+          detail: `${s.updatedAt.slice(0, 10)} · ${s.id}`,
+        }));
+        this.picker = new Picker('恢复当前项目的会话', choices, this.lastRun?.sessionId,
+          picked => this.resumeSession(picked), () => { this.picker = undefined; });
+        return;
+      }
+      const runs = readSessionRuns(this.cwd, id);
+      if (runs.some(r => runningStatus(r.status))) return this.say('该会话正在运行，请在结束后继续', YELLOW);
+      const comparisons = runs.filter(r => r.kind === 'comparison');
+      const last = comparisons.at(-1);
+      if (!last) return this.say('找不到可继续的会话，输入 /resume 查看列表', YELLOW);
+      const latest = runs[runs.length - 1];
+      const execution = latest.kind === 'execution' && latest.planSource?.turnId === last.id ? latest : undefined;
+      if (this.share && this.share.id !== last.sessionId) this.stopSharing();
+      this.lastRun = last;
+      this.lastExecution = execution;
+      this.question = last.question;
+      this.turn = comparisons.length;
+      this.continueFrom = this.zoomId = this.graphId = undefined;
+      this.focus = 'input';
+      this.activeAnswer = 0;
+      this.panes = last.results.map(result => this.restoredPane(last, result, 'answer', ''));
+      const review = last.calls.find(c => c.scope === 'plan-review');
+      this.synth = review ? this.restoredPane(last, review.result, 'synth', '方案复核')
+        : last.synthesis ? this.restoredPane(last, last.synthesis.result, 'synth', '汇总') : undefined;
+      const stage = execution?.calls.filter(c => c.scope === 'report' || c.scope === 'result-review').at(-1);
+      const result = stage?.result ?? execution?.results[0];
+      this.exec = execution && result ? this.restoredPane(execution, result, 'exec',
+        stage?.scope === 'report' ? roleNames.report : stage ? roleNames.audit : roleNames.execution) : undefined;
+      this.say(`已恢复会话 · 第 ${this.turn} 轮 · 可继续追问`, GOLD);
+    } catch (err) { this.say(err instanceof Error ? err.message : String(err), RED); }
+  }
+
+  private restoredPane(run: RunRecord, result: RunRecord['results'][number], kind: Pane['kind'], stage: string): Pane {
+    const target = run.calls.find(c => c.id === result.runId)?.target ?? run.targets.find(t => t.id === result.targetId);
+    const label = target?.label ?? result.targetId;
+    const pane = this.newPane(result.targetId, kind, stage ? `${stage} · ${label}` : label,
+      kind === 'answer' ? this.colorOf(result.targetId) : kind === 'exec' ? VIOLET : GOLD);
+    const format = result.runId === run.synthesis?.result.runId ? synthesisFormatter(run) : (s: string) => s;
+    pane.text = format(result.text) + formatMemoryReferences(result.memoryReferences);
+    pane.reasoning = format(result.reasoning);
+    pane.status = result.ok ? 'ok' : result.status === 'cancelled' || result.status === 'timed_out' ? result.status : 'err';
+    pane.error = result.error;
+    pane.start = 0;
+    pane.end = result.durationMs ?? 0;
+    pane.follow = false;
+    return pane;
+  }
+
   private changeBranch(branch: string): void {
     if (this.branchOperation) return this.say('Git 分支操作正在进行，请稍候', YELLOW);
     if (branch && this.busy) return this.say('请等待当前请求结束后切换分支', YELLOW);
@@ -523,6 +743,29 @@ export class App {
     if (branch) return this.changeBranch(branch[1] ?? '');
     const [name, ...rest] = line.slice(1).trim().split(/\s+/);
     const arg = rest.join(' ');
+    if (name === 'share') return this.shareCommand(arg);
+    if (['graph', 'resume', 'revise', 'close-plan'].includes(name)) {
+      if (this.busy) return this.say('请在当前请求结束后操作', YELLOW);
+      if (name === 'graph') return this.chooseGraph(arg === 'off' ? '' : arg || undefined);
+      if (name === 'resume') return this.resumeSession(arg || undefined);
+      const source = this.lastExecution ?? this.lastRun;
+      if (!source?.collaboration) return this.say('当前轮次没有协作方案', YELLOW);
+      try {
+        const latest = this.requireLatest(source);
+        if (name === 'revise') {
+          const change = line.slice('/revise'.length).trim();
+          if (!change) return this.say('用法：/revise 修改要求', YELLOW);
+          void this.ask(change, undefined, latest);
+        } else {
+          selectPlan(latest);
+          latest.collaborationClosed = true;
+          saveRun(this.cwd, latest);
+          this.lastRun = latest;
+          this.say('已终止这份待实施方案');
+        }
+      } catch (err) { this.say(err instanceof Error ? err.message : String(err), YELLOW); }
+      return;
+    }
     if (name === 'settings') {
       if (arg) return this.say('请单独输入 /settings', YELLOW);
       if (this.busy) return this.say('请等待本轮结束后修改设置', YELLOW);
@@ -575,6 +818,10 @@ export class App {
       if (this.busy) return this.say('请先等待当前请求结束', YELLOW);
       if (!this.lastRun) return this.say('没有可重试的记录', YELLOW);
       const ids = arg ? arg.split(/[,\s]+/) : this.lastRun.targets.filter((t) => !this.lastRun!.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id);
+      if (this.lastRun.collaboration) {
+        if (arg) return this.say('协作模版会按原分工重试，直接输入 /retry 即可', YELLOW);
+        return void this.ask(this.lastRun.question, this.lastRun.collaboration.plans.map(p => p.target));
+      }
       if (!ids.length) return this.say('没有失败目标；用 /retry 目标 指定重新回答');
       void this.ask(this.lastRun.question, ids);
     }
@@ -598,6 +845,7 @@ export class App {
       const bad = ids.find((id) => !this.installed.get(id));
       if (bad) return this.say(`"${bad}" 不可用（未安装或不存在）`, RED);
       this.selected = ids;
+      this.graphId = undefined;
       this.manualModels = true;
       this.say(`之后的问题将发给: ${ids.join(', ')}`);
     } else if (name === 'mouse') {
@@ -608,7 +856,7 @@ export class App {
       if (!this.installed.get(arg)) return this.say(`"${arg}" 不可用`, RED);
       this.sessionSynth = arg;
       this.cfg = { ...this.cfg, synthesizer: arg };
-      this.say(`汇总模型: ${arg}`);
+      this.say(`普通问答汇总模型：${arg}`);
     } else {
       this.say(`未知命令 /${name}；输入 / 查看命令列表，/help 查看快捷键`, YELLOW);
     }
@@ -616,6 +864,42 @@ export class App {
 
   // ── input ────────────────────────────────────────────────────────────────
   handleKey(k: Key): void {
+    if (k.name === 'ctrl+g' && this.interactions.length) {
+      this.prompt = this.interactions[0];
+      return this.requestRender();
+    }
+    if (this.prompt) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      if (!this.interactions.includes(this.prompt)) {
+        if (k.name === 'esc') this.prompt = undefined;
+      } else if (k.name === 'ctrl+c') {
+        this.prompt = undefined;
+        this.interrupt();
+      } else {
+        const item = this.prompt;
+        const response = item.handleKey(k);
+        if (response && this.active?.record.id === item.turnId) {
+          this.active.respondInteraction(item.request.id, response);
+          this.prompt = this.interactions[0];
+        }
+      }
+      return this.requestRender();
+    }
+    if (this.shareView) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      if (k.name === 'esc' || k.name === 'ctrl+c' || k.name === 'enter') this.shareView = undefined;
+      else if (k.name === 'char' && k.text?.toLowerCase() === 'l') this.shareView.toggleLink();
+      else if (k.name === 'char' && k.text?.toLowerCase() === 'c') {
+        this.copyText(this.shareView.url, '手机连接链接');
+        this.shareView = undefined;
+      }
+      return this.requestRender();
+    }
+    if (this.picker) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      this.picker.handleKey(k);
+      return this.requestRender();
+    }
     const branches = this.branchView;
     if (branches) {
       if (k.name === 'ctrl+d') return this.onQuit();
@@ -917,6 +1201,10 @@ export class App {
   render(): void {
     if (this.disposed) return;
     const s = this.compose();
+    if (!this.prompt && this.interactions.length && (this.branchView || this.quotaDetails || this.mem)) {
+      s.put(0, s.rows - 1, ' '.repeat(s.cols));
+      s.put(1, s.rows - 1, 'Ctrl+G 处理模型交互请求', `1;${YELLOW}`);
+    }
     this.last = s;
     const lines = s.toLines();
     let out = '\x1b[?2026h';
@@ -940,6 +1228,13 @@ export class App {
     const s = new Screen(cols, rows);
     this.cursor = null;
     this.rects = [];
+    if (this.prompt) {
+      if (this.interactions.includes(this.prompt)) this.cursor = this.prompt.draw(s, this.interactions.length);
+      else s.put(1, 1, '这项请求已结束 · Esc 返回');
+      return s;
+    }
+    if (this.shareView) { this.shareView.draw(s); return s; }
+    if (this.picker) { this.picker.draw(s); return s; }
     if (this.branchView) {
       this.drawBranches(s, this.branchView);
       return s;
@@ -982,12 +1277,14 @@ export class App {
 
   private drawHeader(s: Screen): void {
     let x = s.put(1, 0, '✦ unify', `1;${GOLD}`) + 2;
+    const graph = this.selectedGraph;
+    const answering = graph ? graph.plans.map(role => role.target) : this.selected;
     for (const a of this.all) {
       if (this.installed.get(a.id) === false) continue;
       const known = this.installed.has(a.id);
-      const on = this.selected.includes(a.id);
+      const on = answering.includes(a.id);
       // The decider does not answer; it is shown as the diamond that routes the others.
-      const deciding = a.id === this.cfg.decider && !on && this.installed.get(a.id) === true;
+      const deciding = !graph && a.id === this.cfg.decider && !on && this.installed.get(a.id) === true;
       const color = deciding ? GOLD : on ? this.colorOf(a.id) : DIM;
       x = s.put(x, 0, !known ? SPIN[this.frame % 10] : deciding ? '◆' : on ? '●' : '○', color);
       x = s.put(x + 1, 0, deciding ? `${a.label} 决策` : a.label, color) + 2;
@@ -1059,6 +1356,8 @@ export class App {
 
   /** One line above the composer: confirmation, notice, what is running, or key hints. */
   private drawActivity(s: Screen, y: number): void {
+    const first = this.interactions[0];
+    if (first) return void s.put(1, y, truncate(`Ctrl+G 处理 · ${first.model} 等待交互：${first.request.title}`, s.cols - 2), `1;${YELLOW}`);
     if (this.confirm) return void s.put(1, y, truncate(this.confirm.text, s.cols - 2), `1;${YELLOW}`);
     if (this.notice) return void s.put(1, y, truncate(this.notice, s.cols - 2), this.noticeColor);
     if (this.busy) {
@@ -1088,13 +1387,14 @@ export class App {
   private drawFooter(s: Screen): void {
     const y = s.rows - 1;
     const used = this.tokens.input + this.tokens.output;
-    const right = [used ? `↑${kilo(this.tokens.input)} ↓${kilo(this.tokens.output)}` : '', this.turn > 1 ? `第 ${this.turn} 轮` : ''].filter(Boolean).join(' · ');
+    const right = [this.share?.ready ? '手机共享中' : '', used ? `↑${kilo(this.tokens.input)} ↓${kilo(this.tokens.output)}` : '', this.turn > 1 ? `第 ${this.turn} 轮` : ''].filter(Boolean).join(' · ');
     const rx = s.cols - textWidth(right) - 1;
     if (right) s.put(rx, y, right, DIM);
     const home = homedir();
     const branch = this.branch === undefined ? '' : ` (${this.branch ?? '游离 HEAD'})`;
     const where = (this.cwd === home || this.cwd.startsWith(home + '/') ? '~' + this.cwd.slice(home.length) : this.cwd) + branch;
-    const who = this.selected.length ? `${this.selected.join(' + ')}${this.cfg.synthesizer && this.selected.length > 1 ? ` → ${this.cfg.synthesizer}` : ''}` : '';
+    const graph = this.selectedGraph;
+    const who = graph ? `模版 · ${graph.name}` : this.selected.length ? `${this.selected.join(' + ')}${this.cfg.synthesizer && this.selected.length > 1 ? ` → ${this.cfg.synthesizer}` : ''}` : '';
     const room = (right ? rx : s.cols) - 2;
     const left = textWidth(where) + textWidth(who) + 3 <= room ? where : basename(this.cwd) + branch;
     const x = s.put(1, y, truncate(left, room), DIM);
@@ -1172,6 +1472,8 @@ export class App {
   }
 
   private drawWelcome(s: Screen, y: number, h: number): void {
+    const graph = this.selectedGraph;
+    const answering = graph ? graph.plans.map(p => p.target) : this.selected;
     const targets = this.all.filter((a) => this.installed.get(a.id) !== false);
     const n = targets.length;
     const nameW = Math.min(Math.max(1, ...targets.map((a) => textWidth(a.label))), Math.floor(s.cols / 3));
@@ -1185,10 +1487,10 @@ export class App {
     let row = y + Math.max(0, Math.floor((h - blockH) / 2));
     for (const [i, a] of targets.entries()) {
       if (row >= y + h) break;
-      const on = this.selected.includes(a.id);
+      const on = answering.includes(a.id);
       const known = this.installed.has(a.id);
       const color = on ? this.colorOf(a.id) : BORDER;
-      const tag = a.id === this.cfg.decider ? '决策' : '';
+      const tag = !graph && a.id === this.cfg.decider ? '决策' : '';
       s.put(x0, row, !known ? SPIN[this.frame % 10] : on ? '●' : '○', color);
       s.put(x0 + 2, row, truncate(a.label, nameW), on ? `1;${color}` : DIM);
       if (showDiagram) {
@@ -1207,7 +1509,7 @@ export class App {
     const center = (text: string, st: string, at: number) => {
       if (at < y + h) s.put(Math.max(1, Math.floor((s.cols - textWidth(text)) / 2)), at, truncate(text, s.cols - 2), st);
     };
-    center('一个问题 · 多个模型 · 一份最优解', '', row + 1);
+    center(graph ? `协作模版 · ${graph.name}` : '一个问题 · 多个模型 · 一份最优解', '', row + 1);
     center('输入 /settings 接入官方 API', DIM, row + 2);
   }
 

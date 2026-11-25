@@ -3,7 +3,7 @@ import { hostname } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import type { Config } from './config.js';
 import { timeoutMillis } from './config.js';
-import { graphIssue, graphPlanResult, graphStages, type Collaboration } from './collaboration.js';
+import { graphIssue, graphPlanResult, graphStages, isReviewOrReport, roleNames, type Collaboration } from './collaboration.js';
 import { resolveSharedFileContext } from './context.js';
 import { buildDecisionPrompt, parseDecision } from './decider.js';
 import { fanOut, runOne } from './orchestrator.js';
@@ -59,6 +59,7 @@ export interface ComparisonOptions extends CommonOptions {
 }
 export interface WorkflowHandle {
   record: RunRecord;
+  readonly waitingForInput: boolean;
   done: Promise<RunRecord>;
   cancel(): void;
   cancelTarget(id: string): boolean;
@@ -123,6 +124,7 @@ class Journal {
     opts.signal?.addEventListener('abort', this.abort, { once: true });
     if (opts.signal?.aborted) this.abort();
   }
+  get waitingForInput() { return this.pendingInteractions.size > 0; }
   cancelAllInteractions(): void {
     for (const [id, entry] of [...this.pendingInteractions.entries()]) {
       this.pendingInteractions.delete(id);
@@ -350,8 +352,8 @@ class Journal {
     try {
       await work();
       this.assertWritable();
-      const reviews = this.record.calls.filter(c => c.scope === 'plan-review' || c.scope === 'result-review');
-      const results = [...this.record.results, ...(this.record.synthesis ? [this.record.synthesis.result] : []), ...reviews.map(c => c.result)];
+      const stageCalls = this.record.calls.filter(c => isReviewOrReport(c.scope));
+      const results = [...this.record.results, ...(this.record.synthesis ? [this.record.synthesis.result] : []), ...stageCalls.map(c => c.result)];
       this.record.status = this.ctl.signal.aborted ? 'cancelled'
         : results.length && results.every((r) => r.ok) ? 'completed'
         : results.some((r) => r.ok) ? 'partial' : 'failed';
@@ -728,6 +730,7 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
   }));
   return {
     record, done, cancel: () => { journal.cancelAllInteractions(); journal.ctl.abort(); },
+    get waitingForInput() { return journal.waitingForInput; },
     cancelTarget(id) {
       if (record.status !== 'answering') return false;
       const c = controls.get(id);
@@ -782,9 +785,15 @@ export function startExecution(opts: CommonOptions & { source: RunRecord; from?:
   if (graph && graph.execution.target !== opts.executor.id) throw new Error('执行目标与已确认的协作图不一致');
   const frozen = opts.source.collaborationTargets;
   const executor = recordedTarget(opts.executor, frozen?.find(t => t.id === opts.executor.id));
-  const auditTarget = graph?.audit && opts.targets.find(t => t.id === graph.audit!.target);
-  if (graph?.audit && !auditTarget) throw new Error('实施复核目标已移除，请更新协作图');
-  const reviewer = auditTarget && recordedTarget(auditTarget, frozen?.find(t => t.id === auditTarget.id));
+  function postExecutionTarget(stage: 'audit' | 'report') {
+    const role = graph?.[stage];
+    if (!role) return;
+    const target = opts.targets.find(t => t.id === role.target);
+    if (!target) throw new Error(`${roleNames[stage]}目标已移除，请更新协作图`);
+    return recordedTarget(target, frozen?.find(t => t.id === target.id));
+  }
+  const reviewer = postExecutionTarget('audit');
+  const reporter = postExecutionTarget('report');
   if (!opts.executor.adapter.capabilities.exec) throw new Error(`${opts.executor.label} 不支持实施`);
   const record = initialRecord(opts, plan.question);
   record.sessionId = opts.source.sessionId;
@@ -801,6 +810,7 @@ export function startExecution(opts: CommonOptions & { source: RunRecord; from?:
   record.targets = [snapshotTarget(executor)];
   record.input.prompt = buildExecPrompt(opts.source.input.prompt, plan.text);
   if (graph?.audit) record.input.prompt += '\n完成后列出实际改动文件、关键变更片段、证据和仍未验证的事项，供下游模型复核。';
+  if (reporter) record.input.prompt += `\n请把实施结果交给 ${reporter.label} 向用户汇报。说明实际完成的工作、验证情况和剩余问题。`;
   const journal = new Journal(record, opts);
   const done = Promise.resolve().then(() => journal.finish(async () => {
     journal.stage('answering', [executor]);
@@ -811,20 +821,31 @@ export function startExecution(opts: CommonOptions & { source: RunRecord; from?:
       prompt: record.input.prompt,
       forkFromAnswer: ownPlan ? plan.source.runId : undefined,
     }, timeoutMillis(opts.config.execTimeoutSec ?? 3600));
+    let review: CallRecord | undefined;
     if (execution.result.ok && reviewer && !journal.ctl.signal.aborted) {
       journal.stage('synthesizing', [reviewer]);
       const verify = reviewer.adapter.capabilities.askPolicy === 'text-only'
         ? '你收到的是执行报告及其中的变更片段，请明确哪些结论仅由报告支持、哪些需要核查实际文件。'
         : '只读检查执行报告涉及的文件和改动，对照方案核实实现。';
-      const review = await journal.one(reviewer, 'result-review', [
+      review = await journal.one(reviewer, 'result-review', [
         buildPlanInput(opts.source.input.prompt, plan.text), '实施报告', execution.result.text,
         '你负责实施复核。' + verify + ' 给出已完成项、具体偏差及仍待确认项。',
       ].join('\n\n'), timeoutMillis(opts.config.timeoutSec ?? 600));
-      if (review.result.ok && !review.result.text.trim()) throw new Error('实施已完成，复核模型没有返回正文');
+    }
+    if (reporter && !journal.ctl.signal.aborted) {
+      journal.stage('synthesizing', [reporter]);
+      await journal.one(reporter, 'report', [
+        buildPlanInput(opts.source.input.prompt, plan.text),
+        `实施回报（${executor.label}，${execution.result.status}）`,
+        execution.result.text || '执行模型没有返回正文。', execution.result.error,
+        review && `实施复核（${review.target.label}，${review.result.status}）`, review?.result.text, review?.result.error,
+        '请直接向用户汇报这次需求的结果。根据以上记录说明已完成的改动、验证情况，以及仍未完成或需要用户决定的事项。遇到失败或证据不足时如实说明。此阶段只汇报，不继续实施。',
+      ].filter(Boolean).join('\n\n'), timeoutMillis(opts.config.timeoutSec ?? 600));
     }
   }));
   return {
     record, done,
+    get waitingForInput() { return journal.waitingForInput; },
     cancel: () => { journal.cancelAllInteractions(); journal.ctl.abort(); },
     cancelTarget: () => false,
     respondInteraction: (interactionId, response) => journal.respondInteraction(interactionId, response),

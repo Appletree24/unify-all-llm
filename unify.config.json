@@ -11,6 +11,9 @@
       ],
       "execution": {
         "target": "codex"
+      },
+      "report": {
+        "target": "gemini-pro"
       }
     }
   },

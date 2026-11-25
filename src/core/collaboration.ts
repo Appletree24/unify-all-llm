@@ -7,7 +7,7 @@ const role = z.strictObject({
 });
 const point = z.strictObject({ x: z.number(), y: z.number() });
 const layoutSchema = z.strictObject({
-  offsets: z.record(z.string().regex(/^(start|plan-[0-2]|merge|check|confirm|execution|audit|end)$/), point),
+  offsets: z.record(z.string().regex(/^(start|plan-[0-2]|merge|check|confirm|execution|audit|report|end)$/), point),
   pan: point,
 });
 export type GraphLayout = z.infer<typeof layoutSchema>;
@@ -18,15 +18,20 @@ export const collaborationSchema = z.strictObject({
   check: role.optional(),
   execution: role,
   audit: role.optional(),
+  report: role.optional(),
   layout: layoutSchema.optional(),
 }).refine(g => new Set(g.plans.map(p => p.target)).size === g.plans.length, '并行分支需要不同目标')
   .refine(g => (g.plans.length > 1) === !!g.merge, '多个方案需要一个比较节点');
 export type Collaboration = z.infer<typeof collaborationSchema>;
 export type GraphRole = z.infer<typeof role>;
-export type GraphStep = 'plan' | 'merge' | 'check' | 'confirm' | 'execution' | 'audit';
+export type GraphStep = 'plan' | 'merge' | 'check' | 'confirm' | 'execution' | 'audit' | 'report';
 export const roleNames: Record<GraphStep, string> = {
-  plan: '制定方案', merge: '方案比较', check: '方案复核', confirm: '本人确认', execution: '实施', audit: '实施复核',
+  plan: '制定方案', merge: '方案比较', check: '方案复核', confirm: '本人确认', execution: '实施', audit: '实施复核', report: '结果汇报',
 };
+
+export function isReviewOrReport(scope: string): scope is 'plan-review' | 'result-review' | 'report' {
+  return scope === 'plan-review' || scope === 'result-review' || scope === 'report';
+}
 
 export function graphStages(graph: Collaboration): GraphStep[] {
   const stages: GraphStep[] = ['plan'];
@@ -34,6 +39,7 @@ export function graphStages(graph: Collaboration): GraphStep[] {
   if (graph.check) stages.push('check');
   stages.push('confirm', 'execution');
   if (graph.audit) stages.push('audit');
+  if (graph.report) stages.push('report');
   return stages;
 }
 

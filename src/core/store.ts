@@ -7,7 +7,7 @@ import { mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { z } from 'zod';
-import { collaborationSchema } from './collaboration.js';
+import { collaborationSchema, isReviewOrReport } from './collaboration.js';
 import { sourceCheckSchema } from './source-check.js';
 import { customSchema, effortSchema, readJson } from './config.js';
 export { loadConfig, type Config } from './config.js';
@@ -87,7 +87,7 @@ const recordSchema = z.object({
   status: z.enum(['created', 'deciding', 'answering', 'synthesizing', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']),
   error: z.string().optional(), results: z.array(resultSchema),
   calls: z.array(z.object({
-    id: safeId, scope: z.enum(['decision', 'answer', 'dispute-assessment', 'source-check', 'synthesis', 'exec', 'plan-review', 'result-review']), target: targetSchema,
+    id: safeId, scope: z.enum(['decision', 'answer', 'dispute-assessment', 'source-check', 'synthesis', 'exec', 'plan-review', 'result-review', 'report']), target: targetSchema,
     input: z.object({
       prompt: z.string(),
       turnPrompt: z.string().optional(),
@@ -153,7 +153,7 @@ export function exportRun(cwd: string, run: RunRecord): void {
   atomicWrite(join(dir, 'question.md'), run.question + '\n');
   for (const r of run.results) atomicWrite(join(dir, `answer-${safeId.parse(r.targetId)}.md`), `${r.ok ? '' : `**${r.status}**: ${r.error ?? ''}\n\n`}${r.text}${formatMemoryReferences(r.memoryReferences)}\n`);
   if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), synthesisFormatter(run)(run.synthesis.result.text) + formatMemoryReferences(run.synthesis.result.memoryReferences) + '\n');
-  for (const call of run.calls) if (call.scope === 'plan-review' || call.scope === 'result-review') {
+  for (const call of run.calls) if (isReviewOrReport(call.scope)) {
     atomicWrite(join(dir, call.scope + '.md'), call.result.text + '\n');
   }
 }
@@ -258,10 +258,15 @@ function formatExecutedAnswer(planText: string | undefined, execution: RunRecord
     let outcome = execOk ? `\n\n[已由 ${execLabel} 实施]\n${execResult.text.trim()}` : '';
     if (!execOk && execution.collaboration) {
       const details = [execResult?.text.trim(), execResult?.error, execution.error].filter(Boolean).join('\n');
-      outcome = `\n\n[实施状态：${execution.status}，再次实施前应核对工作目录里的已有改动]\n${details}`;
+      outcome = `\n\n[实施状态：${execResult?.status ?? execution.status}，再次实施前应核对工作目录里的已有改动]\n${details}`;
     }
     const audit = execution.calls.find(c => c.scope === 'result-review' && c.result.ok);
-    return `${header}${planText}${outcome}${audit ? '\n\n[实施复核]\n' + audit.result.text.trim() : ''}`;
+    const report = execution.calls.find(c => c.scope === 'report' && c.result.ok);
+    return [
+      header + planText + outcome,
+      audit && '[实施复核]\n' + audit.result.text.trim(),
+      report && `[${report.target.label} 向用户汇报的结果]\n${report.result.text.trim()}`,
+    ].filter(Boolean).join('\n\n');
   }
   return execOk ? execResult.text.trim() : undefined;
 }

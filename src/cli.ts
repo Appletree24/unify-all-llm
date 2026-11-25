@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { benchCommand } from './bench/command.js';
 import { readCacheReport } from './core/cache-monitor.js';
+import { isReviewOrReport, roleNames } from './core/collaboration.js';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
@@ -94,7 +95,7 @@ function renderer(json: boolean, reasoning = false) {
     let view: FanOutView | undefined
     let hasText = false;
     const titles: Partial<Record<CallRecord['scope'], string>> = {
-        synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核',
+        synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核', report: roleNames.report,
     };
     return {
         event(event: WorkflowEvent) {
@@ -249,7 +250,7 @@ async function cmdExec(argv: string[]): Promise<number> {
     const onInteract = canInteract ? createCliInteractor(view, abort.signal) : undefined;
     try {
         const result = await startExecution({ cwd, config, targets, executor, source: run, from: values.from, interactive: canInteract, onInteract, signal: abort.signal, onEvent: (e) => view.event(e) }).done;
-        return result.results[0]?.ok ? 0 : 1;
+        return (run.collaboration?.report ? result.status === 'completed' : result.results[0]?.ok) ? 0 : 1;
     } finally { view.stop(); }
 }
 
@@ -359,8 +360,8 @@ async function cmdMemory(args: string[]): Promise<number> {
 
 function show(run: RunRecord): void {
     process.stdout.write(`${bold(run.id)} · ${run.status}\n\n${run.question}\n`);
-    const reviews = run.calls.filter(c => c.scope === 'plan-review' || c.scope === 'result-review');
-    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...reviews.map(c => c.result)]) {
+    const stageCalls = run.calls.filter(c => isReviewOrReport(c.scope));
+    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...stageCalls.map(c => c.result)]) {
         header(`${r.targetId} (${r.provider}${r.model ? ` / ${r.model}` : ''})`, `${r.status} · ${secs(r.durationMs)}`);
         const text = r === run.synthesis?.result ? synthesisFormatter(run)(r.text) : r.text;
         process.stdout.write(text + formatMemoryReferences(r.memoryReferences) + '\n');

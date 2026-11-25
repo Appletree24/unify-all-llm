@@ -1,0 +1,48 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fff; --ink: #191b21; --dim: #616773; --line: #dfe2e8; --subtle: #f5f6f8;
+  --accent: #2f55d4; --button: #fff; --error: #a03430;
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #16171a; --ink: #e8e9ec; --dim: #a0a6b2; --line: #363940; --subtle: #202228;
+    --accent: #9cb0ff; --button: #151d3d; --error: #ff9b96; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); }
+#root { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+.bar { display: flex; align-items: baseline; gap: 12px; padding: max(env(safe-area-inset-top), 12px) 20px 12px; border-bottom: 1px solid var(--line); }
+.bar b { font-size: 19px; letter-spacing: -.04em; }
+.bar span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: .82rem; }
+.bar small { margin-left: auto; white-space: nowrap; }
+small, label, .connection { font-size: .8rem; color: var(--dim); }
+.live { color: var(--accent); }
+main { flex: 1; overflow: auto; min-height: 0; overscroll-behavior: contain; }
+.thread, form { max-width: 720px; margin-inline: auto; padding-inline: 20px; }
+.thread { padding-block: 26px 14px; overflow-wrap: anywhere; }
+h1 { margin: 0 0 24px; font-size: clamp(1.25rem, 4vw, 1.6rem); line-height: 1.35; letter-spacing: -.025em; }
+article { padding: 18px 0 22px; border-top: 1px solid var(--line); }
+.question-head, .answer header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+h2 { white-space: pre-wrap; margin: 4px 0 16px; font-size: 1.05rem; }
+.answer + .answer { margin-top: 22px; }
+h3 { margin: 0; font-size: .9rem; color: var(--accent); }
+.markdown, .plain { margin-top: 6px; font-size: .95rem; }
+.plain { white-space: pre-wrap; }
+.markdown :is(h1,h2,h3,h4) { color: var(--ink); font-size: 1em; margin: 1em 0 .35em; }
+.markdown p { margin: .45em 0; } .markdown :first-child { margin-top: 0; }
+.markdown :is(ul,ol) { padding-left: 1.4em; }
+.markdown pre, .markdown table { display: block; max-width: 100%; overflow: auto; }
+.markdown pre, .markdown code { background: var(--subtle); border-radius: 4px; }
+.markdown pre { padding: 12px; } .markdown code { font-size: .85em; }
+.markdown td, .markdown th { border-bottom: 1px solid var(--line); padding: 4px 8px; }
+.markdown blockquote { margin-left: 0; padding-left: .9em; border-left: 2px solid var(--line); }
+.markdown a { color: var(--accent); }
+footer { border-top: 1px solid var(--line); padding: 10px 0 max(12px, env(safe-area-inset-bottom)); }
+.composer { display: flex; align-items: flex-end; gap: 10px; margin-top: 4px; }
+textarea { flex: 1; min-width: 0; resize: vertical; max-height: 24dvh; border: 1px solid var(--line); border-radius: 10px;
+  padding: 9px 12px; background: var(--subtle); color: var(--ink); font: inherit; line-height: 1.4; }
+textarea:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button { min-height: 44px; padding: 0 17px; border: none; border-radius: 9px; color: var(--button); background: var(--accent); font: inherit; font-weight: 600; }
+button:disabled { background: var(--subtle); color: var(--dim); }
+.cancel-turn:enabled { background: var(--subtle); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
+.error { color: var(--error); font-size: .83rem; margin: 6px 0; }
