@@ -26,9 +26,7 @@ export interface CommandSpec {
 }
 
 export const COMMANDS: CommandSpec[] = [
-  { name: 'models', detail: '选择之后提问的目标，如 /models codex,deepseek', arg: 'targets' },
   { name: 'settings', detail: '设置模型、思考强度、官方 API 和运行偏好' },
-  { name: 'synth', detail: '设置汇总目标', arg: 'target', required: true },
   { name: 'graph', detail: '选用已保存的协作模版，/graph off 恢复普通问答' },
   { name: 'resume', detail: '选择当前项目的历史会话继续工作' },
   { name: 'share', detail: '手机扫码继续当前会话，/share off 停止共享' },
@@ -45,7 +43,6 @@ export const COMMANDS: CommandSpec[] = [
   { name: 'new', detail: '开始新对话' },
   { name: 'copy', detail: '复制当前回答' },
   { name: 'memory', detail: '查看和管理各工具的记忆；/memory web 打开网页界面' },
-  { name: 'mouse', detail: '开关鼠标滚动、拖选和路径点击' },
   { name: 'help', detail: '快捷键与命令' },
   { name: 'exit', detail: '退出' },
 ];

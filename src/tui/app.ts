@@ -167,7 +167,6 @@ export class App {
   private inputTop = 0;
   private mouseOn = true;
   private manualModels = false;
-  private sessionSynth?: string;
   private continueFrom?: string;
   private readonly modelTests: ModelTests;
 
@@ -634,8 +633,6 @@ export class App {
   private applySetting(field: keyof Config, value: unknown, entry?: string): void {
     const { cfg, targets } = writeSetting(this.cwd, field, value, entry);
     void this.modelTests.reset();
-    if (field === 'synthesizer' || !targets.some(t => t.id === this.sessionSynth)) this.sessionSynth = undefined;
-    if (this.sessionSynth) cfg.synthesizer = this.sessionSynth;
     this.cfg = cfg;
     this.all = targets;
     if (field === 'mouse') {
@@ -950,26 +947,7 @@ export class App {
       else this.openMemory();
     }
     else if (name === 'exit') this.onQuit();
-    else if (name === 'models') {
-      if (!arg) return this.say(`当前: ${this.selected.join(', ') || '无'}    用法: /models claude,codex`);
-      const ids = arg.split(/[,\s]+/).filter(Boolean);
-      if (new Set(ids).size !== ids.length) return this.say('不能重复选择同一个目标；请在 targets 中配置不同模型', RED);
-      const bad = ids.find((id) => !this.installed.get(id));
-      if (bad) return this.say(`"${bad}" 不可用（未安装或不存在）`, RED);
-      this.selected = ids;
-      this.graphId = undefined;
-      this.manualModels = true;
-      this.say(`之后的问题将发给: ${ids.join(', ')}`);
-    } else if (name === 'mouse') {
-      this.mouseOn = !this.mouseOn;
-      this.io.setMouse?.(this.mouseOn);
-      this.say(this.mouseOn ? `鼠标交互已开启 · 拖选后按 ${this.selectionCopyLabel} 复制 · 单击路径查看文件` : '鼠标交互已关闭 · 可用终端原生选区');
-    } else if (name === 'synth') {
-      if (!this.installed.get(arg)) return this.say(`"${arg}" 不可用`, RED);
-      this.sessionSynth = arg;
-      this.cfg = { ...this.cfg, synthesizer: arg };
-      this.say(`普通问答汇总模型：${arg}`);
-    } else {
+    else {
       this.say(`未知命令 /${name}；输入 / 查看命令列表，/help 查看快捷键`, YELLOW);
     }
   }

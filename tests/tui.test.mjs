@@ -67,14 +67,54 @@ test('TUI cancellation followed by focused execution uses the visible turn and p
   assert.equal(source.status, 'cancelled');
 });
 
-test('TUI rejects duplicate target selection and /exit remains available', async (t) => {
-  const app = new App({ cols: () => 100, rows: () => 24, write() {} }, workspace(t), {},
-    [target('a', async function* () { yield { type: 'done', text: 'a' }; })]);
+test('TUI removes overlapping setting commands, configures them via /settings, and keeps /exit available', async (t) => {
+  const { buildRegistry } = await import('../dist/providers/index.js');
+  const cwd = workspace(t);
+  const home = workspace(t);
+  const savedHome = process.env[homeEnv];
+  const savedPath = Object.entries(process.env).filter(([k]) => k.toLowerCase() === 'path');
+  process.env[homeEnv] = home;
+  for (const [k] of savedPath) process.env[k] = '';
+  t.after(() => {
+    if (savedHome === undefined) delete process.env[homeEnv]; else process.env[homeEnv] = savedHome;
+    for (const [k, v] of savedPath) process.env[k] = v;
+  });
+
+  const registry = buildRegistry({});
+  const codex = { ...registry.codex, adapter: { ...registry.codex.adapter, detect: async () => ({ installed: true }) } };
+  const deepseek = { ...registry.deepseek, adapter: { ...registry.deepseek.adapter, detect: async () => ({ installed: true }) } };
+  const mouseEvents = [];
+  const app = new App({
+    cols: () => 100, rows: () => 24, write() {}, setMouse: (on) => mouseEvents.push(on),
+  }, cwd, {}, [codex, deepseek]);
   t.after(() => app.dispose());
   await app.init();
-  submit(app, '/models a,a');
-  app.invalidate();
-  assert.match(app.snapshot().join('\n'), /不能重复选择/);
+
+  for (const removed of ['/models codex,deepseek', '/synth deepseek', '/mouse']) {
+    submit(app, removed);
+    assert.match(screen(app), /未知命令/);
+  }
+
+  const press = (...names) => names.forEach((name) => app.handleKey({ name }));
+  submit(app, '/settings');
+  press('down', 'down', 'down', 'down', 'down', 'enter'); // 鼠标滚动
+  assert.deepEqual(mouseEvents, [false]);
+  assert.equal(JSON.parse(readFileSync(join(cwd, 'unify.config.json'), 'utf8')).mouse, false);
+
+  press('up', 'up', 'up', 'enter', 'enter'); // 回答、汇总与执行 -> 默认回答目标
+  submit(app, 'codex,codex');
+  assert.match(screen(app), /目标不能重复/);
+  press('ctrl+u');
+  submit(app, 'codex,deepseek');
+  assert.match(screen(app), /已保存/);
+
+  press('down', 'enter', 'down', 'down', 'down', 'down', 'enter'); // 汇总模型 -> deepseek
+  press('esc', 'esc');
+  const persisted = JSON.parse(readFileSync(join(cwd, 'unify.config.json'), 'utf8'));
+  assert.deepEqual(persisted.providers, ['codex', 'deepseek']);
+  assert.equal(persisted.synthesizer, 'deepseek');
+  assert.match(screen(app), /codex \+ deepseek → deepseek/);
+
   submit(app, '/memory web');
   while (!/记忆管理界面/.test(app.snapshot().join('\n'))) { await new Promise((r) => setTimeout(r, 10)); app.invalidate(); }
   const url = /http:\/\/127\.0\.0\.1:\d+\//.exec(app.snapshot().join('\n'))[0];
@@ -638,24 +678,22 @@ test('TUI completes commands, targets and files from the composer', async (t) =>
   assert.equal(quit, true);
 
   type(app, '/');
-  assert.match(screen(app), /› \/models/);
-  assert.match(screen(app), /\/synth/);
-  type(app, 'sy');
-  assert.doesNotMatch(screen(app), /\/models/);
-  app.handleKey({ name: 'enter' }); // /synth needs its argument: completes, does not run
-  assert.equal(composer(app), '❯ /synth');
-  assert.match(screen(app), /› alpha/);
-  app.handleKey({ name: 'down' });
-  app.handleKey({ name: 'enter' });
-  app.handleKey({ name: 'enter' });
-  assert.match(screen(app), /汇总模型: beta/);
+  assert.match(screen(app), /› \/settings/);
+  assert.doesNotMatch(screen(app), /\/(models|synth|mouse)\b/);
+  type(app, 'rev');
+  assert.doesNotMatch(screen(app), /› \/settings/);
+  assert.doesNotMatch(screen(app), /\/graph/);
+  app.handleKey({ name: 'enter' }); // /revise needs its argument: completes, does not run
+  assert.equal(composer(app), '❯ /revise');
+  app.handleKey({ name: 'ctrl+u' });
 
-  type(app, '/mod');
+  type(app, '/ret');
   app.handleKey({ name: 'tab' });
   type(app, 'alpha,b');
+  assert.match(screen(app), /› beta/);
   app.handleKey({ name: 'tab' });
   app.handleKey({ name: 'enter' });
-  assert.match(screen(app), /之后的问题将发给: alpha, beta/);
+  assert.match(screen(app), /没有可重试的记录/);
 
   type(app, '看看 @orch');
   assert.match(screen(app), /› src\/orchestrator\.ts/);
@@ -671,7 +709,7 @@ test('TUI completes commands, targets and files from the composer', async (t) =>
   app.handleKey({ name: 'up' }); // history, without reopening a popup that would trap the arrows
   assert.equal(composer(app), '❯ 看看 @src/orchestrator.ts 的并发');
   app.handleKey({ name: 'up' });
-  assert.equal(composer(app), '❯ /models alpha,beta');
+  assert.equal(composer(app), '❯ /retry alpha,beta');
   app.handleKey({ name: 'down' });
   app.handleKey({ name: 'down' });
   assert.match(composer(app), /^❯ 继续追问/);
@@ -700,7 +738,7 @@ test('settings test the selected target on demand and show the actual chat outco
   for (const key of ['down', 'enter', 'down', 'enter', 'down', 'down']) press(key);
   assert.match(screen(app), /› 测试可用性/);
   assert.equal(requests.length, 0);
-  app.handleKey({ name: 'click', x: 5, y: 4 });
+  clickText(app, '› 测试可用性');
   press('enter');
   assert.match(screen(app), /测试中/);
   assert.equal(requests.length, 1);
