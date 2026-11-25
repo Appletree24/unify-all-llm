@@ -1,4 +1,5 @@
 import type { SourceReference } from './source.js';
+import type { AnswerReference } from './answer-source.js';
 
 export interface Point { x: number; y: number }
 export interface Rect extends Point { w: number; h: number }
@@ -9,7 +10,7 @@ export interface Cell {
   ch: string;
   st: string; // SGR parameters, e.g. "1;38;2;255;0;0"
   w: number;
-  source?: SourceReference;
+  source?: SourceReference | AnswerReference;
 }
 
 export const rgb = (r: number, g: number, b: number) => `38;2;${r};${g};${b}`;
@@ -108,7 +109,7 @@ export class Screen {
     return this.putCells(x, y, toCells(text, st), maxX);
   }
 
-  sourceAt({ x, y }: Point): SourceReference | undefined {
+  sourceAt({ x, y }: Point): Cell['source'] {
     const row = this.grid[y];
     const cell = row?.[x];
     return cell?.w === 0 ? row[x - 1]?.source : cell?.source;

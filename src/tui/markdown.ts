@@ -1,5 +1,5 @@
 import { rgb, toCells, type Cell } from './screen.js';
-import { sourceCells, sourceReference } from './source.js';
+import { BRANCH_SOURCE, parseBranchSource, sourceCells, sourceReference } from './source.js';
 import { tex } from './tex.js';
 
 const DIM = rgb(120, 125, 135);
@@ -57,9 +57,10 @@ export function wrap(cells: Cell[], width: number, hang = 0): Cell[][] {
 
 const withPrefix = (lines: Cell[][], prefix: Cell[]) => lines.map((l) => [...prefix, ...l]);
 
-// One alternation per inline construct. Half-streamed markers simply do not match yet.
+// One alternation per inline construct. The repository and branch qualify the following code path.
 const INLINE = new RegExp(
   [
+    BRANCH_SOURCE.source,
     '(`+)(.+?)\\1', // 1,2 code
     '\\*\\*(?!\\s)(.+?)\\*\\*', // 3 bold
     '(?<![\\p{L}\\p{N}])__(?!\\s)(.+?)__(?![\\p{L}\\p{N}])', // 4 bold
@@ -74,24 +75,35 @@ const INLINE = new RegExp(
   'gu',
 );
 
-function inline(text: string, base: string): Cell[] {
+type InlineRenderer = (text: string, style: string) => Cell[];
+
+function branchSourceCells(text: string, style: string): Cell[] {
+  const { repository, open, branch, close, file, reference: source } = parseBranchSource(text);
+  const pathCells = source
+    ? toCells(file, add(CODE, '4')).map(cell => ({ ...cell, source }))
+    : toCells(file, CODE);
+  return [...toCells(repository, CODE), ...toCells(open, style), ...toCells(branch, CODE), ...toCells(close, style), ...pathCells];
+}
+
+function inline(text: string, base: string, plain: InlineRenderer): Cell[] {
   const cells: Cell[] = [];
   let last = 0;
   for (const m of text.matchAll(INLINE)) {
-    if (m.index! > last) cells.push(...sourceCells(text.slice(last, m.index), base));
+    if (m.index! > last) cells.push(...plain(text.slice(last, m.index), base));
     last = m.index! + m[0].length;
     if (m[2] !== undefined) cells.push(...sourceCells(m[2], CODE));
-    else if (m[3] !== undefined || m[4] !== undefined) cells.push(...inline(m[3] ?? m[4], add(base, '1')));
-    else if (m[5] !== undefined) cells.push(...inline(m[5], add(base, '9')));
-    else if (m[6] !== undefined || m[7] !== undefined) cells.push(...inline(m[6] ?? m[7], add(base, '3')));
+    else if (m[3] !== undefined || m[4] !== undefined) cells.push(...inline(m[3] ?? m[4], add(base, '1'), plain));
+    else if (m[5] !== undefined) cells.push(...inline(m[5], add(base, '9'), plain));
+    else if (m[6] !== undefined || m[7] !== undefined) cells.push(...inline(m[6] ?? m[7], add(base, '3'), plain));
     else if (m[8] !== undefined) {
       const source = sourceReference(m[9], true);
-      cells.push(...inline(m[8], add(base, '4')).map(cell => ({ ...cell, source })));
+      cells.push(...inline(m[8], add(base, '4'), sourceCells).map(cell => ({ ...cell, source })));
       if (!source && m[9] !== m[8] && !m[9].startsWith('#')) cells.push(...toCells(` (${m[9]})`, DIM));
     } else if (m[10] !== undefined || m[11] !== undefined) cells.push(...toCells(tex(m[10] ?? m[11]).replace(/\s*\n\s*/g, ' '), MATH));
     else if (m[12] !== undefined) cells.push(...toCells(m[12], base));
+    else cells.push(...branchSourceCells(m[0], base));
   }
-  if (last < text.length) cells.push(...sourceCells(text.slice(last), base));
+  if (last < text.length) cells.push(...plain(text.slice(last), base));
   return cells;
 }
 
@@ -105,10 +117,10 @@ const splitRow = (line: string) =>
 
 const isTableRule = (line: string) => line.includes('|') && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(line);
 
-function table(header: string[], aligns: string[], body: string[][], width: number): Cell[][] | undefined {
+function table(header: string[], aligns: string[], body: string[][], width: number, renderInline: InlineRenderer): Cell[][] | undefined {
   const n = Math.max(header.length, ...body.map((r) => r.length));
   const rows = [header, ...body].map((r, ri) =>
-    Array.from({ length: n }, (_, c) => inline(r[c] ?? '', ri === 0 ? '1' : '')),
+    Array.from({ length: n }, (_, c) => renderInline(r[c] ?? '', ri === 0 ? '1' : '')),
   );
   const avail = width - (n + 1) - 2 * n;
   if (avail < n * 3) return undefined; // too narrow to draw: caller falls back to plain text
@@ -154,10 +166,11 @@ function mathBlock(src: string, width: number): Cell[][] {
  * Unicode. Constructs that are still mid-stream are shown verbatim, so text
  * never jumps around while it arrives.
  */
-export function layout(text: string, width: number, accent: string, muted = false): Cell[][] {
+export function layout(text: string, width: number, accent: string, muted = false, plain = sourceCells): Cell[][] {
   const src = text.replace(/\r/g, '').replace(/\t/g, '  ').split('\n');
-  if (muted) return src.flatMap((l) => wrap(sourceCells(l, DIM), width));
+  if (muted) return src.flatMap((l) => wrap(plain(l, DIM), width));
 
+  const renderInline: InlineRenderer = (line, style) => inline(line, style, plain);
   const out: Cell[][] = [];
   const codeBar = toCells('│ ', RULE);
   for (let i = 0; i < src.length; i++) {
@@ -186,7 +199,7 @@ export function layout(text: string, width: number, accent: string, muted = fals
       }
       out.push(...mathBlock(end < 0 ? body : body.slice(0, end), width));
       const tail = end < 0 ? '' : body.slice(end + close.length).trim();
-      if (tail) out.push(...wrap(inline(tail, ''), width));
+      if (tail) out.push(...wrap(renderInline(tail, ''), width));
       continue;
     }
 
@@ -196,7 +209,7 @@ export function layout(text: string, width: number, accent: string, muted = fals
       const body: string[][] = [];
       let j = i + 2;
       for (; j < src.length && src[j].includes('|') && src[j].trim(); j++) body.push(splitRow(src[j]));
-      const drawn = table(splitRow(raw), aligns, body, width);
+      const drawn = table(splitRow(raw), aligns, body, width, renderInline);
       if (drawn) {
         out.push(...drawn);
         i = j - 1;
@@ -216,7 +229,7 @@ export function layout(text: string, width: number, accent: string, muted = fals
     const heading = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(raw);
     if (heading) {
       const level = heading[1].length;
-      out.push(...wrap(inline(heading[2], level <= 2 ? `1;${accent}` : '1'), width));
+      out.push(...wrap(renderInline(heading[2], level <= 2 ? `1;${accent}` : '1'), width));
       continue;
     }
 
@@ -227,7 +240,7 @@ export function layout(text: string, width: number, accent: string, muted = fals
 
     const quote = /^\s*>\s?(.*)$/.exec(raw);
     if (quote) {
-      out.push(...withPrefix(wrap(inline(quote[1], `3;${QUOTE}`), width - 2), toCells('▌ ', accent)));
+      out.push(...withPrefix(wrap(renderInline(quote[1], `3;${QUOTE}`), width - 2), toCells('▌ ', accent)));
       continue;
     }
 
@@ -237,13 +250,13 @@ export function layout(text: string, width: number, accent: string, muted = fals
       const task = /^\[([ xX])\]\s+(.*)$/.exec(item[3]);
       const marker = task ? (task[1] === ' ' ? '☐' : '☑') : /\d/.test(item[2]) ? item[2] : indent >= 2 ? '◦' : '•';
       const head = [...space(indent), ...toCells(marker + ' ', accent)];
-      out.push(...wrap([...head, ...inline(task ? task[2] : item[3], '')], width, widthOf(head)));
+      out.push(...wrap([...head, ...renderInline(task ? task[2] : item[3], '')], width, widthOf(head)));
       continue;
     }
 
     // Continuation lines of a list item keep their indentation.
     const lead = /^ */.exec(raw)![0].length;
-    out.push(...wrap([...space(Math.min(lead, 12)), ...inline(raw.slice(lead), '')], width, Math.min(lead, 12)));
+    out.push(...wrap([...space(Math.min(lead, 12)), ...renderInline(raw.slice(lead), '')], width, Math.min(lead, 12)));
   }
   return out;
 }

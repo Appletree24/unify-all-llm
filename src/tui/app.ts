@@ -7,7 +7,6 @@ import { currentGitBranch, listGitBranches, switchGitBranch, type GitBranches } 
 import { loadConfig, saveRun, type Config, type RunRecord } from '../core/store.js';
 import { graphIssue, graphPlanResult, roleNames } from '../core/collaboration.js';
 import { readSessionRuns, runningStatus, summarizeSessions } from '../core/sessions.js';
-import { synthesisFormatter } from '../core/synth.js';
 import { InteractionView } from './interaction.js';
 import { Picker } from './picker.js';
 import { MobileShare, mobileNetworks } from '../mobile/share.js';
@@ -24,6 +23,7 @@ import { readCacheReport } from '../core/cache-monitor.js';
 import { defaultTargetIds, detectTargets } from '../core/targets.js';
 import { ModelTests } from '../core/model-tests.js';
 import { displaySynthesisEvents } from '../ui/synthesis.js';
+import { AnswerSourceView, synthesisText } from './answer-source.js';
 import { COMMANDS, complete, listFiles, type Completion } from './complete.js';
 import { readApiProfile, saveApiProfile, type ApiProfile, type OfficialApi } from '../providers/official.js';
 import { SettingsView, writeSetting } from './settings.js';
@@ -73,6 +73,7 @@ interface Pane {
   follow: boolean;
   viewH: number;
   maxScroll: number;
+  synthesis?: ReturnType<typeof synthesisText>;
   cache?: { key: string; lines: Cell[][] };
 }
 
@@ -130,7 +131,8 @@ export class App {
   private api?: ApiView;
   private quota?: QuotaView;
   private quotaDetails = false;
-  private source?: SourceView;
+  private sources: (SourceView | AnswerSourceView)[] = [];
+  private sourceError?: string;
 
   private focus = 'input';
   private zoomId?: string;
@@ -291,6 +293,10 @@ export class App {
     return !!(this.source || this.shareView || this.picker || this.branchView || this.api || this.settings || this.quotaDetails || this.mem);
   }
 
+  private get source(): SourceView | AnswerSourceView | undefined {
+    return this.sources.at(-1);
+  }
+
   private handleInteraction(ev: WorkflowEvent): boolean {
     if (ev.type === 'interaction') {
       const paneId = ev.scope === 'answer' ? `a:${ev.targetId}`
@@ -313,13 +319,14 @@ export class App {
     return true;
   }
 
-  private workflowEvent(ev: WorkflowEvent): void {
+  private workflowEvent(ev: WorkflowEvent, record: RunRecord): void {
     if (this.handleInteraction(ev)) return;
     if (ev.type === 'stage' && ev.stage === 'answering') {
       this.synth = undefined;
       this.panes = ev.targets.map((t) => this.newPane(t.id, 'answer', t.label, this.colorOf(t.id)));
     } else if (ev.type === 'call' && (ev.scope === 'synthesis' || ev.scope === 'plan-review')) {
       this.synth = this.newPane(ev.target.id, 'synth', `${ev.scope === 'plan-review' ? '方案复核' : '汇总'} · ${ev.target.label}`, GOLD);
+      if (ev.scope === 'synthesis') this.synth.synthesis = synthesisText(record);
     } else if (ev.type === 'provider') {
       const pane = ev.scope === 'answer' ? this.panes.find((p) => p.id === `a:${ev.targetId}`) : ev.scope === 'synthesis' || ev.scope === 'plan-review' ? this.synth : ev.scope === 'exec' ? this.exec : undefined;
       if (pane) this.apply(pane, ev.event);
@@ -339,7 +346,7 @@ export class App {
     }
     try {
       const ctl = new AbortController();
-      const display = displaySynthesisEvents(ev => this.workflowEvent(ev));
+      const display = displaySynthesisEvents((ev, record) => this.workflowEvent(ev, record), false);
       this.active = startComparison({
         cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
         previous, continueFrom: retryIds || revise ? undefined : this.continueFrom,
@@ -504,7 +511,7 @@ export class App {
   private copy(): void {
     const p = this.findPane(this.focus) ?? this.bottomPane() ?? this.panes[this.activeAnswer];
     if (!p || !p.text.trim()) return this.say('没有可复制的内容', YELLOW);
-    this.copyText(p.text, p.title);
+    this.copyText(p.synthesis?.format(p.text) ?? p.text, p.title);
   }
 
   private copyText(text: string, title: string): void {
@@ -731,9 +738,9 @@ export class App {
     const label = target?.label ?? result.targetId;
     const pane = this.newPane(result.targetId, kind, stage ? `${stage} · ${label}` : label,
       kind === 'answer' ? this.colorOf(result.targetId) : kind === 'exec' ? VIOLET : GOLD);
-    const format = result.runId === run.synthesis?.result.runId ? synthesisFormatter(run) : (s: string) => s;
-    pane.text = format(result.text) + formatMemoryReferences(result.memoryReferences);
-    pane.reasoning = format(result.reasoning);
+    if (result.runId === run.synthesis?.result.runId) pane.synthesis = synthesisText(run);
+    pane.text = result.text + formatMemoryReferences(result.memoryReferences);
+    pane.reasoning = result.reasoning;
     pane.status = result.ok ? 'ok' : result.status === 'cancelled' || result.status === 'timed_out' ? result.status : 'err';
     pane.error = result.error;
     pane.start = 0;
@@ -870,7 +877,7 @@ export class App {
       if (arg === 'web') this.memoryWeb().then((url) => this.say(`记忆管理界面（仅本机）: ${url}`, GOLD), (err) => this.say(`无法启动记忆管理界面: ${err instanceof Error ? err.message : err}`, RED));
       else this.openMemory();
     }
-    else if (name === 'quit' || name === 'exit') this.onQuit();
+    else if (name === 'exit') this.onQuit();
     else if (name === 'models') {
       if (!arg) return this.say(`当前: ${this.selected.join(', ') || '无'}    用法: /models claude,codex`);
       const ids = arg.split(/[,\s]+/).filter(Boolean);
@@ -912,19 +919,28 @@ export class App {
       if (k.name === 'esc') return this.requestRender();
     }
     this.drag = undefined;
+    this.sourceError = undefined;
     if (k.name === 'click' && !this.confirm) {
-      const ref = this.last?.sourceAt({ x: k.x ?? -1, y: k.y ?? -1 });
-      if (ref) return this.openSource(ref);
+      const point = { x: k.x ?? -1, y: k.y ?? -1 };
+      const ref = this.last?.sourceAt(point);
+      if (ref && 'blocks' in ref) {
+        this.sources.push(new AnswerSourceView(ref));
+        return this.render();
+      }
+      if (ref) {
+        const hit = this.paneAt(point);
+        return this.openSource(ref, hit && this.findPane(hit.id));
+      }
     }
     if (k.name === 'ctrl+g' && this.interactions.length) {
-      this.source = undefined;
+      this.sources.length = 0;
       const current = this.prompt ? this.interactions.indexOf(this.prompt) : -1;
       this.prompt = this.interactions[(current + 1) % this.interactions.length];
       return this.render();
     }
     if (this.source) {
       if (k.name === 'ctrl+d') return this.onQuit();
-      if (k.name === 'esc' || k.name === 'ctrl+c') this.source = undefined;
+      if (k.name === 'esc' || k.name === 'ctrl+c') this.sources.pop();
       else this.source.handleKey(k);
       return this.requestRender();
     }
@@ -1079,9 +1095,21 @@ export class App {
     return item.value !== current;
   }
 
-  private openSource(ref: SourceReference): void {
-    try { this.source = new SourceView(this.cwd, ref); }
-    catch (err) { return this.say(`无法预览 ${ref.path} · ${err instanceof Error && 'code' in err ? '文件不可读取' : String(err instanceof Error ? err.message : err)}`, YELLOW); }
+  private openSource(ref: SourceReference, pane?: Pane): void {
+    try { this.sources.push(new SourceView(this.cwd, ref)); }
+    catch (err) {
+      const code = err instanceof Error && 'code' in err ? err.code : undefined;
+      const missing = code === 'ENOENT' || code === 'ENOTDIR';
+      if (missing && !ref.git) {
+        const cited = pane?.synthesis?.branchSource(this.cwd, pane.text, ref);
+        if (cited) return this.openSource(cited);
+      }
+      const detail = missing ? '找不到文件'
+        : code === 'EACCES' || code === 'EPERM' ? '没有读权限' : String(err instanceof Error ? err.message : err);
+      const message = `无法预览 ${ref.path} · ${detail}`;
+      if (!this.source) return this.say(message, YELLOW);
+      this.sourceError = message;
+    }
     this.render();
   }
 
@@ -1109,10 +1137,14 @@ export class App {
     return false;
   }
 
+  private paneAt({ x, y }: Point) {
+    return this.rects.find(r => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
+  }
+
   private mouse(k: Key): void {
     const x = k.x ?? -1;
     const y = k.y ?? -1;
-    const hit = this.rects.find((r) => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
+    const hit = this.paneAt({ x, y });
     if (hit?.interaction && y >= hit.interaction.top && y < hit.y + hit.h - 1 && this.interactions.includes(hit.interaction.item)) {
       const { item } = hit.interaction;
       if (k.name === 'click') {
@@ -1333,7 +1365,14 @@ export class App {
     const s = new Screen(cols, rows);
     this.cursor = null;
     this.rects = [];
-    if (this.source) { this.source.draw(s); return s; }
+    if (this.source) {
+      this.source.draw(s);
+      if (this.sourceError) {
+        s.put(0, s.rows - 1, ' '.repeat(s.cols));
+        s.put(1, s.rows - 1, truncate(this.sourceError, s.cols - 2), YELLOW);
+      }
+      return s;
+    }
     if (!this.prompt) {
       if (this.shareView) { this.shareView.draw(s); return s; }
       if (this.picker) { this.picker.draw(s); return s; }
@@ -1650,8 +1689,9 @@ export class App {
     if (p.error) body += `${body ? '\n\n' : ''}✗ ${p.error}`;
     const key = `${body.length}|${p.reasoning.length}|${innerW}|${this.showReasoning}`;
     if (p.cache?.key !== key) {
-      const lines = this.showReasoning && p.reasoning.trim() ? [...layout(p.reasoning.trim(), innerW, p.color, true), []] : [];
-      if (body) lines.push(...layout(body, innerW, p.color));
+      const plain = p.synthesis?.cells;
+      const lines = this.showReasoning && p.reasoning.trim() ? [...layout(p.reasoning.trim(), innerW, p.color, true, plain), []] : [];
+      if (body) lines.push(...layout(body, innerW, p.color, false, plain));
       p.cache = { key, lines };
     }
     const lines = p.cache.lines;

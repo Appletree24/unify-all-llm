@@ -2,18 +2,18 @@ import type { RunRecord } from '../core/store.js';
 import { synthesisFormatter } from '../core/synth.js';
 import type { WorkflowEvent } from '../core/workflow.js';
 
-/** Translate only the human-readable stream. Provider events and saved inputs stay verbatim. */
-export function displaySynthesisEvents(render: (event: WorkflowEvent) => void) {
+/** Keep streamed references intact. A renderer can resolve them itself to attach interactive sources. */
+export function displaySynthesisEvents(render: (event: WorkflowEvent, record: RunRecord) => void, resolveReferences = true) {
   let format: ((text: string) => string) | undefined;
   let labels: string[] = [];
   const pending = { reasoning: '', delta: '' };
   return (event: WorkflowEvent, record: RunRecord) => {
     if (event.type === 'call' && event.scope === 'synthesis') {
-      format = synthesisFormatter(record);
+      format = resolveReferences ? synthesisFormatter(record) : text => text;
       labels = Object.keys(record.synthesis?.labels ?? {});
       pending.reasoning = pending.delta = '';
     }
-    if (event.type !== 'provider' || event.scope !== 'synthesis' || !format) return render(event);
+    if (event.type !== 'provider' || event.scope !== 'synthesis' || !format) return render(event, record);
 
     const part = event.event;
     if (part.type === 'delta' || part.type === 'reasoning') {
@@ -26,15 +26,15 @@ export function displaySynthesisEvents(render: (event: WorkflowEvent) => void) {
         || !!passagePrefix && labels.includes(`[ref:${passagePrefix[1]}]`));
       pending[part.type] = incomplete ? tail : '';
       const ready = incomplete ? text.slice(0, start) : text;
-      if (ready) render({ ...event, event: { type: part.type, text: format(ready) } });
+      if (ready) render({ ...event, event: { type: part.type, text: format(ready) } }, record);
       return;
     }
     if (part.type === 'done' || part.type === 'error') {
       for (const type of ['reasoning', 'delta'] as const) {
-        if (pending[type]) render({ ...event, event: { type, text: pending[type] } });
+        if (pending[type]) render({ ...event, event: { type, text: pending[type] } }, record);
       }
-      if (part.type === 'done') return render({ ...event, event: { ...part, text: format(part.text) } });
+      if (part.type === 'done') return render({ ...event, event: { ...part, text: format(part.text) } }, record);
     }
-    render(event);
+    render(event, record);
   };
 }

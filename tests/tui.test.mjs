@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { App } from '../dist/tui/app.js';
+import { textWidth } from '../dist/tui/screen.js';
 import { listRunIds, loadRun } from '../dist/core/store.js';
 import { QUOTA_REFRESH_MS } from '../dist/quota/index.js';
 import { aborted, deferred, target, workspace } from './helpers.mjs';
@@ -86,6 +87,15 @@ test('TUI rejects duplicate target selection and /exit remains available', async
 
 const type = (app, text) => app.handleKey({ name: 'char', text });
 const screen = (app) => { app.invalidate(); return app.snapshot().join('\n'); };
+
+function clickText(app, label, offset = 0) {
+  const rows = screen(app).split('\n');
+  const y = rows.findIndex(row => row.includes(label));
+  assert.ok(y >= 0, `Missing text ${label}`);
+  const x = textWidth(rows[y].slice(0, rows[y].indexOf(label))) + offset;
+  app.handleKey({ name: 'mousedown', x, y });
+  app.handleKey({ name: 'mouseup', x, y });
+}
 
 test('TUI keeps Gemini Pro approvals inside its pane and preserves a follow-up draft', { timeout: 5000 }, async (t) => {
   let ready = deferred(), requestApproval = deferred();
@@ -261,6 +271,107 @@ test('TUI drags to select rendered text and clicks file references to jump to th
   assert.match(screen(app), /unsent draft/);
   click(3, link);
   assert.match(screen(app), /notes file\.ts:2[\s\S]*› 2 │ MARKDOWN LINK TARGET/);
+});
+
+test('TUI synthesis citations open the originating answer during streaming and after resuming', { timeout: 5000 }, async (t) => {
+  const cwd = workspace(t);
+  const streamed = deferred(), finish = deferred();
+  const gemini = { ...target('gemini', async function* () {
+    const first = ['GEMINI START', ...Array.from({ length: 24 }, (_, i) => `Context ${i}`)].join('\n');
+    yield { type: 'done', text: `${first}\n\n- Second passage\n- GEMINI CITED PASSAGE` };
+  }), model: 'gemini-4-neon-medium' };
+  const codex = { ...target('codex', async function* () { yield { type: 'done', text: 'CODEX CITED PASSAGE' }; }), label: 'Codex' };
+  const judge = target('judge', async function* ({ prompt, signal }) {
+    const geminiRef = /<answer id="([^"]+)"[^>]*>\nGEMINI START/.exec(prompt)[1];
+    const codexRef = /<answer id="([^"]+)"[^>]*>\nCODEX CITED PASSAGE/.exec(prompt)[1];
+    const start = `参见 **${geminiRef.slice(0, -1)}#`;
+    const end = `3]** ${codexRef.slice(0, -1)}#1]。`;
+    yield { type: 'delta', text: start };
+    yield { type: 'delta', text: end };
+    streamed.resolve();
+    await Promise.race([finish.promise, aborted(signal)]);
+    yield { type: 'done', text: start + end };
+  });
+  const makeApp = async () => {
+    const app = new App({ cols: () => 120, rows: () => 22, write() {} }, cwd,
+      { providers: ['gemini', 'codex'], synthesizer: 'judge' }, [gemini, codex, judge]);
+    t.after(() => app.dispose());
+    await app.init();
+    return app;
+  };
+  const live = await makeApp();
+  submit(live, 'Compare');
+  await streamed.promise;
+  type(live, 'follow-up draft');
+  clickText(live, 'gemini-4-neon-medium（第3段）');
+  assert.match(screen(live), /gemini-4-neon-medium · 第3段原文[\s\S]*› • GEMINI CITED PASSAGE/);
+  assert.doesNotMatch(screen(live), /GEMINI START/);
+  live.handleKey({ name: 'esc' });
+  assert.match(screen(live), /gemini-4-neon-medium（第3段） Codex（第1段）[\s\S]*follow-up draft/);
+  finish.resolve();
+  await live.waitForIdle();
+
+  const restored = await makeApp();
+  const { sessionId } = loadRun(cwd, listRunIds(cwd)[0]);
+  submit(restored, `/resume ${sessionId}`);
+  const summary = screen(restored);
+  clickText(restored, 'Codex（第1段）', textWidth('Codex（') + 1);
+  assert.match(screen(restored), /Codex · 第1段原文[\s\S]*› CODEX CITED PASSAGE/);
+  restored.handleKey({ name: 'esc' });
+  assert.equal(screen(restored), summary);
+});
+
+test('TUI opens a cited file from the named repository branch and returns to the cited answer', async (t) => {
+  const cwd = workspace(t);
+  const repo = join(cwd, 'commonapi');
+  mkdirSync(repo);
+  const git = (...args) => execFileSync('git', args, { cwd: repo, stdio: 'pipe', encoding: 'utf8' }).trim();
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.name', 'Unify Test');
+  git('config', 'user.email', 'unify@example.invalid');
+  git('config', 'core.hooksPath', '.unify-test-hooks');
+  git('commit', '--allow-empty', '-qm', 'main');
+  git('switch', '-qc', 'feat/ss_plugin');
+  mkdirSync(join(repo, 'short_article', 'audit'), { recursive: true });
+  writeFileSync(join(repo, 'short_article', 'audit', 'state.go'), 'package audit\nconst BranchSource = 1\n');
+  git('add', 'short_article/audit/state.go');
+  git('commit', '-qm', 'feature');
+  git('switch', '-q', 'main');
+
+  const a = target('a', async function* () {
+    yield { type: 'done', text: '常量定义：`commonapi`（`feat/ss_plugin` 分支）`short_article/audit/state.go:2`，另见 `missing.go`。\n\n另一个版本：`commonapi`（`other` 分支）`short_article/audit/state.go`。' };
+  });
+  const b = target('b', async function* () { yield { type: 'done', text: 'OTHER ANSWER' }; });
+  const judge = target('judge', async function* ({ prompt }) {
+    const ref = /<answer id="([^"]+)"[^>]*>\n常量定义/.exec(prompt)[1];
+    yield { type: 'done', text: `常量来源：\x60commonapi/short_article/audit/state.go:2\x60 ${ref.slice(0, -1)}#1]` };
+  });
+  const app = new App({ cols: () => 120, rows: () => 28, write() {} }, cwd,
+    { providers: ['a', 'b'], synthesizer: 'judge' }, [a, b, judge]);
+  t.after(() => app.dispose());
+  await app.init();
+  submit(app, 'Find the constant');
+  await app.waitForIdle();
+
+  const summary = screen(app);
+  const preview = /commonapi@feat\/ss_plugin · short_article\/audit\/state\.go:2[\s\S]*› 2 │ const BranchSource = 1/;
+  clickText(app, 'commonapi/short_article/audit/state.go:2');
+  assert.match(screen(app), preview);
+  app.handleKey({ name: 'esc' });
+  assert.equal(screen(app), summary);
+
+  clickText(app, 'A（第1段）');
+  const answer = screen(app);
+  clickText(app, 'short_article/audit/state.go:2');
+  assert.match(screen(app), preview);
+  assert.equal(git('branch', '--show-current'), 'main');
+  assert.equal(git('status', '--porcelain'), '');
+  app.handleKey({ name: 'esc' });
+  assert.equal(screen(app), answer);
+  clickText(app, 'missing.go');
+  assert.match(screen(app), /无法预览 missing\.go · 找不到文件/);
+  app.handleKey({ name: 'esc' });
+  assert.equal(screen(app), summary);
 });
 
 function quotaClock(t) {

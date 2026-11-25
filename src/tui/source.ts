@@ -1,6 +1,7 @@
-import { readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { resolve } from 'node:path';
+import { basename, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Key } from './keys.js';
 import { Screen, rgb, textWidth, toCells, truncate, type Cell } from './screen.js';
@@ -9,6 +10,16 @@ export interface SourceReference {
   path: string;
   line?: number;
   column?: number;
+  git?: { repository: string; branch: string };
+}
+
+export const BRANCH_SOURCE = /`[^`\n]+`\s*[（(]\s*`[^`\n]+`\s*分支\s*[）)]\s*`[^`\n]+`/gu;
+
+export function parseBranchSource(text: string) {
+  const [, repository, open, branch, close, file] = text.split('`');
+  const ref = sourceReference(file, true);
+  const reference = ref && { ...ref, git: { repository, branch } };
+  return { repository, open, branch, close, file, reference };
 }
 
 export function sourceReference(value: string, explicit = false): SourceReference | undefined {
@@ -48,6 +59,41 @@ const DIM = rgb(120, 125, 135);
 const ACCENT = rgb(232, 196, 104);
 const MAX_SOURCE_SIZE = 8 * 1024 * 1024;
 
+export function branchRepository(cwd: string, repository: string): string {
+  return resolve(cwd, repository === basename(cwd) && existsSync(resolve(cwd, '.git')) ? '.' : repository);
+}
+
+function readBranchSource(cwd: string, source: NonNullable<SourceReference['git']>, file: string): Buffer {
+  const { repository, branch } = source;
+  const repo = branchRepository(cwd, repository);
+  if (!existsSync(resolve(repo, '.git'))) throw new Error(`找不到本地 Git 仓库 ${repository}`);
+  const path = posix.normalize(file.replace(/\\/g, '/'));
+  if (/^(?:\/|[a-z]:|~\/|\.\.(?:\/|$))/i.test(path)) throw new Error('分支文件需要使用仓库相对路径');
+
+  const git = (args: string[]) => {
+    const result = spawnSync('git', args, {
+      cwd: repo, windowsHide: true, timeout: 3000, maxBuffer: MAX_SOURCE_SIZE,
+      env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
+    });
+    if (result.error && 'code' in result.error && result.error.code === 'ENOBUFS') throw new Error('文件超过 8 MiB');
+    if (result.error) throw new Error(`无法读取 Git 对象 · ${result.error.message}`);
+    return result;
+  };
+  const commit = git(['show-ref', '--verify', '--hash', `refs/heads/${branch}`]);
+  if (commit.status !== 0) throw new Error(`找不到本地分支 ${repository}@${branch}`);
+  const blob = git(['cat-file', 'blob', `${commit.stdout.toString().trim()}:${path}`]);
+  if (blob.status !== 0) throw new Error(`${repository}@${branch} 中没有该文件`);
+  return blob.stdout;
+}
+
+function readLocalSource(cwd: string, file: string): Buffer {
+  const path = /^~[\\/]/.test(file) ? resolve(homedir(), file.slice(2)) : resolve(cwd, file);
+  const stat = statSync(path);
+  if (!stat.isFile()) throw new Error('请选择文本文件');
+  if (stat.size > MAX_SOURCE_SIZE) throw new Error('文件超过 8 MiB');
+  return stat.size ? readFileSync(path) : Buffer.alloc(0);
+}
+
 /** Read-only view of a file referenced in the current conversation. */
 export class SourceView {
   private readonly lines: string[];
@@ -57,11 +103,7 @@ export class SourceView {
   private offset = 0;
 
   constructor(cwd: string, readonly ref: SourceReference) {
-    const path = /^~[\\/]/.test(ref.path) ? resolve(homedir(), ref.path.slice(2)) : resolve(cwd, ref.path);
-    const stat = statSync(path);
-    if (!stat.isFile()) throw new Error('请选择文本文件');
-    if (stat.size > MAX_SOURCE_SIZE) throw new Error('文件超过 8 MiB');
-    const data = stat.size ? readFileSync(path) : Buffer.alloc(0);
+    const data = ref.git ? readBranchSource(cwd, ref.git, ref.path) : readLocalSource(cwd, ref.path);
     if (data.subarray(0, 8192).includes(0)) throw new Error('请选择文本文件');
     this.lines = data.toString('utf8').replace(/\n$/, '').split(/\r?\n/);
     this.target = Math.min((ref.line ?? 1) - 1, this.lines.length - 1);
@@ -87,7 +129,8 @@ export class SourceView {
   draw(s: Screen): void {
     this.page = s.rows - 3;
     this.top = Math.max(0, Math.min(this.top, this.lines.length - this.page));
-    const title = [this.ref.path, this.ref.line && this.target + 1, this.ref.column].filter(Boolean).join(':');
+    const location = [this.ref.path, this.ref.line && this.target + 1, this.ref.column].filter(Boolean).join(':');
+    const title = this.ref.git ? `${this.ref.git.repository}@${this.ref.git.branch} · ${location}` : location;
     s.put(1, 0, truncate(title, s.cols - 2), '1;' + ACCENT);
     const digits = String(this.lines.length).length;
     this.lines.slice(this.top, this.top + this.page).forEach((line, i) => {

@@ -72,7 +72,7 @@ exec 选项:
   providers: ["fast", "gemini-pro"]；concurrency: 3。
   custom 端点和命令仅从用户配置加载，详见 README。
   在 ~/.unify/config.json 中设置 disableClaude: true 可全局禁用 Claude Code，包括版本检测。
-  TUI: /settings /models /quota /synth /cancel [目标] /retry [目标] /exec /new /copy /exit /quit。
+  TUI: /settings /models /quota /synth /cancel [目标] /retry [目标] /exec /new /copy /exit。
 `;
 
 const cwd = process.cwd();

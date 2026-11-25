@@ -48,7 +48,6 @@ export const COMMANDS: CommandSpec[] = [
   { name: 'mouse', detail: '开关鼠标滚动、拖选和路径点击' },
   { name: 'help', detail: '快捷键与命令' },
   { name: 'exit', detail: '退出' },
-  { name: 'quit', detail: '退出' },
 ];
 
 export interface TargetInfo { id: string; label: string; exec: boolean }
