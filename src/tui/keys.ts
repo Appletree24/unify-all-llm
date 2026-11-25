@@ -1,6 +1,6 @@
 export interface Key {
   /** 'char' | 'paste' | 'enter' | 'altenter' | 'backspace' | 'delete' | 'tab' | 'shifttab' | 'esc'
-   *  | 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'pgup' | 'pgdn' | 'ctrl+<letter>'
+   *  | 'up' | 'down' | 'left' | 'right' | 'home' | 'end' | 'pgup' | 'pgdn' | 'ctrl+<letter>' | 'cmd+c'
    *  | 'wordleft' | 'wordright' | 'wordback' | 'worddel'
    *  'altenter' is any modified Enter (Shift, Alt or Ctrl): it inserts a newline. */
   name: string;
@@ -23,9 +23,10 @@ const CSI_TILDE: Record<number, string> = { 1: 'home', 7: 'home', 4: 'end', 8: '
 
 const ALT: Record<string, string> = { b: 'wordleft', f: 'wordright', d: 'worddel', '\x7f': 'wordback', '\b': 'wordback' };
 
-/** A key reported with explicit modifiers (kitty CSI u, xterm modifyOtherKeys). mod: 1 shift, 2 alt, 4 ctrl. */
+/** Explicit modifiers in kitty CSI u or xterm modifyOtherKeys. Bits 1/2/4/8 are Shift/Alt/Ctrl/Super. */
 function modified(code: number, mod: number): Key | undefined {
   if (!Number.isFinite(code)) return undefined;
+  if (mod & 8) return mod === 8 && (code === 99 || code === 67) ? { name: 'cmd+c' } : undefined;
   if (code === 13) return { name: mod ? 'altenter' : 'enter' };
   if (code === 27) return { name: 'esc' };
   if (code === 9) return { name: mod & 1 ? 'shifttab' : 'tab' };
@@ -40,11 +41,11 @@ function modified(code: number, mod: number): Key | undefined {
 /** Turns raw-mode stdin chunks into keys. Bracketed pastes arrive as a single 'paste'. */
 export class KeyParser {
   private paste: string | null = null;
-  private mouseReport = '';
+  private csiPrefix = '';
 
   feed(s: string): Key[] {
-    s = this.mouseReport + s;
-    this.mouseReport = '';
+    s = this.csiPrefix + s;
+    this.csiPrefix = '';
     const out: Key[] = [];
     let i = 0;
     while (i < s.length) {
@@ -78,8 +79,8 @@ export class KeyParser {
           continue;
         }
         const m = /^\x1b(?:\[([0-9;:?<]*)([@-~])|O([A-Z]))/.exec(rest);
-        if (!m && /^\x1b\[<[0-9;]*$/.test(rest)) {
-          this.mouseReport = rest;
+        if (!m && /^\x1b\[[0-9;:?<]*$/.test(rest)) {
+          this.csiPrefix = rest;
           break;
         }
         if (m && m[1]?.startsWith('<')) {
@@ -97,12 +98,13 @@ export class KeyParser {
         if (m) {
           const final = m[2] ?? m[3];
           const params = (m[1] ?? '').split(';').map((p) => parseInt(p, 10));
-          const mod = ((params[1] || 1) - 1) & 7;
+          const mod = ((params[1] || 1) - 1) & 15;
           if (final === 'u' || (final === '~' && params[0] === 27)) {
             const key = modified(final === 'u' ? params[0] : params[2], mod);
             if (key) out.push(key);
           } else {
-            let name = final === '~' ? CSI_TILDE[params[0]] : CSI_LETTER[final];
+            let name: string | undefined = final === '~' ? CSI_TILDE[params[0]] : CSI_LETTER[final];
+            if ((mod & 8) && (name === 'left' || name === 'right')) name = undefined;
             if (mod & 6) name = name === 'left' ? 'wordleft' : name === 'right' ? 'wordright' : name === 'delete' ? 'worddel' : name;
             if (name) out.push({ name });
           }

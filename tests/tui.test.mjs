@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { App } from '../dist/tui/app.js';
 import { textWidth } from '../dist/tui/screen.js';
-import { listRunIds, loadRun } from '../dist/core/store.js';
+import { listRunIds, loadRun, loadRunRecap } from '../dist/core/store.js';
 import { QUOTA_REFRESH_MS } from '../dist/quota/index.js';
 import { aborted, deferred, target, workspace } from './helpers.mjs';
 
@@ -227,7 +227,7 @@ test('TUI lists local branches, switches through /branch, and preserves conflict
   assert.equal(readFileSync(file, 'utf8'), 'local edit\n');
 });
 
-test('TUI drags to select rendered text and clicks file references to jump to their lines', async (t) => {
+for (const [platform, copyKey] of [['darwin', '\x1b[99;9u'], ['win32', '\x03']]) test(`TUI drags to select, copies on ${platform}, and opens file references`, async (t) => {
   const { KeyParser } = await import('../dist/tui/keys.js');
   const cwd = workspace(t);
   writeFileSync(join(cwd, 'jump.ts'), 'first\nsecond\nTARGET LINE\nfourth\n');
@@ -239,7 +239,7 @@ test('TUI drags to select rendered text and clicks file references to jump to th
   const writes = [];
   const copied = [];
   const app = new App({
-    cols: () => 112, rows: () => 30, write: (value) => writes.push(value), setClipboard: (value) => copied.push(value),
+    cols: () => 112, rows: () => 30, platform, write: (value) => writes.push(value), setClipboard: (value) => copied.push(value),
   }, cwd, { providers: ['a', 'b'], synthesizer: 'b' }, [a, b]);
   t.after(() => app.dispose());
   await app.init();
@@ -262,8 +262,11 @@ test('TUI drags to select rendered text and clicks file references to jump to th
   mouse(0, 80, path, 'm');
   assert.match(screen(app), /unsent draft/);
   assert.ok(writes.some(chunk => /\x1b\[(?:[0-9;]+;)?7m/.test(chunk)));
-  app.handleKey({ name: 'ctrl+c' });
+  for (const key of parser.feed(copyKey)) app.handleKey(key);
   assert.deepEqual(copied, ['你好 selected\njump.ts:3']);
+  app.handleKey({ name: 'tab' });
+  for (const key of parser.feed(copyKey)) app.handleKey(key);
+  assert.match(copied[1], /^你好 selected\n`jump\.ts:3`/);
 
   click(3, path);
   assert.match(screen(app), /jump\.ts:3[\s\S]*› 3 │ TARGET LINE/);
@@ -372,6 +375,110 @@ test('TUI opens a cited file from the named repository branch and returns to the
   assert.match(screen(app), /无法预览 missing\.go · 找不到文件/);
   app.handleKey({ name: 'esc' });
   assert.equal(screen(app), summary);
+
+  submit(app, 'Find another constant');
+  await app.waitForIdle();
+  const latest = screen(app);
+  app.handleKey({ name: 'left' });
+  const historical = screen(app);
+  assert.match(historical, /第 1 轮 \(1\/2\)[\s\S]*Find the constant[\s\S]*常量定义[\s\S]*OTHER ANSWER[\s\S]*汇总/);
+  clickText(app, 'commonapi/short_article/audit/state.go:2');
+  assert.match(screen(app), preview);
+  app.handleKey({ name: 'esc' });
+  assert.equal(screen(app), historical);
+  clickText(app, 'A（第1段）');
+  assert.match(screen(app), /第1段原文[\s\S]*常量定义/);
+  app.handleKey({ name: 'esc' });
+  assert.equal(screen(app), historical);
+  app.handleKey({ name: 'right' });
+  assert.equal(screen(app), latest);
+});
+
+test('TUI recaps each completed turn in the background and reloads the latest recap', { timeout: 5000 }, async (t) => {
+  const cwd = workspace(t);
+  const started = deferred(), release = deferred();
+  const recapInputs = [];
+  const answer = target('answer', async function* ({ prompt }) {
+    assert.doesNotMatch(prompt, /回顾已生成/);
+    yield { type: 'done', text: prompt.endsWith('FIRST_TASK') ? 'FIRST_ANSWER' : 'SECOND_ANSWER' };
+  });
+  const summarizer = target('summary', async function* ({ prompt, signal }) {
+    const input = JSON.parse(prompt.split('\n').at(-1));
+    recapInputs.push(input);
+    if (recapInputs.length === 1) {
+      started.resolve();
+      await Promise.race([release.promise, aborted(signal)]);
+    }
+    yield { type: 'done', text: `回顾已生成 ${recapInputs.length}`, usage: { inputTokens: 10, outputTokens: 4 } };
+  });
+  const worker = target('worker', async function* () {
+    yield { type: 'done', text: 'IMPLEMENTED' };
+  }, { askPolicy: 'sandbox-read-only', exec: true });
+  const cfg = { providers: ['answer'], synthesizer: 'summary', executor: 'worker' };
+  const makeApp = async () => {
+    const app = new App({ cols: () => 120, rows: () => 28, write() {} }, cwd, cfg, [answer, summarizer, worker]);
+    t.after(() => app.dispose());
+    await app.init();
+    return app;
+  };
+  const app = await makeApp();
+  submit(app, 'FIRST_TASK');
+  await started.promise;
+  assert.match(screen(app), /回顾 · 正在生成/);
+  submit(app, 'SECOND_TASK');
+  await app.waitForIdle();
+  assert.match(screen(app), /SECOND_ANSWER/);
+  assert.equal(listRunIds(cwd).length, 2);
+  assert.equal(recapInputs.length, 1);
+
+  submit(app, '/exec');
+  type(app, 'y');
+  await app.waitForIdle();
+  const ids = listRunIds(cwd);
+  assert.deepEqual(ids.map(id => loadRun(cwd, id).kind), ['comparison', 'comparison', 'execution']);
+  release.resolve();
+  for (let i = 0; i < 100 && !loadRunRecap(cwd, ids[2]); i++) await delay(10);
+  assert.deepEqual(ids.map(id => loadRunRecap(cwd, id)), ['回顾已生成 1', '回顾已生成 2', '回顾已生成 3']);
+  assert.equal(recapInputs[0].recent[0].answer, 'FIRST_ANSWER');
+  assert.deepEqual(recapInputs[1].recent.map(item => item.answer), ['FIRST_ANSWER', 'SECOND_ANSWER']);
+  assert.equal(recapInputs[2].executionStatus, 'completed');
+  assert.match(recapInputs[2].recent.at(-1).answer, /IMPLEMENTED/);
+  assert.match(screen(app), /回顾 · 回顾已生成 3/);
+  assert.match(screen(app), /↑30 ↓12/);
+
+  const restored = await makeApp();
+  submit(restored, `/resume ${loadRun(cwd, ids[0]).sessionId}`);
+  assert.match(screen(restored), /回顾 · 回顾已生成 3/);
+  assert.equal(recapInputs.length, 3);
+
+  type(restored, 'AC');
+  restored.handleKey({ name: 'left' });
+  type(restored, 'B');
+  restored.handleKey({ name: 'right' });
+  type(restored, 'D');
+  assert.equal(composer(restored), '❯ ABCD');
+  restored.handleKey({ name: 'ctrl+u' });
+  restored.handleKey({ name: 'left' });
+  assert.match(screen(restored), /第 2 轮 \(2\/3\)[\s\S]*SECOND_ANSWER[\s\S]*回顾已生成 2/);
+  restored.handleKey({ name: 'left' });
+  assert.match(screen(restored), /第 1 轮 \(1\/3\)[\s\S]*FIRST_TASK[\s\S]*FIRST_ANSWER[\s\S]*回顾已生成 1/);
+  restored.handleKey({ name: 'right' });
+  assert.match(screen(restored), /第 2 轮 \(2\/3\)[\s\S]*SECOND_ANSWER[\s\S]*回顾已生成 2/);
+  restored.handleKey({ name: 'right' });
+  assert.match(screen(restored), /SECOND_TASK[\s\S]*IMPLEMENTED[\s\S]*回顾 · 回顾已生成 3/);
+  restored.handleKey({ name: 'left' });
+  restored.handleKey({ name: 'left' });
+  restored.handleKey({ name: 'esc' });
+  assert.match(screen(restored), /SECOND_TASK[\s\S]*回顾 · 回顾已生成 3/);
+  assert.equal(recapInputs.length, 3);
+
+  submit(restored, 'THIRD_TASK');
+  await restored.waitForIdle();
+  const followUp = loadRun(cwd, listRunIds(cwd).at(-1));
+  assert.equal(followUp.parentTurnId, ids[2]);
+  assert.match(followUp.input.history.at(-1).answer, /IMPLEMENTED/);
+  restored.handleKey({ name: 'left' });
+  assert.match(screen(restored), /第 2 轮 · 实施[\s\S]*IMPLEMENTED[\s\S]*回顾已生成 3/);
 });
 
 function quotaClock(t) {
@@ -482,6 +589,7 @@ test('key parser understands kitty, modifyOtherKeys and word-motion chords', asy
   const names = (s) => new KeyParser().feed(s).map((k) => k.name);
   assert.deepEqual(names('\x1b[13;2u\x1b[27;2;13~\x1b[13u'), ['altenter', 'altenter', 'enter']);
   assert.deepEqual(names('\x1b[27u\x1b[99;5u\x1b[9;2u\x1b[127;3u'), ['esc', 'ctrl+c', 'shifttab', 'wordback']);
+  assert.deepEqual(names('\x1b[99;9u\x1b[99;73u\x1b[27;9;99~\x1b[120;9u\x1b[1;9D\x03'), ['cmd+c', 'cmd+c', 'cmd+c', 'ctrl+c']);
   assert.deepEqual(names('\x1b[1;5D\x1b[1;3C\x1bb\x1bf\x1b\x7f\x1b[3;5~\x1b[D'), ['wordleft', 'wordright', 'wordleft', 'wordright', 'wordback', 'worddel', 'left']);
   assert.deepEqual(new KeyParser().feed('\x1b[200~a\x1b[13;2ub\x1b[201~'), [{ name: 'paste', text: 'a\x1b[13;2ub' }]);
   const parser = new KeyParser();
@@ -489,6 +597,8 @@ test('key parser understands kitty, modifyOtherKeys and word-motion chords', asy
   assert.deepEqual(parser.feed(';6M\x1b[<0;5;6m\x1b[<65;5;6M'), [
     { name: 'mousedrag', x: 4, y: 5 }, { name: 'mouseup', x: 4, y: 5 }, { name: 'wheeldown', x: 4, y: 5 },
   ]);
+  assert.deepEqual(parser.feed('\x1b[99;'), []);
+  assert.deepEqual(parser.feed('9u'), [{ name: 'cmd+c' }]);
 });
 
 test('editor follows readline conventions across lines and words', async () => {
@@ -740,7 +850,9 @@ test('TUI queues follow-ups while busy, Esc interrupts, and Ctrl+C needs two pre
     yield { type: 'done', text: `re:${q}`, usage: { inputTokens: 1200, outputTokens: 34 } };
   });
   const started2 = deferred();
-  const app = new App({ cols: () => 100, rows: () => 30, write() {} }, cwd, {}, [a]);
+  const recap = target('recap', async function* () { yield { type: 'done', text: '回顾就绪' }; });
+  const app = new App({ cols: () => 100, rows: () => 30, write() {} }, cwd,
+    { providers: ['a'], synthesizer: 'recap' }, [a, recap]);
   t.after(() => app.dispose());
   await app.init();
   let quit = 0;

@@ -3,7 +3,7 @@ import { atomicWrite } from './atomic-write.js';
 import { formatMemoryReferences } from '../memory/report.js';
 import { extractFinalPlan, synthesisFormatter } from './synth.js';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { z } from 'zod';
@@ -156,6 +156,15 @@ export function exportRun(cwd: string, run: RunRecord): void {
   for (const call of run.calls) if (isReviewOrReport(call.scope)) {
     atomicWrite(join(dir, call.scope + '.md'), call.result.text + '\n');
   }
+}
+
+export function saveRunRecap(cwd: string, id: string, text: string): void {
+  atomicWrite(join(runDir(cwd, id), 'recap.md'), text + '\n');
+}
+
+export function loadRunRecap(cwd: string, id: string): string | undefined {
+  try { return readFileSync(join(runDir(cwd, id), 'recap.md'), 'utf8').trim() || undefined; }
+  catch { return undefined; }
 }
 
 export function listRunIds(cwd: string): string[] {

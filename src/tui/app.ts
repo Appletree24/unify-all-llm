@@ -4,14 +4,18 @@ import { homedir } from 'node:os';
 import { basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { currentGitBranch, listGitBranches, switchGitBranch, type GitBranches } from '../core/git-branches.js';
-import { loadConfig, saveRun, type Config, type RunRecord } from '../core/store.js';
+import { loadConfig, loadRunRecap, saveRun, saveRunRecap, type Config, type RunRecord } from '../core/store.js';
+import { timeoutMillis } from '../core/config.js';
 import { graphIssue, graphPlanResult, roleNames } from '../core/collaboration.js';
+import { runOne } from '../core/orchestrator.js';
+import { recapPrompt } from '../core/recap.js';
 import { readSessionRuns, runningStatus, summarizeSessions } from '../core/sessions.js';
 import { InteractionView } from './interaction.js';
+import { HistoryView, historyEntries } from './history.js';
 import { Picker } from './picker.js';
 import { MobileShare, mobileNetworks } from '../mobile/share.js';
 import { ShareView } from './share-view.js';
-import type { ModelTarget, ProviderEvent } from '../core/types.js';
+import type { ModelTarget, ProviderEvent, RunResult } from '../core/types.js';
 import { chooseExecutor, selectPlan, startComparison, startExecution, type WorkflowEvent, type WorkflowHandle } from '../core/workflow.js';
 import { defaultContext } from '../memory/scan.js';
 import { formatMemoryReferences } from '../memory/report.js';
@@ -30,10 +34,10 @@ import { SettingsView, writeSetting } from './settings.js';
 import { ApiView } from './api.js';
 import { Editor } from './editor.js';
 import { KeyParser, type Key } from './keys.js';
-import { layout } from './markdown.js';
+import { layout, wrap } from './markdown.js';
 import { MemoryView } from './memory.js';
 import { QuotaView } from './quota.js';
-import { Screen, charWidth, rgb, textWidth, truncate, type Cell, type Point, type Rect, type TextRange } from './screen.js';
+import { Screen, charWidth, rgb, textWidth, toCells, truncate, type Cell, type Point, type Rect, type TextRange } from './screen.js';
 import { SourceView, type SourceReference } from './source.js';
 
 // ── palette ────────────────────────────────────────────────────────────────
@@ -81,6 +85,7 @@ export interface TuiIO {
   cols(): number;
   rows(): number;
   write(s: string): void;
+  platform?: NodeJS.Platform;
   setMouse?(on: boolean): void;
   setClipboard?(text: string): void;
 }
@@ -97,9 +102,13 @@ export class App {
   private turn = 0;
   private lastRun?: RunRecord;
   private lastExecution?: RunRecord;
+  private recap?: { turnId: string; text: string; style: string };
+  private readonly recapController = new AbortController();
+  private recapWork: Promise<void> = Promise.resolve();
   private active?: WorkflowHandle;
   private graphId?: string;
   private picker?: Picker;
+  private historyView?: HistoryView;
   private share?: MobileShare;
   private shareView?: ShareView;
   private interactions: InteractionView[] = [];
@@ -209,8 +218,9 @@ export class App {
     this.quota?.dispose();
     if (this.ticker) clearInterval(this.ticker);
     this.ctl?.abort();
+    this.recapController.abort();
     this.detecting.abort();
-    await Promise.all([this.active?.done.catch(() => undefined), this.branchOperation, this.modelTests.reset()]);
+    await Promise.all([this.active?.done.catch(() => undefined), this.recapWork, this.branchOperation, this.modelTests.reset()]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 
@@ -249,6 +259,14 @@ export class App {
 
   private adapter(id: string): ModelTarget | undefined {
     return this.all.find((a) => a.id === id);
+  }
+
+  private get platform(): NodeJS.Platform { return this.io.platform ?? process.platform; }
+
+  private get selectionCopyLabel(): string { return this.platform === 'darwin' ? '⌘C' : 'Ctrl+C'; }
+
+  private get answerCopyLabel(): string {
+    return this.platform === 'darwin' ? '⌘C' : this.platform === 'win32' ? 'Ctrl+C' : 'y';
   }
 
   private newPane(targetId: string, kind: Pane['kind'], title: string, color: string): Pane {
@@ -290,7 +308,7 @@ export class App {
 
   // ── flows ────────────────────────────────────────────────────────────────
   private get hasFullScreenView(): boolean {
-    return !!(this.source || this.shareView || this.picker || this.branchView || this.api || this.settings || this.quotaDetails || this.mem);
+    return !!(this.source || this.shareView || this.picker || this.historyView || this.branchView || this.api || this.settings || this.quotaDetails || this.mem);
   }
 
   private get source(): SourceView | AnswerSourceView | undefined {
@@ -383,6 +401,7 @@ export class App {
     } catch (err) {
       this.say(`出错: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
+      this.enqueueRecap(handle.record);
       this.finish();
     }
   }
@@ -431,6 +450,7 @@ export class App {
     this.zoomId = undefined;
     this.begin();
     const ctl = (this.ctl = new AbortController());
+    let execution: RunRecord | undefined;
     this.render();
     try {
       this.active = startExecution({
@@ -445,13 +465,14 @@ export class App {
           if (ev.type === 'provider') this.apply(this.exec!, ev.event);
         },
       });
-      this.lastExecution = this.active.record;
+      this.lastExecution = execution = this.active.record;
       this.share?.update(this.lastExecution);
       this.addUsage(await this.active.done);
       if (pane.status === 'ok' && !source.collaboration?.report) this.say('实施完成，请用 git diff 检查改动', GOLD);
     } catch (err) {
       this.say(`实施失败: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
+      if (execution) this.enqueueRecap(source, execution);
       this.finish();
     }
   }
@@ -502,10 +523,48 @@ export class App {
 
   private addUsage(run: RunRecord): void {
     const supporting = run.calls.filter(c => ['plan-review', 'result-review', 'report', 'dispute-assessment', 'source-check'].includes(c.scope));
-    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...supporting.map(c => c.result)]) {
-      this.tokens.input += r.usage?.inputTokens ?? 0;
-      this.tokens.output += r.usage?.outputTokens ?? 0;
-    }
+    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...supporting.map(c => c.result)]) this.addCallUsage(r);
+  }
+
+  private addCallUsage(result: RunResult): void {
+    this.tokens.input += result.usage?.inputTokens ?? 0;
+    this.tokens.output += result.usage?.outputTokens ?? 0;
+  }
+
+  private enqueueRecap(run: RunRecord, execution?: RunRecord): void {
+    const signal = this.recapController.signal;
+    if (signal.aborted) return;
+    const turn = execution ?? run;
+    const id = [this.cfg.synthesizer ?? 'claude', run.synthesis?.provider, ...run.results.map(r => r.targetId), ...this.selected]
+      .find(id => id && this.installed.get(id));
+    const target = id ? this.adapter(id) : undefined;
+    const show = (text: string, style: string) => {
+      if (signal.aborted || turn.id !== (this.lastExecution ?? this.lastRun)?.id) return;
+      this.recap = { turnId: turn.id, text, style };
+      this.requestRender();
+    };
+    if (!target) return show('没有可用的回顾模型', YELLOW);
+    show('正在生成…', DIM);
+    const timeoutSec = this.cfg.timeoutSec ?? 60;
+    this.recapWork = this.recapWork.then(async () => {
+      if (signal.aborted) return;
+      const result = await runOne(target, {
+        cwd: this.cwd, mode: 'ask', prompt: recapPrompt(run, execution), timeoutMs: timeoutMillis(timeoutSec), signal,
+        cache: { scope: 'recap', turnId: turn.id, sessionId: turn.sessionId },
+      });
+      this.addCallUsage(result);
+      if (signal.aborted) return;
+      if (!result.ok) throw new Error(result.error ?? '模型未返回内容');
+      const chars = Array.from(result.text.replace(/\s+/g, ' ').trim());
+      const text = chars.length > 160 ? chars.slice(0, 159).join('') + '…' : chars.join('');
+      show(text, GOLD);
+      try { saveRunRecap(this.cwd, turn.id, text); }
+      catch (err) {
+        if (turn.id === (this.lastExecution ?? this.lastRun)?.id) {
+          this.say(`回顾保存失败 · ${err instanceof Error ? err.message : String(err)}`, YELLOW);
+        }
+      }
+    }).catch(err => show(`生成失败 · ${err instanceof Error ? err.message : String(err)}`, YELLOW));
   }
 
   private copy(): void {
@@ -521,9 +580,9 @@ export class App {
       return copied();
     }
     const [cmd, args, data]: [string, string[], Buffer] =
-      process.platform === 'win32'
+      this.platform === 'win32'
         ? ['clip', [], Buffer.from('\uFEFF' + text, 'utf16le')]
-        : process.platform === 'darwin'
+        : this.platform === 'darwin'
           ? ['pbcopy', [], Buffer.from(text, 'utf8')]
           : ['xclip', ['-selection', 'clipboard'], Buffer.from(text, 'utf8')];
     const terminalClipboard = () => {
@@ -716,6 +775,9 @@ export class App {
       if (this.share && this.share.id !== last.sessionId) this.stopSharing();
       this.lastRun = last;
       this.lastExecution = execution;
+      const turnId = (execution ?? last).id;
+      const recap = loadRunRecap(this.cwd, turnId);
+      if (recap) this.recap = { turnId, text: recap, style: GOLD };
       this.question = last.question;
       this.turn = comparisons.length;
       this.continueFrom = this.zoomId = this.graphId = undefined;
@@ -729,7 +791,17 @@ export class App {
       const result = stage?.result ?? execution?.results[0];
       this.exec = execution && result ? this.restoredPane(execution, result, 'exec',
         stage?.scope === 'report' ? roleNames.report : stage ? roleNames.audit : roleNames.execution) : undefined;
-      this.say(`已恢复会话 · 第 ${this.turn} 轮 · 可继续追问`, GOLD);
+      const hint = comparisons.length > 1 || execution ? ' · ← 查看上一轮' : '';
+      this.say(`已恢复会话 · 第 ${this.turn} 轮${hint}`, GOLD);
+    } catch (err) { this.say(err instanceof Error ? err.message : String(err), RED); }
+  }
+
+  private openPreviousTurn(): void {
+    const current = this.lastExecution ?? this.lastRun;
+    if (!current) return;
+    try {
+      const earlier = readSessionRuns(this.cwd, current.sessionId).filter(run => run.id < current.id && !runningStatus(run.status));
+      if (earlier.length) this.historyView = new HistoryView(this.cwd, historyEntries(earlier), earlier.length - 1, this.showReasoning);
     } catch (err) { this.say(err instanceof Error ? err.message : String(err), RED); }
   }
 
@@ -891,7 +963,7 @@ export class App {
     } else if (name === 'mouse') {
       this.mouseOn = !this.mouseOn;
       this.io.setMouse?.(this.mouseOn);
-      this.say(this.mouseOn ? '鼠标交互已开启 · 拖选后按 Ctrl+C 复制 · 单击路径查看文件' : '鼠标交互已关闭 · 可用终端原生选区');
+      this.say(this.mouseOn ? `鼠标交互已开启 · 拖选后按 ${this.selectionCopyLabel} 复制 · 单击路径查看文件` : '鼠标交互已关闭 · 可用终端原生选区');
     } else if (name === 'synth') {
       if (!this.installed.get(arg)) return this.say(`"${arg}" 不可用`, RED);
       this.sessionSynth = arg;
@@ -912,7 +984,7 @@ export class App {
     if (this.selection) {
       const { text } = this.selection;
       this.selection = undefined;
-      if (k.name === 'ctrl+c' || k.name === 'ctrl+y') {
+      if (k.name === 'cmd+c' || k.name === 'ctrl+y' || (k.name === 'ctrl+c' && this.platform !== 'darwin')) {
         this.copyText(text, '选中文字');
         return this.requestRender();
       }
@@ -929,7 +1001,8 @@ export class App {
       }
       if (ref) {
         const hit = this.paneAt(point);
-        return this.openSource(ref, hit && this.findPane(hit.id));
+        const history = !this.source && !this.prompt ? this.historyView?.synthesisAt(point.y) : undefined;
+        return this.openSource(ref, history ?? (hit && this.findPane(hit.id)));
       }
     }
     if (k.name === 'ctrl+g' && this.interactions.length) {
@@ -979,6 +1052,12 @@ export class App {
       this.picker.handleKey(k);
       return this.requestRender();
     }
+    if (this.historyView) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      if (k.name === 'esc' || k.name === 'ctrl+c' || (k.name === 'right' && !this.historyView.hasNewerEntry)) this.historyView = undefined;
+      else this.historyView.handleKey(k);
+      return this.requestRender();
+    }
     const branches = this.branchView;
     if (branches) {
       if (k.name === 'ctrl+d') return this.onQuit();
@@ -1026,6 +1105,7 @@ export class App {
     switch (k.name) {
       case 'ctrl+c':
         if (this.busy) this.interrupt();
+        else if (!typing && this.platform === 'win32') this.copy();
         else if (!this.ed.empty) this.ed.clear();
         else if (Date.now() - this.quitArmed < 2000) this.onQuit();
         else {
@@ -1045,6 +1125,13 @@ export class App {
       case 'ctrl+e':
         if (typing && !this.ed.empty) this.ed.end();
         else this.startExec();
+        break;
+      case 'left':
+        if (typing && !this.ed.empty) this.inputKey(k);
+        else this.openPreviousTurn();
+        break;
+      case 'cmd+c':
+        if (!typing || this.ed.empty) this.copy();
         break;
       case 'ctrl+y':
         this.copy();
@@ -1095,19 +1182,19 @@ export class App {
     return item.value !== current;
   }
 
-  private openSource(ref: SourceReference, pane?: Pane): void {
+  private openSource(ref: SourceReference, context?: Pick<Pane, 'text' | 'synthesis'>): void {
     try { this.sources.push(new SourceView(this.cwd, ref)); }
     catch (err) {
       const code = err instanceof Error && 'code' in err ? err.code : undefined;
       const missing = code === 'ENOENT' || code === 'ENOTDIR';
       if (missing && !ref.git) {
-        const cited = pane?.synthesis?.branchSource(this.cwd, pane.text, ref);
+        const cited = context?.synthesis?.branchSource(this.cwd, context.text, ref);
         if (cited) return this.openSource(cited);
       }
       const detail = missing ? '找不到文件'
         : code === 'EACCES' || code === 'EPERM' ? '没有读权限' : String(err instanceof Error ? err.message : err);
       const message = `无法预览 ${ref.path} · ${detail}`;
-      if (!this.source) return this.say(message, YELLOW);
+      if (!this.source && (!this.historyView || this.prompt)) return this.say(message, YELLOW);
       this.sourceError = message;
     }
     this.render();
@@ -1365,8 +1452,9 @@ export class App {
     const s = new Screen(cols, rows);
     this.cursor = null;
     this.rects = [];
-    if (this.source) {
-      this.source.draw(s);
+    const reading = this.source ?? (this.prompt ? undefined : this.historyView);
+    if (reading) {
+      reading.draw(s);
       if (this.sourceError) {
         s.put(0, s.rows - 1, ' '.repeat(s.cols));
         s.put(1, s.rows - 1, truncate(this.sourceError, s.cols - 2), YELLOW);
@@ -1476,6 +1564,15 @@ export class App {
     const st = active ? GOLD : BORDER;
 
     this.drawActivity(s, top);
+    const recap = this.recap?.turnId === (this.lastExecution ?? this.lastRun)?.id ? this.recap : undefined;
+    const recapLines = recap && !this.prompt ? wrap(toCells(`回顾 · ${recap.text}`, recap.style), s.cols - 2) : [];
+    const recapHeight = Math.min(recapLines.length, 3, Math.max(0, top - 5));
+    recapLines.slice(0, recapHeight).forEach((line, i) => {
+      const row = top - recapHeight + i;
+      if (i + 1 === recapHeight && recapHeight < recapLines.length) {
+        s.put(1, row, truncate(line.map(cell => cell.ch).join('') + '…', s.cols - 2), recap?.style);
+      } else s.putCells(1, row, line, s.cols - 1);
+    });
     queued.forEach((q, i) => {
       const more = i === 2 && this.queue.length > 3 ? ` (+${this.queue.length - 3})` : '';
       s.put(1, top + 1 + i, truncate(`↳ 已排队${more}  ${q.replace(/\s+/g, ' ')}`, s.cols - 2), DIM);
@@ -1495,7 +1592,7 @@ export class App {
       s.put(2, y + 1, truncate(hint, inner), DIM);
     }
     if (active) this.cursor = { x: 2 + cx, y: y + 1 + (cy - first) };
-    return h + 3 + queued.length;
+    return h + 3 + queued.length + recapHeight;
   }
 
   /** One line above the composer: confirmation, notice, what is running, or key hints. */
@@ -1522,9 +1619,10 @@ export class App {
     const hints =
       this.focus === 'input'
         ? this.panes.length
-          ? ['Tab 切换面板', 'Ctrl+E 实施', 'Ctrl+Y 复制', 'Ctrl+R 思考', 'Ctrl+N 新对话', '/help 帮助']
+          ? [...(this.turn > 1 || this.lastExecution ? ['← 上一轮'] : []), 'Tab 切换面板', 'Ctrl+E 实施',
+            `${this.selectionCopyLabel} 复制选区`, 'Ctrl+R 思考', 'Ctrl+N 新对话', '/help 帮助']
           : ['Enter 发送', 'Shift+Enter/Ctrl+J 换行', '/quota 套餐余量', '/ 命令', '@ 文件', '/help 帮助']
-        : ['↑↓/滚轮 滚动', 'Enter 放大', 'u 沿此继续', 'b 留题', 'y 复制', 'Ctrl+E 按此实施', 'Esc 返回'];
+        : ['↑↓/滚轮 滚动', 'Enter 放大', 'u 沿此继续', 'b 留题', `${this.answerCopyLabel} 复制`, 'Ctrl+E 按此实施', 'Esc 返回'];
     let x = 1;
     for (const h of hints) {
       if (x + textWidth(h) + 3 > s.cols) break;
@@ -1577,9 +1675,11 @@ export class App {
       ['Enter', '发送；生成中发送会排队，本轮结束后自动发出'],
       ['Shift+Enter / Alt+Enter / Ctrl+J', '换行'],
       ['Esc', '中断本轮（排队的消息放回输入框）'],
-      ['Ctrl+C', '有选区时复制，否则中断本轮或清空输入'],
+      [this.selectionCopyLabel, '复制所选文字'],
+      ['Ctrl+C', '中断本轮或清空输入'],
       ['鼠标', '拖选文字，单击下划线文件路径跳到源码'],
       ['↑ ↓', '多行内移动；到首/末行时翻阅历史'],
+      ['← →', '输入为空时切换会话轮次，有文字时移动光标'],
       ['Ctrl+A/E · Alt+←/→ · Ctrl+W · Ctrl+U/K', '行首/行尾 · 按词移动 · 删词 · 删到行首/行尾'],
       ['@', '模糊搜索并引用项目文件'],
       ['Tab', '接受补全；否则在输入框与各面板间切换'],

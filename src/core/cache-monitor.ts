@@ -16,7 +16,7 @@ export interface CacheBaseline {
 }
 
 export interface CacheContext {
-  scope: CallRecord['scope'] | 'benchmark' | 'distill' | 'model-check';
+  scope: CallRecord['scope'] | 'benchmark' | 'distill' | 'model-check' | 'recap';
   project?: string;
   home?: string;
   turnId?: string;
