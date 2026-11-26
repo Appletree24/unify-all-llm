@@ -1,10 +1,15 @@
 import type { ReasoningEffort } from '../core/config.js';
+import { effortLabel } from './effort.js';
 
 export const isAgyProvider = (provider: string, askPolicy: string) =>
   provider === 'gemini-pro' && askPolicy === 'provider-plan';
 
 const levels = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
-const effortInId = (id?: string) => levels.find(level => id?.endsWith('-' + level));
+export const effortInId = (id?: string) => levels.find(level => id?.endsWith('-' + level));
+export function agyModelFamily(id: string): string {
+  const effort = effortInId(id);
+  return effort ? id.slice(0, -(effort.length + 1)) : id;
+}
 export interface AgyModel {
   id: string;
   family: string;
@@ -19,7 +24,7 @@ export function parseAgyModels(output: string): AgyModel[] {
     if (!row) continue;
     const [, id, name] = row;
     const effort = effortInId(id);
-    const family = effort ? id.slice(0, -(effort.length + 1)) : id;
+    const family = agyModelFamily(id);
     const label = effort ? name.replace(/\s+\((low|medium|high|xhigh|max)\)$/i, '') : name;
     models.set(id, { id, family, effort, label });
   }
@@ -44,8 +49,9 @@ export function modelSettings(
   const option = (value: string, label = value) => ({ value, label });
   if (!catalog) return {
     models: target.models.map(id => option(id)),
-    efforts: target.efforts.length ? [option('default', '默认强度'), ...target.efforts.map(e => option(e))] : [],
+    efforts: target.efforts.length ? [option('default', '默认强度'), ...target.efforts.filter(e => e !== 'none').map(e => option(e))] : [],
     effortField: 'reasoningEffort', effortValue: target.reasoningEffort ?? 'default',
+    storedEffort: target.reasoningEffort && effortLabel(target.reasoningEffort),
   };
 
   const families = new Map<string, AgyModel[]>();

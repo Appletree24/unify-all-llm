@@ -1,4 +1,5 @@
 import type { InteractionResponse, PendingInteraction } from '../core/types.js';
+import { ApprovalSelection } from '../ui/approval.js';
 import { Editor } from './editor.js';
 import type { Key } from './keys.js';
 import { wrap } from './markdown.js';
@@ -14,8 +15,11 @@ export class InteractionView {
   private scroll = 0;
   private pageSize = 1;
   private error = '';
+  private approval?: ApprovalSelection;
 
-  constructor(readonly turnId: string, readonly paneId: string, readonly model: string, readonly request: PendingInteraction) {}
+  constructor(readonly turnId: string, readonly paneId: string, readonly model: string, readonly request: PendingInteraction) {
+    if (request.kind === 'approval') this.approval = new ApprovalSelection(request.options);
+  }
 
   get summary(): string {
     const { kind, detail, tool, title } = this.request;
@@ -28,17 +32,19 @@ export class InteractionView {
     return this.request.kind === 'question' ? this.request.questions?.[this.field] : undefined;
   }
 
-  private get approvals() {
-    return this.request.options?.length ? this.request.options : [{ id: 'accept', label: '允许' }, { id: 'decline', label: '拒绝' }];
-  }
-
   handleKey(key: Key): InteractionResponse | undefined {
     switch (key.name) {
+      case 'pgup': this.scroll = Math.max(0, this.scroll - this.pageSize); return;
+      case 'pgdn': this.scroll += this.pageSize; return;
+      case 'wheelup': this.scroll = Math.max(0, this.scroll - 1); return;
+      case 'wheeldown': this.scroll++; return;
+    }
+    if (this.approval) return this.approval.handleKey(key);
+
+    switch (key.name) {
       case 'esc': return { cancelled: true };
-      case 'pgup': this.scroll = Math.max(0, this.scroll - this.pageSize); break;
-      case 'pgdn': this.scroll += this.pageSize; break;
-      case 'up': case 'wheelup': this.scroll = Math.max(0, this.scroll - 1); break;
-      case 'down': case 'wheeldown': this.scroll++; break;
+      case 'up': this.scroll = Math.max(0, this.scroll - 1); break;
+      case 'down': this.scroll++; break;
       case 'char': case 'paste': this.input.insert(key.text ?? ''); this.error = ''; break;
       case 'backspace': this.input.backspace(); break;
       case 'delete': this.input.del(); break;
@@ -55,12 +61,6 @@ export class InteractionView {
     const text = this.input.text;
     const value = text.trim();
     if (!value) { this.error = '请填写后再提交'; return; }
-    if (this.request.kind === 'approval') {
-      const option = /^[1-9]\d*$/.test(value) ? this.approvals[Number(value) - 1] : undefined;
-      if (option) return { optionId: option.id };
-      this.error = '请输入一个有效的选项编号';
-      return;
-    }
     const q = this.question;
     if (!q) return { text };
     let values: string[];
@@ -92,24 +92,25 @@ export class InteractionView {
   }
 
   draw(s: Screen, x: number, bottom: number, width: number, maxHeight: number, focused: boolean, color: string) {
-    const { request, question: q } = this;
+    const { request, approval, question: q } = this;
     const showTitle = maxHeight >= 4;
     const body: string[] = [];
     const operation = request.detail || request.tool;
     if (operation) body.push(operation);
     if (q) body.push(`${this.field + 1}/${request.questions!.length} ${q.header ?? ''} ${q.question}`);
     if (!showTitle && !body.length) body.push(request.title);
-    const choices = request.kind === 'approval' ? this.approvals : q?.options;
+    const choices = q?.options;
     if (choices && !this.other) {
-      const labels = choices.map((o, i) => `${i + 1}. ${o.label}${o.description ? ' — ' + o.description : ''}`);
-      if (request.kind === 'approval' && !choices.some(o => o.description)) body.push(labels.join('   '));
-      else body.push(...labels);
+      body.push(...choices.map((o, i) => `${i + 1}. ${o.label}${o.description ? ' — ' + o.description : ''}`));
       if (q?.allowOther) body.push('0. 自定义回答');
     }
     const lines = body.flatMap(block => block.split('\n').flatMap(line => wrap(sourceCells(line, ''), width)));
-    this.pageSize = Math.min(lines.length, maxHeight - (showTitle ? 2 : 1));
+    const footer = !approval || !focused;
+    const room = maxHeight - Number(showTitle) - Number(footer);
+    const options = approval?.rows(Math.max(Number(focused), room - Number(lines.length > 0))) ?? [];
+    this.pageSize = Math.min(lines.length, room - options.length);
     this.scroll = Math.min(this.scroll, Math.max(0, lines.length - this.pageSize));
-    const top = bottom - this.pageSize - (showTitle ? 2 : 1);
+    const top = bottom - this.pageSize - options.length - Number(showTitle) - Number(footer);
     const inputY = bottom - 1;
     if (showTitle) {
       const position = lines.length > this.pageSize ? ` ${this.scroll + this.pageSize}/${lines.length}` : '';
@@ -117,11 +118,16 @@ export class InteractionView {
       s.put(x, top, truncate(` ${request.title} `, width - textWidth(position)), `1;${color}`);
       s.put(x + width - textWidth(position), top, position, color);
     }
-    lines.slice(this.scroll, this.scroll + this.pageSize).forEach((line, i) => s.putCells(x, top + Number(showTitle) + i, line, x + width));
+    const bodyY = top + Number(showTitle);
+    lines.slice(this.scroll, this.scroll + this.pageSize).forEach((line, i) => s.putCells(x, bodyY + i, line, x + width));
+    options.forEach(({ text, selected }, i) => {
+      s.put(x, bodyY + this.pageSize + i, truncate(text, width), focused && selected ? '1;7' : '');
+    });
     if (!focused) {
       s.put(x, inputY, 'Ctrl+G 回答', color);
       return { top };
     }
+    if (approval) return { top };
     const hint = this.other ? '输入自定义回答' : choices ? (q?.multiSelect ? '输入编号，可用空格多选' : '输入选项编号') : request.placeholder || '输入回答';
     const secret = request.secret || q?.secret;
     const chars = this.input.chars.map(ch => secret ? '•' : ch === '\n' ? '↵' : ch);
@@ -134,5 +140,9 @@ export class InteractionView {
     return { top, cursor: { x: x + 2 + used, y: inputY } };
   }
 
-  get inputError(): string { return this.error; }
+  get keyHint(): string {
+    return this.error || (this.approval
+      ? '↑↓ 选择 · Enter 确认 · Esc 取消 · PgUp/PgDn 详情 · Tab 返回'
+      : 'Enter 提交 · Esc 取消 · ↑↓ 详情 · Tab 返回');
+  }
 }

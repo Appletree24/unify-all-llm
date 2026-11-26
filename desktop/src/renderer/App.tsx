@@ -228,6 +228,10 @@ export function App() {
   };
 
   const toggleTarget = (id: string) => {
+    if (composer.routing === 'single') {
+      changeComposerSelection({ ...composerSelection, selected: composer.manual && composer.selected[0] === id ? undefined : [id] });
+      return;
+    }
     const selected = composerSelection?.selected ?? composer.selected;
     changeComposerSelection({
       ...composerSelection,
@@ -299,6 +303,12 @@ export function App() {
   const graphControls = {
     revision: revision?.collaboration,
     onGraph: (graph?: string) => { setRevisionId(undefined); changeComposerSelection({ ...composerSelection, graph }); },
+    onRouting: (routing: ComposerState['routing']) => {
+      setRevisionId(undefined);
+      if (composer.graph || revision || routing !== composer.routing) {
+        changeComposerSelection({ ...composerSelection, graph: undefined, routing, selected: undefined });
+      }
+    },
     editGraph: () => { setSettingsGraph(composer.graph ?? ''); setView('settings'); },
   };
   const liveSessions = useMemo(() => new Set(Object.values(records).filter(isActive).map((r) => r.sessionId)), [records]);
@@ -327,7 +337,7 @@ export function App() {
     try {
       const reviseTurn = source?.collaboration ? source.id : revision?.id;
       const ids = await unify.ask(cwd, {
-        question, selected: composer.selected, manual: composerSelection?.selected !== undefined, graph: composer.graph, reviseTurn,
+        question, selected: composer.selected, manual: composer.manual, routing: composer.routing, graph: composer.graph, reviseTurn,
         synthesize: composer.synth !== 'off', synthesizer: composer.synth && composer.synth !== 'off' ? composer.synth : undefined,
         sessionId: current ?? undefined,
         expectedTurnId: turns.at(-1)?.id,
@@ -363,6 +373,10 @@ export function App() {
     },
     retry: (turnId, targetIds) => {
       unify.retry(cwd!, turnId, targetIds).then(() => { refreshSessions(cwd); }, (err) => notify(errText(err), 'err'));
+    },
+    supplement: (turnId, action) => {
+      const synthesizer = composer.synth && composer.synth !== 'off' ? composer.synth : undefined;
+      void unify.supplement(cwd!, turnId, action, synthesizer).then(() => refreshSessions(cwd), err => notify(errText(err), 'err'));
     },
     cancel: (turnId) => { void unify.cancel(cwd!, turnId); },
     cancelTarget: (turnId, targetId) => { void unify.cancelTarget(cwd!, turnId, targetId); },

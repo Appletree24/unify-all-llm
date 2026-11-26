@@ -4,9 +4,18 @@ import type { ModelTarget } from '../core/types.js';
 const standard = ['low', 'medium', 'high'] as const;
 const budgets = { low: 1024, medium: 4096, high: 8192 };
 
-export function effortChoices({ adapter, model }: ModelTarget): readonly ReasoningEffort[] {
+export function effortLabel(effort: string, prefix = ''): string {
+  return effort === 'none' ? '已关闭额外推理' : prefix + effort;
+}
+
+export function effortChoices({ adapter, model, supportedEfforts, reasoningEffort }: ModelTarget, declaredOnly = false): readonly ReasoningEffort[] {
+  if (supportedEfforts) return supportedEfforts;
   const config = adapter.configuration;
-  if (!config && adapter.id === 'codex') return [...standard, 'xhigh'];
+  if (!config && adapter.id === 'codex') {
+    // With an inherited or uncatalogued model, Codex can validate an explicit override itself.
+    if (!declaredOnly) return [...standard, 'xhigh', 'max', 'ultra'];
+    return reasoningEffort === 'max' || reasoningEffort === 'ultra' ? [...standard, 'xhigh', reasoningEffort] : [...standard, 'xhigh'];
+  }
   if (!config && adapter.id === 'claude') return [...standard, 'xhigh', 'max'];
   if (config?.type !== 'openai') return [];
   const host = new URL(config.baseUrl).hostname;
@@ -23,6 +32,9 @@ export function effortChoices({ adapter, model }: ModelTarget): readonly Reasoni
     if (/^gpt-5(?:$|-(?:mini|nano|20))/.test(name)) return ['minimal', ...standard];
     return ['none', ...standard, 'xhigh'];
   }
+  if (config.supportedEfforts) return config.supportedEfforts;
+  // Keep manual setup available on compatible gateways; automatic routing needs a declared or configured level.
+  if (declaredOnly) return reasoningEffort ? [reasoningEffort] : [];
   return ['minimal', ...standard, 'xhigh'];
 }
 

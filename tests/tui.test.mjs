@@ -7,6 +7,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { App } from '../dist/tui/app.js';
 import { textWidth } from '../dist/tui/screen.js';
 import { listRunIds, loadRun, loadRunRecap } from '../dist/core/store.js';
+import { loadConfig } from '../dist/core/config.js';
+import { buildRegistry } from '../dist/providers/index.js';
 import { QUOTA_REFRESH_MS } from '../dist/quota/index.js';
 import { aborted, deferred, target, workspace } from './helpers.mjs';
 
@@ -16,6 +18,95 @@ function submit(app, text) {
   app.handleKey({ name: 'paste', text });
   app.handleKey({ name: 'enter' });
 }
+
+test('TUI settings saves the answer mode and runs the current turn actions', async (t) => {
+  const cwd = workspace(t);
+  const home = workspace(t);
+  const savedHome = process.env[homeEnv];
+  process.env[homeEnv] = home;
+  t.after(() => {
+    if (savedHome === undefined) delete process.env[homeEnv];
+    else process.env[homeEnv] = savedHome;
+  });
+  const command = (label, text) => ({ type: 'command', label, command: process.execPath, args: ['-e',
+    `require('node:fs').appendFileSync('calls.log', ${JSON.stringify(label + '\n')}); console.log(${JSON.stringify(text)})`,
+  ] });
+  mkdirSync(join(home, '.unify'));
+  writeFileSync(join(home, '.unify', 'config.json'), JSON.stringify({
+    disableClaude: true, custom: { a: command('Alpha', '首答'), b: command('Beta', '独立意见') },
+  }));
+  writeFileSync(join(cwd, 'unify.config.json'), JSON.stringify({ providers: ['a', 'b'], synthesizer: 'a' }));
+  const cfg = loadConfig(cwd);
+  const app = new App({ cols: () => 140, rows: () => 40, write() {} }, cwd,
+    cfg, Object.values(buildRegistry(cfg)).filter(model => ['a', 'b'].includes(model.id)));
+  t.after(() => app.dispose());
+  await app.init();
+  const openRoutingSettings = () => {
+    submit(app, '/settings');
+    clickText(app, '回答、汇总与执行');
+  };
+  for (const command of ['/mode single', '/opinion', '/synthesize']) {
+    submit(app, command);
+    assert.match(screen(app), /未知命令/);
+  }
+  openRoutingSettings();
+  clickText(app, '问答模式');
+  clickText(app, '单模型');
+  assert.equal(loadConfig(cwd).routing, 'single');
+  app.handleKey({ name: 'esc' });
+  app.handleKey({ name: 'esc' });
+  submit(app, '一句话解释');
+  await app.waitForIdle();
+  await delay(20);
+  const requests = () => readFileSync(join(cwd, 'calls.log'), 'utf8').trim().split('\n');
+  assert.deepEqual(requests(), ['Alpha']);
+  openRoutingSettings();
+  clickText(app, '追加一个独立意见');
+  clickText(app, 'Beta');
+  await app.waitForIdle();
+  assert.doesNotMatch(loadRun(cwd).calls[0].input.prompt, /首答/);
+  openRoutingSettings();
+  clickText(app, '汇总已有回答');
+  await app.waitForIdle();
+  assert.deepEqual(requests(), ['Alpha', 'Beta', 'Alpha']);
+  assert.match(loadRun(cwd).calls[0].input.prompt, /独立意见/);
+  assert.equal(loadRun(cwd).synthesis.result.ok, true);
+  openRoutingSettings();
+  clickText(app, '问答模式');
+  clickText(app, '自动');
+  app.handleKey({ name: 'esc' });
+  app.handleKey({ name: 'esc' });
+  submit(app, '只让 Beta 回答，解释 Alpha 的含义');
+  await app.waitForIdle();
+  assert.deepEqual(requests(), ['Alpha', 'Beta', 'Alpha', 'Beta']);
+  assert.equal(loadRun(cwd).routing.kind, 'direct');
+  submit(app, '让 Alpha 和 Beta 分别回答，只看原答');
+  await app.waitForIdle();
+  await app.recapWork;
+  assert.deepEqual(requests().slice(4).sort(), ['Alpha', 'Beta']);
+  assert.equal(loadRun(cwd).synthesis, undefined);
+  submit(app, '/settings');
+  clickText(app, '模型与思考强度');
+  clickText(app, '回答模型');
+  clickText(app, 'Beta（b）');
+  clickText(app, '回答思考强度');
+  assert.doesNotMatch(screen(app), /\bnone\b/i);
+  clickText(app, '自动（按本轮要求）');
+  assert.equal(loadConfig(cwd).answerModel, 'b');
+  assert.equal(loadConfig(cwd).answerEffort, 'auto');
+  app.handleKey({ name: 'esc' });
+  app.handleKey({ name: 'esc' });
+  submit(app, '只让 Alpha 回答。请深入分析');
+  await app.waitForIdle();
+  const pinned = loadRun(cwd);
+  assert.deepEqual(pinned.calls.map(c => c.target.id), ['b']);
+  assert.equal(pinned.routing.modelPolicy, 'fixed');
+  assert.match(pinned.routing.answers[0].reason, /沿用原生设置/);
+  openRoutingSettings();
+  clickText(app, '顾问复核');
+  clickText(app, '关闭');
+  assert.equal(loadConfig(cwd).advisor, 'off');
+});
 
 test('TUI cancellation followed by focused execution uses the visible turn and persists it', async (t) => {
   const cwd = workspace(t);
@@ -161,6 +252,36 @@ function clickText(app, label, offset = 0) {
   app.handleKey({ name: 'mouseup', x, y });
 }
 
+test('TUI lets an existing none setting switch to default without marking default as already active', async t => {
+  const cwd = workspace(t);
+  const savedHome = process.env[homeEnv];
+  process.env[homeEnv] = workspace(t);
+  t.after(() => {
+    if (savedHome === undefined) delete process.env[homeEnv];
+    else process.env[homeEnv] = savedHome;
+  });
+  const cfg = { answerEffort: 'none', reasoningEffort: { deepseek: 'none' } };
+  writeFileSync(join(cwd, 'unify.config.json'), JSON.stringify(cfg));
+  const app = new App({ cols: () => 140, rows: () => 40, write() {} }, cwd, cfg, [buildRegistry(cfg).deepseek]);
+  t.after(() => app.dispose());
+  submit(app, '/settings');
+  clickText(app, '模型与思考强度');
+  assert.match(screen(app), /回答思考强度[^\n]*已关闭额外推理/);
+  clickText(app, '回答思考强度');
+  assert.doesNotMatch(screen(app), /\bnone\b|● 当前/i);
+  clickText(app, '原生默认');
+  assert.equal(loadConfig(cwd).answerEffort, 'default');
+  clickText(app, 'deepseek');
+  assert.match(screen(app), /思考强度[^\n]*已关闭额外推理/);
+  // The model settings page also mentions effort in its heading. Select the actual second row.
+  app.handleKey({ name: 'down' });
+  app.handleKey({ name: 'enter' });
+  assert.doesNotMatch(screen(app), /\bnone\b|● 当前/i);
+  assert.match(screen(app), /思考强度 · deepseek/);
+  app.handleKey({ name: 'enter' });
+  assert.equal(loadConfig(cwd).reasoningEffort.deepseek, 'default');
+});
+
 test('TUI keeps Gemini Pro approvals inside its pane and preserves a follow-up draft', { timeout: 5000 }, async (t) => {
   let ready = deferred(), requestApproval = deferred();
   let cols = 100, rows = 22;
@@ -183,7 +304,7 @@ test('TUI keeps Gemini Pro approvals inside its pane and preserves a follow-up d
     yield { type: 'delta', text: 'GEMINI PROGRESS' };
     await requestApproval.promise;
     const response = req.interact({
-      kind: 'approval', title: 'Gemini Pro 请求权限确认', tool: 'run_command', detail: 'node -p 1+1',
+      kind: 'approval', title: 'Gemini Pro 请求权限确认', tool: 'run_command', detail: 'node -p 1+1\n执行目录：项目根目录',
       options: [{ id: 'allow', label: 'Allow' }, { id: 'deny', label: 'Deny' }],
     });
     ready.resolve();
@@ -205,16 +326,24 @@ test('TUI keeps Gemini Pro approvals inside its pane and preserves a follow-up d
   const approvalRow = initial.findIndex(line => line.includes('node -p 1+1'));
   assert.ok(outputRow >= 0 && approvalRow > outputRow);
   assert.ok(initial[approvalRow].indexOf('node -p 1+1') >= cols / 2);
-  assert.match(initial.join('\n'), /ALPHA OUTPUT[\s\S]*Gemini Pro 请求权限确认[\s\S]*1\. Allow\s+2\. Deny[\s\S]*Enter 提交/);
+  const allowRow = initial.findIndex(line => line.includes('Allow'));
+  assert.ok(allowRow > approvalRow);
+  assert.match(initial[allowRow + 1], /❯ Deny/);
+  assert.match(initial.join('\n'), /↑↓ 选择 · Enter 确认/);
 
   requestPeerApproval.resolve();
   await peerReady.promise;
   assert.match(screen(app), /read alpha\.txt[\s\S]*node -p 1\+1[\s\S]*Ctrl\+G 下一项/);
   app.handleKey({ name: 'ctrl+g' });
-  type(app, '2');
+  app.handleKey({ name: 'up' });
+  assert.match(screen(app), /❯ 允许/);
+  app.handleKey({ name: 'down' });
+  type(app, '1');
+  assert.match(screen(app), /❯ 拒绝/);
   app.handleKey({ name: 'enter' });
   assert.deepEqual(await peerDecision.promise, { optionId: 'decline' });
-  type(app, '1');
+  app.handleKey({ name: 'up' });
+  assert.match(screen(app), /❯ Allow/);
   app.handleKey({ name: 'enter' });
   await app.waitForIdle();
   assert.match(screen(app), /DECISION allow/);
@@ -227,7 +356,8 @@ test('TUI keeps Gemini Pro approvals inside its pane and preserves a follow-up d
   await ready.promise;
   assert.match(screen(app), /Gemini Pro 请求权限确认[\s\S]*Ctrl\+G 回答[\s\S]*follow-up draft/);
   app.handleKey({ name: 'ctrl+g' });
-  assert.match(screen(app), /Gemini Pro 请求权限确认[\s\S]*输入选项编号[\s\S]*follow-up draft/);
+  assert.match(screen(app), /Gemini Pro 请求权限确认[\s\S]*❯ Deny[\s\S]*↑↓ 选择[\s\S]*follow-up draft/);
+  app.handleKey({ name: 'up' });
   app.handleKey({ name: 'tab' });
   type(app, ' kept');
   assert.match(screen(app), /Ctrl\+G 回答[\s\S]*follow-up draft kept/);
@@ -235,9 +365,9 @@ test('TUI keeps Gemini Pro approvals inside its pane and preserves a follow-up d
   cols = 45;
   rows = 12;
   app.handleKey({ name: 'ctrl+g' });
-  assert.match(screen(app), /Gemini Pro[\s\S]*GEMINI PROGRESS[\s\S]*node -p 1\+1[\s\S]*follow-up draft kept/);
+  assert.match(screen(app), /Gemini Pro[\s\S]*GEMINI PROGRESS[\s\S]*node -p 1\+1[\s\S]*❯ Allow[\s\S]*follow-up draft kept/);
   app.handleKey({ name: 'pgdn' });
-  assert.match(screen(app), /1\. Allow\s+2\. Deny/);
+  assert.match(screen(app), /执行目录：项目根目录[\s\S]*❯ Allow/);
   app.handleKey({ name: 'esc' });
   await app.waitForIdle();
   cols = 100;
@@ -848,8 +978,9 @@ test('official API setup masks credentials, selects DeepSeek immediately, and su
   assert.equal(JSON.parse(readFileSync(cwd + '/unify.config.json')).models.deepseek, 'deepseek-flash');
   press('down');
   press('enter'); // effort levels
-  assert.match(screen(app), /默认（由模型决定）[\s\S]*none[\s\S]*low[\s\S]*high[\s\S]*max/);
-  for (const name of ['down', 'down', 'down', 'enter', 'esc', 'esc', 'esc']) press(name);
+  assert.match(screen(app), /默认强度[\s\S]*low[\s\S]*high[\s\S]*max/);
+  assert.doesNotMatch(screen(app), /\bnone\b/i);
+  for (const name of ['down', 'down', 'enter', 'esc', 'esc', 'esc']) press(name);
   const persisted = JSON.parse(readFileSync(cwd + '/unify.config.json'));
   assert.deepEqual(persisted.reasoningEffort, { deepseek: 'high' });
   assert.equal(buildRegistry(persisted).pro.reasoningEffort, undefined);

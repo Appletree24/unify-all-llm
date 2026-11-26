@@ -1,3 +1,4 @@
+import type { HarnessPool } from './harness-pool.js';
 import { randomUUID } from 'node:crypto';
 import { collectMemoryReport } from '../memory/report.js';
 import type { NativeConversation } from './native-conversation.js';
@@ -5,6 +6,8 @@ import { monitorCache, type CacheContext } from './cache-monitor.js';
 import { appendToolUse, type ChatMessage, type InteractionHandler, type InteractionRequest, type InteractionResponse, type ModelTarget, type ProviderEvent, type RunMode, type RunResult } from './types.js';
 
 export interface RunOptions {
+  harnesses?: HarnessPool;
+  sessionId?: string;
   prompt: string;
   messages?: ChatMessage[];
   memoryReportMarker?: string;
@@ -83,7 +86,7 @@ export async function runOne(target: ModelTarget, opts: RunOptions): Promise<Run
       if (ctl.signal.aborted) return;
       if (opts.mode === 'exec' && !target.adapter.capabilities.exec) throw new Error(`${target.label} 不支持实施`);
       const request = {
-        prompt: opts.prompt,
+        prompt: opts.prompt, harnesses: opts.harnesses, sessionId: opts.sessionId,
         conversation: opts.conversation?.request,
         ...(opts.messages ? { messages: opts.messages } : {}),
         cwd: opts.cwd, mode: opts.mode, model: target.model, reasoningEffort: target.reasoningEffort, signal: ctl.signal,

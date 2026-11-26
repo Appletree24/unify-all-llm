@@ -2,12 +2,15 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseConfig, readJson, type Config } from '../core/config.js';
 import { projectConfigPath, userField, writeSetting, type SettingField } from '../core/settings.js';
+import { canAdvise } from '../core/advisor.js';
+import { answerMode, answerEffortLabels, routingLabels, sameModel, supplementActions, supplementLabels, type SupplementAction } from '../core/routing.js';
+import type { RunRecord } from '../core/store.js';
 import type { ModelTarget } from '../core/types.js';
 import type { ModelTests } from '../core/model-tests.js';
 import { isAgyProvider, modelSettings, type AgyModel } from '../providers/agy-models.js';
 import { readAgyModels, targetModelIds } from '../providers/models.js';
 import { officialApis, readApiProfile } from '../providers/official.js';
-import { effortChoices } from '../providers/effort.js';
+import { effortChoices, effortLabel } from '../providers/effort.js';
 import { Editor } from './editor.js';
 import type { Key } from './keys.js';
 import { Screen, rgb, truncate, textWidth, toCells } from './screen.js';
@@ -43,6 +46,8 @@ interface SettingsState {
   selected: string[];
   showReasoning: boolean;
   mouse: boolean;
+  installed: ReadonlyMap<string, boolean>;
+  currentTurn?: RunRecord;
 }
 
 interface PreviewLine {
@@ -127,6 +132,7 @@ export class SettingsView {
     private tests: ModelTests,
     private state: () => SettingsState,
     private save: (field: Field, value: unknown, entry?: string) => void,
+    private supplement: (action: SupplementAction, targetId?: string) => void,
     private api: () => void,
     private close: () => void,
     private redraw: () => void,
@@ -188,10 +194,10 @@ export class SettingsView {
         summary: '为每个目标单独指定模型与思考档位，并可即时测试连通性与可用性。',
         preview: () => targets.slice(0, 8).map(t => ({
           label: t.id,
-          text: [t.model ?? '默认模型', t.reasoningEffort ? `思考 ${t.reasoningEffort}` : ''].filter(Boolean).join(' · '),
+          text: [t.model ?? '默认模型', t.reasoningEffort && effortLabel(t.reasoningEffort, '思考 ')].filter(Boolean).join(' · '),
           style: targetColor(t),
         })),
-        open: () => this.page('模型与思考强度', '选择目标以覆盖模型、思考强度或运行即时可用性测试', () => this.targetRows()),
+        open: () => this.page('模型与思考强度', '选择目标以覆盖模型、思考强度或运行即时可用性测试', () => [...this.targetRows(), ...this.answerPolicyRows()]),
       },
       {
         label: '回答、汇总与执行',
@@ -265,12 +271,33 @@ export class SettingsView {
     ];
   }
 
+  private answerPolicyRows(): Row[] {
+    const { cfg, targets } = this.state();
+    const picker = (key: 'answerModel' | 'answerEffort', title: string, summary: string,
+      choices: { value: string | null; label: string }[], current: string | null): Row => {
+      const selected = choices.findIndex(c => c.value === current);
+      const value = choices[selected]?.label ?? (key === 'answerEffort' ? effortLabel(current ?? '') : current ?? '');
+      return { label: title, value, scope: 'project', chevron: true, summary,
+        open: () => this.page(title, summary, () => choices.map((choice, i) => ({
+          label: choice.label, value: i === selected ? '● 当前' : '',
+          open: () => { this.save(key, choice.value); this.pages.pop(); },
+        })), Math.max(0, selected)) };
+    };
+    return [
+      picker('answerModel', '回答模型', '自动跟随问答模式，也可锁定一个回答目标。', [
+        { value: null, label: '自动' }, ...targets.map(t => ({ value: t.id, label: t.label === t.id ? t.id : `${t.label}（${t.id}）` })),
+      ], cfg.answerModel ?? null),
+      picker('answerEffort', '回答思考强度', '仅用于回答。自动按本轮明确的深度或速度要求调档。',
+        Object.entries(answerEffortLabels).map(([value, label]) => ({ value, label })), cfg.answerEffort ?? 'target'),
+    ];
+  }
+
   private targetRows(): Row[] {
     const { targets } = this.state();
     return targets.map(t => {
       const agy = isAgyProvider(t.adapter.id, t.adapter.capabilities.askPolicy);
       const test = this.tests.state(t);
-      const val = agy ? (t.model ?? '默认') : (t.reasoningEffort ?? '默认');
+      const val = agy ? (t.model ?? '默认') : effortLabel(t.reasoningEffort ?? '默认');
       return {
         label: t.id,
         value: val,
@@ -283,7 +310,7 @@ export class SettingsView {
           { label: '目标 ID', text: t.id, style: targetColor(t) },
           { label: '适配器', text: t.adapter.id },
           { label: '当前模型', text: t.model ?? '默认' },
-          { label: '思考强度', text: t.reasoningEffort ?? '默认' },
+          { label: '思考强度', text: effortLabel(t.reasoningEffort ?? '默认') },
           { label: '能力', text: t.adapter.capabilities.exec ? '问答 · 支持实施' : '仅问答', style: DIM },
           ...(test ? [{
             label: '最近测试',
@@ -369,7 +396,7 @@ export class SettingsView {
         ],
         open: () => {
           if (!options.efforts.length) return;
-          const selected = Math.max(0, options.efforts.findIndex(e => e.value === options.effortValue));
+          const selected = options.efforts.findIndex(e => e.value === options.effortValue);
           this.page('思考强度 · ' + id, '选择推理强度档位，立即写入当前项目配置', () => options.efforts.map((effort, index) => ({
             label: effort.label,
             value: index === selected ? '● 当前' : '',
@@ -377,7 +404,7 @@ export class SettingsView {
             scope: 'project' as const,
             summary: `将 ${id} 的思考强度设置为「${effort.label}」。`,
             open: () => { this.save(options.effortField, effort.value, id); this.pages.pop(); },
-          })), selected);
+          })), Math.max(0, selected));
         },
       },
       {
@@ -448,7 +475,7 @@ export class SettingsView {
   }
 
   private routing(): Row[] {
-    const { cfg, targets } = this.state();
+    const { cfg, currentTurn, installed, targets } = this.state();
     const rows: Row[] = [{
       label: '默认回答目标',
       value: cfg.providers?.join(', ') ?? '自动',
@@ -493,6 +520,57 @@ export class SettingsView {
           })), current);
         },
       });
+    }
+    const current = answerMode(cfg);
+    const modes = ['auto', 'single', 'multi', 'standard'] as const;
+    const details = {
+      auto: '可直接点名模型。查项目优先用能读仓库的模型，选方案时按需比较。',
+      single: '由一个模型回答。',
+      multi: '并行调用选定的回答目标。',
+      standard: '使用默认回答目标和已配置的决策模型。',
+    } as const;
+    rows.push({
+      label: '问答模式', value: routingLabels[current], scope: 'project', chevron: true,
+      summary: '为项目选择默认问答模式。',
+      open: () => this.page('问答模式', '选择后保存为项目默认设置', () => modes.map(mode => ({
+        label: routingLabels[mode], value: mode === current ? '● 当前' : '', valueStyle: GOLD,
+        scope: 'project' as const, summary: details[mode],
+        open: () => {
+          this.save('routing', mode);
+          this.pages.pop();
+          this.message = '✓ 已保存';
+          this.messageKind = 'ok';
+        },
+      })), modes.indexOf(current)),
+    });
+    const advisors = [{ id: 'auto', label: '自动选择' }, { id: 'off', label: '关闭' },
+      ...targets.filter(t => canAdvise(t) && !['auto', 'off'].includes(t.id)).map(t => ({ id: t.id, label: t.label }))];
+    const advisor = cfg.advisor ?? 'auto';
+    rows.push({ label: '顾问复核', value: advisors.find(a => a.id === advisor)?.label ?? advisor, scope: 'project', chevron: true,
+      summary: '自动问答出现关键疑点或完成声明时，由独立顾问核对证据。',
+      open: () => this.page('顾问复核', '为当前项目选择复核方式', () => advisors.map(a => ({
+        label: a.label, value: a.id === advisor ? '● 当前' : '', scope: 'project' as const,
+        open: () => { this.save('advisor', a.id); this.pages.pop(); },
+      })), Math.max(0, advisors.findIndex(a => a.id === advisor))) });
+    if (!currentTurn) return rows;
+    for (const action of supplementActions(currentTurn)) {
+      if (action === 'synthesis') {
+        rows.push({
+          label: supplementLabels.synthesis, scope: 'action', summary: '汇总当前轮次已有的成功回答。',
+          open: () => this.supplement('synthesis'),
+        });
+      } else {
+        const answered = currentTurn.targets.filter(t => currentTurn.results.some(r => r.targetId === t.id && r.ok && r.text.trim()));
+        const candidates = targets.filter(t => installed.get(t.id) && answered.every(a => a.id !== t.id && !sameModel(t, a)));
+        rows.push({
+          label: supplementLabels.opinion, scope: 'action', chevron: true,
+          summary: '请另一模型根据原问题及当时的对话独立作答。',
+          open: () => this.page(supplementLabels.opinion, '选择新的回答目标', () => [
+            { label: '自动选择', open: () => this.supplement('opinion') },
+            ...candidates.map(t => ({ label: t.label, value: t.model, open: () => this.supplement('opinion', t.id) })),
+          ]),
+        });
+      }
     }
     return rows;
   }

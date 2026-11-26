@@ -2,12 +2,33 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { customAdapter } from '../dist/providers/custom.js';
 import { runOne } from '../dist/core/orchestrator.js';
 import { defaultTargetIds } from '../dist/core/targets.js';
 import { geminiPro } from '../dist/providers/antigravity.js';
 import { sseData } from '../dist/providers/sse.js';
+import { modelSettings } from '../dist/providers/agy-models.js';
+import { effortChoices, httpEffort } from '../dist/providers/effort.js';
+import { answerEffortLabels, routingNotice } from '../dist/core/routing.js';
+import { resolveAnswerEffort } from '../dist/core/answer-effort.js';
 import { options, workspace } from './helpers.mjs';
+
+test('none is hidden from strength pickers while explicit configurations retain their wire behavior', () => {
+  const baseUrl = 'https://api.deepseek.com';
+  const model = 'deepseek-flash';
+  const target = { id: 'deepseek', model, adapter: customAdapter('deepseek', { type: 'openai', model, baseUrl }) };
+  assert.equal(Object.hasOwn(answerEffortLabels, 'none'), false);
+  const settings = modelSettings({ models: [model], model, reasoningEffort: 'none', efforts: effortChoices(target) });
+  assert.deepEqual(settings.efforts.map(e => e.value), ['default', 'low', 'high', 'max']);
+  assert.equal(settings.effortValue, 'none');
+  assert.equal(settings.storedEffort, '已关闭额外推理');
+  const explicit = resolveAnswerEffort(target, 'none', undefined, []);
+  assert.deepEqual(httpEffort(baseUrl, explicit.target.reasoningEffort), { thinking: { type: 'disabled' } });
+  assert.match(routingNotice({ kind: 'direct', reason: '', answers: [explicit.choice] }), /已关闭额外推理/);
+  assert.deepEqual(httpEffort(baseUrl, resolveAnswerEffort(target, 'default', undefined, []).target.reasoningEffort), {});
+});
 
 test('SSE decodes split UTF-8, CRLF, comments, multiline and trailing data', async () => {
   const bytes = new TextEncoder().encode(': heartbeat\r\ndata: {"text":\r\ndata: "你好"}\r\n\r\ndata: [DONE]');
@@ -96,6 +117,33 @@ test('built-in DeepSeek target authenticates from the environment and streams re
   const gateway = buildRegistry({ custom: { deepseek: { type: 'openai', baseUrl: 'http://127.0.0.1:9/v1', model: 'm' } } });
   assert.equal(gateway.deepseek.adapter.configuration.baseUrl, 'http://127.0.0.1:9/v1');
   assert.throws(() => buildRegistry({ custom: { codex: { type: 'command', command: 'x' } } }), /重名/);
+});
+
+test('Codex manual effort choices honor the catalog and exec forwards max and ultra', async t => {
+  const { buildRegistry } = await import('../dist/providers/index.js');
+  const { effortChoices } = await import('../dist/providers/effort.js');
+  const { createCodexAdapter } = await import('../dist/providers/codex.js');
+  const cwd = workspace(t);
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = cwd;
+  t.after(() => { if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous; });
+  writeFileSync(join(cwd, 'models_cache.json'), JSON.stringify({ models: [
+    { slug: 'limited', visibility: 'list', supported_reasoning_levels: [{ effort: 'high' }, { effort: 'max' }] },
+  ] }));
+  const limited = buildRegistry({ models: { codex: 'limited' } }).codex;
+  assert.deepEqual(effortChoices(limited), ['high', 'max']);
+  assert.throws(() => buildRegistry({ models: { codex: 'limited' }, reasoningEffort: { codex: 'ultra' } }), /不支持思考强度 ultra/);
+  const fixture = join(cwd, 'exec.mjs');
+  writeFileSync(fixture, `const setting = process.argv.find(arg => arg.startsWith('model_reasoning_effort='));
+    console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: setting } }));
+    console.log(JSON.stringify({ type: 'turn.completed' }));`);
+  const adapter = createCodexAdapter({ cmd: process.execPath, prefixArgs: [fixture], nativeExecutable: true });
+  for (const level of ['max', 'ultra']) {
+    const target = buildRegistry({ reasoningEffort: { codex: level } }).codex;
+    assert.ok(effortChoices(target).includes(level));
+    const result = await runOne({ ...target, adapter }, options(cwd));
+    assert.equal(result.text, 'model_reasoning_effort=' + level);
+  }
 });
 
 test('HTTP targets encode effort for their transport and leave provider defaults untouched', async t => {

@@ -9,7 +9,8 @@ import { hostname } from 'node:os';
 import { z } from 'zod';
 import { collaborationSchema, isReviewOrReport } from './collaboration.js';
 import { sourceCheckSchema } from './source-check.js';
-import { customSchema, effortSchema, readJson } from './config.js';
+import { advisorSchema, advisorText } from './advisor.js';
+import { answerEffortSchema, customSchema, effortSchema, readJson, routingModeSchema } from './config.js';
 export { loadConfig, type Config } from './config.js';
 
 const safeId = z.string().regex(/^[\w-]+$/);
@@ -69,6 +70,7 @@ const inputSchema = z.object({
   userContent: z.string().optional(),
   sharedFiles: z.array(z.string()).optional(),
   sharedContext: z.string().optional(),
+  expandFileMentions: z.literal(false).optional(),
   memorySnapshot: memorySnapshotSchema.optional(),
   memoryUpdates: z.array(z.string()).optional(),
 });
@@ -87,7 +89,7 @@ const recordSchema = z.object({
   status: z.enum(['created', 'deciding', 'answering', 'synthesizing', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']),
   error: z.string().optional(), results: z.array(resultSchema),
   calls: z.array(z.object({
-    id: safeId, scope: z.enum(['decision', 'answer', 'dispute-assessment', 'source-check', 'synthesis', 'exec', 'plan-review', 'result-review', 'report']), target: targetSchema,
+    id: safeId, scope: z.enum(['decision', 'answer', 'advisor', 'advisor-revision', 'dispute-assessment', 'source-check', 'synthesis', 'exec', 'plan-review', 'result-review', 'report']), target: targetSchema,
     input: z.object({
       prompt: z.string(),
       turnPrompt: z.string().optional(),
@@ -101,6 +103,13 @@ const recordSchema = z.object({
     result: resultSchema,
   })),
   decision: z.object({ providers: z.array(safeId), synthesize: z.boolean(), reason: z.string().optional() }).optional(),
+  routing: z.object({ mode: routingModeSchema, kind: z.enum(['direct', 'compare', 'opinion', 'synthesis']), reason: z.string(),
+    modelPolicy: z.enum(['auto', 'fixed']).optional(), effortPolicy: answerEffortSchema.optional(),
+    advisorPolicy: z.object({ automatic: z.boolean(), candidates: z.array(safeId) }).optional(),
+    answers: z.array(z.object({ targetId: safeId, model: z.string().optional(), level: effortSchema.optional(), reason: z.string() })).optional(),
+  }).optional(),
+  supplementOf: safeId.optional(),
+  advisor: advisorSchema.optional(),
   synthesis: z.object({
     provider: safeId, labels: z.record(z.string(), safeId), result: resultSchema,
     sourceCheck: sourceCheckSchema.optional(),
@@ -151,6 +160,7 @@ export function saveRun(cwd: string, run: RunRecord): string {
 export function exportRun(cwd: string, run: RunRecord): void {
   const dir = runDir(cwd, run.id);
   atomicWrite(join(dir, 'question.md'), run.question + '\n');
+  if (run.advisor) atomicWrite(join(dir, 'advisor.md'), advisorText(run.advisor) + '\n');
   for (const r of run.results) atomicWrite(join(dir, `answer-${safeId.parse(r.targetId)}.md`), `${r.ok ? '' : `**${r.status}**: ${r.error ?? ''}\n\n`}${r.text}${formatMemoryReferences(r.memoryReferences)}\n`);
   if (run.synthesis) atomicWrite(join(dir, 'synthesis.md'), synthesisFormatter(run)(run.synthesis.result.text) + formatMemoryReferences(run.synthesis.result.memoryReferences) + '\n');
   for (const call of run.calls) if (isReviewOrReport(call.scope)) {
@@ -207,6 +217,7 @@ export function loadRun(cwd: string, id?: string): RunRecord {
   if (run.id !== target) throw new Error('记录 id 与目录不一致');
   if (['created', 'deciding', 'answering', 'synthesizing'].includes(run.status) && !ownerAlive(run)) {
     run.status = 'interrupted';
+    if (run.advisor?.status === 'checking') run.advisor.status = 'failed';
     for (const result of [...run.results, ...run.calls.map((c) => c.result), ...(run.synthesis ? [run.synthesis.result] : [])]) {
       if (result.status === 'running') { result.status = 'interrupted'; result.ok = false; result.error = '上次执行未保存终态'; }
     }
@@ -296,8 +307,10 @@ export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, from
       ? [{ ...target, suffix: content.slice(base.length) }]
       : [{ ...target, suffix: content, replace: true as const }];
   });
+  const review = run.advisor && advisorText(run.advisor);
   const entry = (turnId: string, answer: string, answerRunId?: string): HistoryEntry => ({
-    turnId, question: run.question, answer, answerRunId, ...(userContent ? { userContent } : {}),
+    turnId, question: run.question, answer: review && !answer.includes(review) ? answer + '\n\n' + review : answer,
+    answerRunId, ...(userContent ? { userContent } : {}),
     ...(sentUsers.length ? { sentUsers } : {}),
   });
   if (run.kind === 'execution') {
@@ -322,8 +335,8 @@ export function historyAfter(run: RunRecord, followUpExecution?: RunRecord, from
     const answer = formatExecutedAnswer(planText, followUpExecution, run);
     if (answer) return [...run.input.history, entry(run.id, answer)];
   }
-  const review = run.calls.find(c => c.scope === 'plan-review' && c.result.ok && c.result.text.trim());
-  if (review) return [...run.input.history, entry(run.id, review.result.text.trim())];
+  const planReview = run.calls.find(c => c.scope === 'plan-review' && c.result.ok && c.result.text.trim());
+  if (planReview) return [...run.input.history, entry(run.id, planReview.result.text.trim())];
   if (run.synthesis?.result.ok && run.synthesis.result.text.trim()) {
     const answer = synthesisFormatter(run)(run.synthesis.result.text);
     return [...run.input.history, entry(run.id, answer)];

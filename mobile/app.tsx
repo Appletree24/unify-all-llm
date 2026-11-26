@@ -2,6 +2,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import { createRoot } from 'react-dom/client';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
+import { supplementLabels, type SupplementAction } from '../src/core/routing.js';
 import type { MobileAnswer, MobileTurn, MobileUpdate } from '../src/mobile/types.js';
 import './mobile.css';
 
@@ -125,7 +126,9 @@ const Turn = memo(function Turn({ turn }: { turn: MobileTurn }) {
   return <article>
     <header className="question-head"><small>你</small><small>{turn.waitingForInput ? '等待电脑端确认' : turnStatus[turn.status]}</small></header>
     <h2>{turn.question}</h2>
+    {turn.routing && <small className="route-notice">{turn.routing}</small>}
     {turn.answers.map(a => <Answer key={a.id} answer={a} />)}
+    {turn.advisor && <section className="answer plain" aria-label="顾问复核">{turn.advisor}</section>}
     {turn.error && <p className="error">{turn.error}</p>}
   </article>;
 });
@@ -190,6 +193,19 @@ function App() {
     }
     setCancellation(current => current?.turnId === turnId ? { turnId, error: failure } : current);
   }
+  async function supplement(action: SupplementAction) {
+    if (!latest || !online || busy || sending) return;
+    setError('');
+    setSending(true);
+    try {
+      const query = new URLSearchParams({ turnId: latest.id, action });
+      const { ok, result } = await postTurn('/supplement?' + query);
+      if (!ok) throw new Error(result.error || '追加操作失败');
+      follow.current = true;
+      setAck(result.turnId);
+    } catch (err) { setError(err instanceof Error ? err.message : '追加操作失败'); }
+    finally { setSending(false); }
+  }
   return <>
     <header className="bar"><b>Unify</b><span>{project}</span><small role="status" className={online ? 'live' : ''}>{ended ? '共享不可用' : online ? '已连接' : '正在连接电脑'}</small></header>
     <main ref={list} onScroll={() => {
@@ -204,6 +220,8 @@ function App() {
     </main>
     {!ended && <footer><form onSubmit={event => { event.preventDefault(); void send(); }}>
       {alert && <p role="alert" className="error">{alert}</p>}
+      {!busy && latest?.actions?.map(action => <button type="button" className="supplement" key={action}
+        disabled={!online || sending} onClick={() => void supplement(action)}>{supplementLabels[action]}</button>)}
       <label htmlFor="draft">{busy ? '本轮生成结束后可继续追问' : '继续对话'}</label>
       <div className="composer"><textarea id="draft" rows={2} value={draft} onChange={e => changeDraft(e.target.value)} readOnly={sending} placeholder="输入追问…" />
         {cancelId ? <button type="button" className="cancel-turn" disabled={!online || stopping}

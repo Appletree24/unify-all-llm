@@ -9,7 +9,9 @@ import { readClaudeQuota } from '../quota/claude.js';
 import { readCodexQuota } from '../quota/codex.js';
 import { commandQuota } from '../quota/command.js';
 
+import { applyCodexEfforts } from './models.js';
 import { effortChoices } from './effort.js';
+import { canAdvise } from '../core/advisor.js';
 
 const builtin: Record<string, ProviderAdapter> = {
   claude: { ...claude, readQuota: readClaudeQuota },
@@ -50,12 +52,16 @@ export function buildRegistry(config: Config, readProfile = readApiProfile): Rec
     if (!adapter) throw new Error(`目标 ${id} 引用了未知 provider ${t.provider}`);
     targets[id] = { id, adapter, label: t.label ?? id, model: t.model ?? cfg.models?.[t.provider] };
   }
-  for (const id of [...(cfg.providers ?? []), ...Object.keys(cfg.models ?? {}), ...Object.keys(cfg.reasoningEffort ?? {}), ...[cfg.synthesizer, cfg.executor, cfg.decider].filter((s): s is string => !!s)]) {
+  for (const id of [...(cfg.providers ?? []), ...Object.keys(cfg.models ?? {}), ...Object.keys(cfg.reasoningEffort ?? {}), ...[cfg.synthesizer, cfg.executor, cfg.decider, cfg.answerModel].filter((s): s is string => !!s)]) {
     if (!Object.hasOwn(targets, id)) throw new Error(`配置引用了未知目标 ${id}`);
   }
   for (const [id, model] of Object.entries(cfg.models ?? {})) targets[id].model = model;
+  for (const target of Object.values(targets)) target.model ??= target.adapter.defaultModel;
+  applyCodexEfforts(Object.values(targets));
+  if (cfg.advisor && !['auto', 'off'].includes(cfg.advisor) && (!Object.hasOwn(targets, cfg.advisor) || !canAdvise(targets[cfg.advisor]))) {
+    throw new Error(`顾问 ${cfg.advisor} 必须是可用配置中的只读或纯文本目标`);
+  }
   for (const target of Object.values(targets)) {
-    target.model ??= target.adapter.defaultModel;
     const effort = cfg.reasoningEffort?.[target.id] ?? cfg.targets?.[target.id]?.reasoningEffort;
     if (effort === 'default') continue;
     if (effort && !effortChoices(target).includes(effort)) throw new Error(`目标 ${target.id} 不支持思考强度 ${effort}`);

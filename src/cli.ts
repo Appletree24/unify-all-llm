@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { HarnessPool } from './core/harness-pool.js';
 import { benchCommand } from './bench/command.js';
 import { projectCommand } from './project-command.js';
 import { readHandoff } from './core/handoff.js';
@@ -7,7 +8,9 @@ import { isReviewOrReport, roleNames } from './core/collaboration.js';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
-import { loadConfig, parseConfig, timeoutMillis } from './core/config.js';
+import { loadConfig, parseConfig, routingModeSchema, timeoutMillis } from './core/config.js';
+import { advisorText } from './core/advisor.js';
+import { routingNotice } from './core/routing.js';
 import { latestComparison, listRunIds, loadRun, type CallRecord, type RunRecord } from './core/store.js';
 import { synthesisFormatter } from './core/synth.js';
 import { detectTargets } from './core/targets.js';
@@ -21,6 +24,7 @@ import { startMemoryServer } from './memory/server.js';
 import { buildRegistry } from './providers/index.js';
 import { formatQuota, QUOTA_REFRESH_MS, readTargetQuotas } from './quota/index.js';
 import { runTui } from './tui/app.js';
+import { promptApproval } from './ui/approval.js';
 import { displaySynthesisEvents } from './ui/synthesis.js';
 import { bold, dim, FanOutView, header, red, secs, streamEvent } from './ui/term.js';
 
@@ -43,6 +47,10 @@ const HELP = `unify — 同时提问多个模型，再汇总与实施
   unify memory                  查看和管理各工具的记忆（网页；--tui 为终端界面）
 
 ask 选项:
+      --mode auto|single|multi|standard  选择本轮问答模式
+      --advisor auto|off|id      自动问答的只读复核顾问
+      --model auto|id            自动选择或为本轮锁定一个回答目标
+      --effort auto|default|档位   本轮回答思考策略（target 沿用目标设置）
   -m, --models a,b               选择独立目标 id，不允许重复
   -s, --synth id                 汇总目标
       --no-synth                跳过汇总
@@ -100,31 +108,44 @@ async function readStdin(): Promise<string> {
 function renderer(json: boolean, reasoning = false) {
     let view: FanOutView | undefined
     let hasText = false;
+    let deferredEvents: WorkflowEvent[] | undefined;
     const titles: Partial<Record<CallRecord['scope'], string>> = {
-        synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核', report: roleNames.report,
+        'advisor-revision': '复核后修订', synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核', report: roleNames.report,
+    };
+    const render = (event: WorkflowEvent) => {
+        if (json) { process.stdout.write(JSON.stringify({ schemaVersion: 2, ...event }) + '\n'); return; }
+        if (event.type === 'stage' && event.stage === 'answering') {
+            view = new FanOutView(Object.fromEntries(event.targets.map((t) => [t.id, t.label])));
+            view.start();
+        } else if (event.type === 'call' && titles[event.scope]) {
+            view?.stop();
+            hasText = false;
+            header(`${titles[event.scope]} · ${event.target.label}`);
+        } else if (event.type === 'provider') {
+            if (event.scope === 'answer') view?.onEvent(event.targetId, event.event);
+            else if (titles[event.scope]) {
+                if (event.event.type === 'delta') hasText = true;
+                if (event.event.type === 'done' && !hasText) process.stdout.write(event.event.text);
+                streamEvent(event.event, reasoning);
+            }
+        } else if (event.type === 'notice') process.stdout.write(dim(event.message) + '\n');
+        else if (event.type === 'end') process.stdout.write(dim(`已保存: ${event.turnId} · ${event.status}`) + '\n');
     };
     return {
         event(event: WorkflowEvent) {
-            if (json) { process.stdout.write(JSON.stringify({ schemaVersion: 2, ...event }) + '\n'); return; }
-            if (event.type === 'stage' && event.stage === 'answering') {
-                view = new FanOutView(Object.fromEntries(event.targets.map((t) => [t.id, t.label])));
-                view.start();
-            } else if (event.type === 'call' && titles[event.scope]) {
-                view?.stop();
-                hasText = false;
-                header(`${titles[event.scope]} · ${event.target.label}`);
-            } else if (event.type === 'provider') {
-                if (event.scope === 'answer') view?.onEvent(event.targetId, event.event);
-                else if (titles[event.scope]) {
-                    if (event.event.type === 'delta') hasText = true;
-                    if (event.event.type === 'done' && !hasText) process.stdout.write(event.event.text);
-                    streamEvent(event.event, reasoning);
-                }
-            } else if (event.type === 'notice') process.stdout.write(dim(event.message) + '\n');
-            else if (event.type === 'end') process.stdout.write(dim(`已保存: ${event.turnId} · ${event.status}`) + '\n');
+            if (deferredEvents) deferredEvents.push(event);
+            else render(event);
         },
-        pause() { view?.stop(); },
-        resume() { view?.start(); },
+        pause(keepOutput: boolean) {
+            view?.stop();
+            if (keepOutput) deferredEvents = [];
+        },
+        resume(restart: boolean) {
+            if (restart) view?.start();
+            const events = deferredEvents;
+            deferredEvents = undefined;
+            events?.forEach(render);
+        },
         stop() { view?.stop(); },
     };
 }
@@ -137,26 +158,15 @@ function createCliInteractor(view: ReturnType<typeof renderer>, signal: AbortSig
     return (info: { targetLabel: string; request: PendingInteraction }): Promise<InteractionResponse> => {
         const run = async (): Promise<InteractionResponse> => {
             if (signal.aborted) return { cancelled: true };
-            view.pause();
-            const rl = createInterface({ input: process.stdin, output: process.stdout });
+            const { request } = info;
+            view.pause(request.kind === 'approval');
+            let rl: ReturnType<typeof createInterface> | undefined;
             try {
-                const { request } = info;
                 process.stdout.write(`\n${bold(`[需要交互 · ${info.targetLabel}] ${request.title}`)}${request.tool ? dim(` (${request.tool})`) : ''}\n`);
                 if (request.detail) process.stdout.write(`${dim(request.detail)}\n`);
 
-                if (request.kind === 'approval') {
-                    const options = request.options?.length
-                        ? request.options
-                        : [{ id: 'accept', label: '允许' }, { id: 'decline', label: '拒绝' }];
-                    options.forEach((o, i) => process.stdout.write(`  ${i + 1}. ${o.label}${o.description ? dim(` — ${o.description}`) : ''}\n`));
-                    const ans = (await rl.question(`请选择 [1-${options.length}]（回车默认拒绝，q 中止）: `, { signal })).trim();
-                    if (!ans) return { optionId: options.find((o) => o.tone === 'danger')?.id ?? options[options.length - 1].id };
-                    if (ans.toLowerCase() === 'q') return { cancelled: true };
-                    const idx = Number(ans) - 1;
-                    if (Number.isInteger(idx) && idx >= 0 && idx < options.length) return { optionId: options[idx].id };
-                    const byId = options.find((o) => o.id.toLowerCase() === ans.toLowerCase());
-                    return { optionId: byId?.id ?? options[options.length - 1].id };
-                }
+                if (request.kind === 'approval') return await promptApproval(request, signal);
+                rl = createInterface({ input: process.stdin, output: process.stdout });
 
                 if (request.kind === 'question' && request.questions?.length) {
                     const answers: Record<string, string[]> = {};
@@ -182,8 +192,8 @@ function createCliInteractor(view: ReturnType<typeof renderer>, signal: AbortSig
             } catch {
                 return { cancelled: true };
             } finally {
-                rl.close();
-                if (!signal.aborted) view.resume();
+                rl?.close();
+                view.resume(!signal.aborted);
             }
         };
         const result = queue.then(run, run);
@@ -196,16 +206,24 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
     const { values, positionals } = parseArgs({
         args: argv, allowPositionals: true,
         options: {
-            models: { type: 'string', short: 'm' }, synth: { type: 'string', short: 's' }, 'no-synth': { type: 'boolean' },
+            advisor: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, models: { type: 'string', short: 'm' }, synth: { type: 'string', short: 's' }, 'no-synth': { type: 'boolean' }, mode: { type: 'string' },
             continue: { type: 'boolean', short: 'c' }, from: { type: 'string' }, reasoning: { type: 'boolean' }, json: { type: 'boolean' },
             timeout: { type: 'string' }, concurrency: { type: 'string' }, target: { type: 'string' },
             handoff: { type: 'string' },
         },
     });
+    if (values.model !== undefined && values.models !== undefined) throw new Error('--model 与 --models 请选择一项');
+    if (retry && values.advisor !== undefined) throw new Error('重试沿用原轮复核设置');
+    if (retry && (values.model !== undefined || values.effort !== undefined)) throw new Error('重试沿用原轮的模型与强度，请用 ask 开启新一轮');
     if (values.from && !values.continue) throw new Error('--from 需要与 -c/--continue 一起使用');
     if (values.handoff && (values.continue || retry)) throw new Error('--handoff 需要开启新会话');
+    const routing = values.mode ? routingModeSchema.safeParse(values.mode) : undefined;
+    if (routing && !routing.success) throw new Error('--mode 应为 auto、single、multi 或 standard');
     const config = parseConfig({
         ...loadConfig(cwd),
+        ...(values.advisor !== undefined ? { advisor: values.advisor } : {}),
+        ...(values.model !== undefined ? { answerModel: values.model === 'auto' ? null : values.model } : {}),
+        ...(values.effort !== undefined ? { answerEffort: values.effort } : {}),
         ...(values.synth ? { synthesizer: values.synth } : {}),
         ...(values.timeout !== undefined ? { timeoutSec: Number(values.timeout) } : {}),
         ...(values.concurrency !== undefined ? { concurrency: Number(values.concurrency) } : {}),
@@ -214,13 +232,14 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
     const original = retry ? (positionals[0] ? loadRun(cwd, positionals[0]) : latestComparison(cwd)) : undefined;
     const question = original?.question ?? (positionals.join(' ') || await readStdin()).trim();
     if (abort.signal.aborted) return signalExit;
+    const harnesses = new HarnessPool();
     const view = renderer(values.json === true, values.reasoning === true);
     const canInteract = process.stdin.isTTY && process.stdout.isTTY && !values.json;
     const onInteract = canInteract ? createCliInteractor(view, abort.signal) : undefined;
     try {
         const handle = startComparison({
-            cwd, config, targets, question, selected: values.models?.split(',').map((s) => s.trim()),
-            manualSelection: !!values.models, synthesize: !values['no-synth'],
+            harnesses, cwd, config, targets, question, selected: values.models?.split(',').map((s) => s.trim()),
+            manualSelection: !!values.models, synthesize: !values['no-synth'], routing: routing?.data,
             previous: values.continue ? latestComparison(cwd) : undefined,
             handoff: values.handoff ? readHandoff(cwd, values.handoff) : undefined,
             continueFrom: values.continue ? values.from : undefined,
@@ -229,8 +248,8 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
             signal: abort.signal, onEvent: values.json ? view.event : displaySynthesisEvents(view.event),
         });
         const run = await handle.done;
-        return run.results.some((r) => r.ok) ? 0 : 1;
-    } finally { view.stop(); }
+        return run.results.some(r => r.ok) ? 0 : 1;
+    } finally { view.stop(); await harnesses.dispose(); }
 }
 
 async function cmdExec(argv: string[]): Promise<number> {
@@ -254,13 +273,14 @@ async function cmdExec(argv: string[]): Promise<number> {
         } finally { rl.close(); }
     }
     if (abort.signal.aborted) return signalExit;
+    const harnesses = new HarnessPool();
     const view = renderer(false);
     const canInteract = process.stdin.isTTY && process.stdout.isTTY;
     const onInteract = canInteract ? createCliInteractor(view, abort.signal) : undefined;
     try {
-        const result = await startExecution({ cwd, config, targets, executor, source: run, from: values.from, interactive: canInteract, onInteract, signal: abort.signal, onEvent: (e) => view.event(e) }).done;
+        const result = await startExecution({ harnesses, cwd, config, targets, executor, source: run, from: values.from, interactive: canInteract, onInteract, signal: abort.signal, onEvent: (e) => view.event(e) }).done;
         return (run.collaboration?.report ? result.status === 'completed' : result.results[0]?.ok) ? 0 : 1;
-    } finally { view.stop(); }
+    } finally { view.stop(); await harnesses.dispose(); }
 }
 
 async function cmdQuota(args: string[]): Promise<number> {
@@ -369,6 +389,7 @@ async function cmdMemory(args: string[]): Promise<number> {
 
 function show(run: RunRecord): void {
     process.stdout.write(`${bold(run.id)} · ${run.status}\n\n${run.question}\n`);
+    if (run.routing) process.stdout.write(dim(routingNotice(run.routing)) + '\n');
     const stageCalls = run.calls.filter(c => isReviewOrReport(c.scope));
     for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...stageCalls.map(c => c.result)]) {
         header(`${r.targetId} (${r.provider}${r.model ? ` / ${r.model}` : ''})`, `${r.status} · ${secs(r.durationMs)}`);
@@ -376,6 +397,7 @@ function show(run: RunRecord): void {
         process.stdout.write(text + formatMemoryReferences(r.memoryReferences) + '\n');
         if (r.error) process.stdout.write(red(r.error) + '\n');
     }
+    if (run.advisor) process.stdout.write(advisorText(run.advisor) + '\n');
     if (run.error) process.stdout.write(red(run.error) + '\n');
 }
 

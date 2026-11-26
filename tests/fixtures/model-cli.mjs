@@ -6,6 +6,26 @@ const name = basename(process.argv[1]).replace(/\.(?:cmd|mjs)$/, '');
 if (process.env.UNIFY_TEST_LOG) appendFileSync(process.env.UNIFY_TEST_LOG, JSON.stringify({ name, args: process.argv.slice(2) }) + '\n');
 if (process.argv.includes('--version')) {
   process.stdout.write('fixture-1.0\n');
+} else if (name === 'codex' && process.env.UNIFY_TEST_SCENARIO === 'codex-efforts' && process.argv.includes('app-server')) {
+  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of lines) {
+    const { id, method, params } = JSON.parse(line);
+    const reply = result => console.log(JSON.stringify({ id, result }));
+    if (method === 'initialize') reply({});
+    if (method === 'config/read') reply({ config: { model: process.env.UNIFY_TEST_CODEX_MODEL } });
+    if (method === 'model/list') {
+      const model = params.cursor ? 'pro' : 'small';
+      const levels = model === 'pro' ? ['high', 'max', 'ultra'] : ['high', 'max'];
+      reply({ data: [{ model, isDefault: model === 'small', supportedReasoningEfforts: levels.map(reasoningEffort => ({ reasoningEffort })) }],
+        nextCursor: params.cursor ? null : 'next' });
+    }
+    if (method === 'thread/start') reply({ thread: { id: 'thread' } });
+    if (method === 'turn/start') {
+      reply({ turn: { id: 'turn' } });
+      console.log(JSON.stringify({ method: 'item/completed', params: { item: { type: 'agentMessage', text: params.effort } } }));
+      console.log(JSON.stringify({ method: 'turn/completed', params: { turn: { id: 'turn', status: 'completed' } } }));
+    }
+  }
 } else {
   if (name !== 'agy') {
     for await (const chunk of process.stdin) { /* Wait for the caller to finish writing. */ }

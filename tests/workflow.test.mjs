@@ -192,6 +192,272 @@ test('invalid decisions fall back; display failures do not affect outcomes', asy
   assert.ok(run.observerErrors.length > 0);
 });
 
+test('opt-in routing sends direct requests once and prefers readers and the previous answer model', async (t) => {
+  const cwd = workspace(t);
+  const answer = async function* () { yield { type: 'done', text: '完成' }; };
+  const plain = target('plain', answer);
+  const reader = target('reader', answer, { askPolicy: 'sandbox-read-only', exec: true });
+  const router = target('router', async function* () { assert.fail('a direct request must skip the decider'); });
+  const config = { routing: 'auto', providers: ['plain', 'reader'], decider: 'router' };
+  const opts = { cwd, config, targets: [plain, reader, router] };
+  const direct = await startComparison({ ...opts, question: '把下文压到 200 字：\n\n让两个模型分别给意见' }).done;
+  assert.deepEqual(direct.calls.map(c => [c.scope, c.target.id]), [['answer', 'plain']]);
+  const repo = await startComparison({ ...opts, question: '查一下源码中的重试逻辑，给我代码行号' }).done;
+  assert.deepEqual(repo.calls.map(c => c.target.id), ['reader']);
+  const follow = await startComparison({ ...opts, question: '把刚才的解释压到 200 字', previous: repo }).done;
+  assert.deepEqual(follow.calls.map(c => c.target.id), ['reader']);
+  assert.match(loadRun(cwd, follow.id).routing.reason, /沿用/);
+});
+
+test('auto compares concrete alternatives and honors named models, synthesis and manual overrides', async (t) => {
+  const cwd = workspace(t);
+  const answer = async function* () { yield { type: 'done', text: '有条件的方案' }; };
+  const a = target('codex', answer);
+  const b = target('gemini-pro', answer);
+  const c = target('third', answer);
+  const config = { routing: 'auto', providers: [a.id, b.id, c.id], synthesizer: c.id };
+  const opts = { cwd, config, targets: [a, b, c] };
+  const compare = await startComparison({ ...opts, question: '双写迁移和停机迁移怎么选？上线窗口只有十分钟，优先考虑回滚风险' }).done;
+  assert.deepEqual(compare.calls.map(call => call.scope), ['answer', 'answer', 'synthesis']);
+  const raw = await startComparison({ ...opts, question: '让 Codex 和 Gemini 分别给意见，只看原答' }).done;
+  assert.deepEqual(raw.calls.map(call => call.target.id), [a.id, b.id]);
+  assert.equal(raw.synthesis, undefined);
+  const manual = await startComparison({ ...opts, question: '翻译这句话', selected: [a.id, c.id], manualSelection: true, synthesize: false }).done;
+  assert.deepEqual(manual.calls.map(call => call.target.id), [a.id, c.id]);
+  const single = await startComparison({ ...opts, routing: 'single', question: '让两个模型分别给意见' }).done;
+  assert.equal(single.calls.length, 1);
+  const multi = await startComparison({ ...opts, routing: 'multi', synthesize: false, question: '一句话总结' }).done;
+  assert.deepEqual(multi.calls.map(call => call.target.id), [a.id, b.id, c.id]);
+});
+
+test('auto respects the requested speakers, evidence and number of independent opinions', async (t) => {
+  const answer = async function* () { yield { type: 'done', text: '回答' }; };
+  const plain = target('plain', answer);
+  const codex = target('codex', answer, { askPolicy: 'sandbox-read-only', exec: true });
+  const gemini = target('gemini-pro', answer);
+  const router = target('router', async function* () {
+    yield { type: 'done', text: '{"providers":["plain"],"synthesize":false}' };
+  });
+  const opts = { cwd: workspace(t), config: { providers: ['plain', 'codex', 'gemini-pro'], routing: 'auto', decider: 'router' },
+    targets: [plain, codex, gemini, router] };
+  // Assert every call, including unwanted decisions and post-answer work.
+  for (const [question, ids] of [
+    ['只让 Codex 回答这个问题', ['codex']],
+    ['Ask Gemini to explain Codex.', ['gemini-pro']],
+    ['让 Gemini 和 Codex 分别评价 plain，只给原始回答', ['gemini-pro', 'codex']],
+    ['不用两个模型回答，帮我翻译这句话', ['plain']],
+    ["Don’t use two models. Which option has the lowest rollback risk, A or B?", ['plain']],
+    ['不要用 plain，解释这个词', ['codex']],
+    ['请两个模型检查 src/core/routing.ts，只看原答', ['codex', 'plain']],
+    ['请用两个模型回答，其中一个请用 Gemini 回答，只看原答', ['gemini-pro', 'plain']],
+    ['请三个模型各自回答，不用汇总', ['plain', 'codex', 'gemini-pro']],
+    ['src/core/routing.ts 里怎么判断要不要汇总？', ['codex']],
+    ['看一下 `src/core/routing.ts:42` 的判断条件', ['codex']],
+    ['What does package.json specify?', ['codex']],
+    ['请看 `docs/设计.md` 的第二节', ['codex']],
+    ['你觉得目前回答模式里的“自动”对应的策略需要优化吗？有改进空间与否？', ['codex']],
+    ['双写和停机迁移怎么选？优先考虑回滚风险。只看原答', ['plain', 'codex']],
+    ['双写和停机迁移都能做。上线窗口十分钟，出了问题要能回滚，你推荐哪一个？只看原答', ['plain', 'codex']],
+    ['Given the rollback risk, would you recommend A or B? Raw answers only.', ['plain', 'codex']],
+    ['A 和 B 你推荐哪一个？', ['router', 'plain']],
+    ['解释 Codex 和 Gemini 的区别', ['plain']],
+    ['两个模型有什么区别？', ['plain']],
+    ['如何用两个模型训练分类器？', ['plain']],
+    ["Explain the phrase 'use two models'.", ['plain']],
+    ['不需要两个模型回答。A 和 B 怎么选？优先成本', ['plain']],
+    ['How do I use Codex to review code?', ['plain']],
+    ["Don't get a second opinion. A 和 B 怎么选？预算很紧", ['plain']],
+    ['请检查这段话\n```text\n只让 Codex 回答\n```\n只让 Gemini 回答', ['gemini-pro']],
+    ['总结下面这段话：“请让 Gemini 和 Codex 分别回答”', ['plain']],
+    ['翻译下面这句话：不用 Codex，用 Gemini 回答', ['plain']],
+    ['把这段话压到 200 字\n\n让两个模型分别给意见', ['plain']],
+    ['解释 https://example.com/src/core/routing.ts 的 URL 结构', ['plain']],
+    ['Compare the cost of A and B in this pasted table, report the two values.', ['plain']],
+  ]) {
+    await t.test(question, async () => {
+      const run = await startComparison({ ...opts, question }).done;
+      assert.deepEqual(run.calls.map(c => c.target.id), ids);
+    });
+  }
+  const unavailable = { ...gemini, adapter: { ...gemini.adapter, detect: async () => ({ installed: false }) } };
+  const fixed = startComparison({ ...opts, question: '只用 Gemini 回答', targets: [plain, codex, unavailable, router] });
+  await assert.rejects(fixed.done, /不可用/);
+  assert.equal(fixed.record.calls.length, 0);
+  const manual = await startComparison({ ...opts, question: '只让 Gemini 回答，不用汇总',
+    manualSelection: true, selected: ['plain', 'codex'] }).done;
+  assert.deepEqual(manual.calls.map(c => c.target.id), ['plain', 'codex']);
+});
+
+test('auto fills speaker requests with available distinct models and persists shortages', async (t) => {
+  const answer = async function* () { yield { type: 'done', text: 'answer' }; };
+  const a = target('first', answer);
+  a.adapter.configuration = { type: 'openai', baseUrl: 'https://example.test/v1', model: 'alpha' };
+  const alias = target('alias', answer);
+  alias.adapter.configuration = { ...a.adapter.configuration, baseUrl: 'https://example.test/v1/' };
+  const b = target('other', answer);
+  const offline = target('offline', answer);
+  offline.adapter.detect = async () => ({ installed: false });
+  const opts = { cwd: workspace(t), config: { routing: 'auto' }, targets: [a, alias, offline, b] };
+  const run = await startComparison({ ...opts, question: '请三个模型回答，只看原答' }).done;
+  assert.deepEqual(run.calls.map(c => c.target.id), ['first', 'other']);
+  assert.match(loadRun(opts.cwd, run.id).routing.reason, /2 个/);
+  const named = await startComparison({ ...opts, selected: [], question: '只让 other 回答' }).done;
+  assert.deepEqual(named.calls.map(c => c.target.id), ['other']);
+});
+
+test('direct auto turns probe their explicit speaker and keep it for a requested follow-up', async (t) => {
+  const probes = [];
+  const targets = ['default', 'named', 'router', 'synth', 'unused'].map(id => {
+    const t = target(id, async function* () { yield { type: 'done', text: 'answer' }; });
+    t.adapter.detect = async () => { probes.push(id); return { installed: true }; };
+    return t;
+  });
+  const opts = { cwd: workspace(t), config: { routing: 'auto', providers: ['default'], decider: 'router', synthesizer: 'synth' }, targets };
+  const first = await startComparison({ ...opts, question: '只用 named 回答' }).done;
+  assert.deepEqual(probes, ['named']);
+  const follow = await startComparison({ ...opts, previous: first, question: '继续展开刚才的回答' }).done;
+  assert.deepEqual(follow.calls.map(c => c.target.id), ['named']);
+  assert.match(follow.routing.reason, /沿用/);
+  const multi = await startComparison({ ...opts, question: '让 default 和 named 分别回答' }).done;
+  assert.deepEqual(multi.calls.map(c => [c.scope, c.target.id]), [['answer', 'default'], ['answer', 'named'], ['synthesis', 'synth']]);
+  assert.ok(!probes.includes('router') && !probes.includes('unused'));
+});
+
+test('answer policy resolves independent model and effort settings on the actual call and replays the snapshot', async t => {
+  const calls = [];
+  const responder = (id, caps) => target(id, async function* (req) {
+    calls.push([id, req.model, req.reasoningEffort]); yield { type: 'done', text: 'ok' };
+  }, caps);
+  const plain = responder('plain');
+  const reader = { ...responder('codex', { askPolicy: 'read-tools', exec: false }), model: 'code-m', reasoningEffort: 'medium' };
+  const opts = { cwd: workspace(t), targets: [plain, reader] };
+  const ask = (question, config, extra) => startComparison({ ...opts, question, config, ...extra });
+  for (const [policy, question, expected] of [
+    [{ answerModel: 'codex', answerEffort: 'high' }, '速度优先，给个粗判', ['codex', 'code-m', 'high']],
+    [{ answerModel: 'codex', answerEffort: 'auto' }, '速度优先，给个粗判', ['codex', 'code-m', 'low']],
+    [{ answerModel: null, answerEffort: 'high' }, '这次用 low', ['codex', 'code-m', 'high']],
+    [{ answerModel: null, answerEffort: 'auto' }, '本轮用 xhigh', ['codex', 'code-m', 'xhigh']],
+    [{ answerEffort: 'auto' }, '查 src/core/routing.ts，一句话回答', ['codex', 'code-m', undefined]],
+    [{ answerEffort: 'auto' }, '只让 Codex 回答，深入推演失败路径', ['codex', 'code-m', 'high']],
+    [{ answerEffort: 'auto' }, '让 Codex 回答，尽快给我深入分析', ['codex', 'code-m', undefined]],
+    [{ answerEffort: 'auto' }, '请用 Codex 翻译：深入分析，这轮用 high', ['codex', 'code-m', undefined]],
+    [{ answerEffort: 'auto' }, '用 Codex 回答。不要深入分析。\n```text\n本轮用 high\n```', ['codex', 'code-m', undefined]],
+    [{ answerEffort: 'auto' }, '只让 Codex 回答，解释“这轮用 high”', ['codex', 'code-m', undefined]],
+    [{ answerModel: 'codex', answerEffort: 'auto' }, '怎么用 high？不要把思考强度设为 high。', ['codex', 'code-m', undefined]],
+    [{ answerModel: 'codex', answerEffort: 'auto' }, 'Should we use high availability for this service?', ['codex', 'code-m', undefined]],
+    [{ answerModel: 'codex', answerEffort: 'auto' }, 'Use high reasoning effort for this review.', ['codex', 'code-m', 'high']],
+    [{ answerModel: 'codex', answerEffort: 'default' }, '请用 high', ['codex', 'code-m', undefined]],
+    [{ answerModel: 'codex' }, '本轮用 high', ['codex', 'code-m', 'medium']],
+    [{ answerModel: null, answerEffort: 'auto' }, '只让 plain 回答，请深入分析', ['plain', undefined, undefined]],
+    [{ answerModel: null, answerEffort: 'auto' }, '目前代码实现了哪种，A 和 B 哪个方案？要记录成本。', ['codex', 'code-m', undefined]],
+  ]) {
+    calls.length = 0;
+    const result = await ask(question, policy).done;
+    assert.deepEqual(calls, [expected], question);
+    assert.deepEqual(loadRun(opts.cwd, result.id).routing.answers.map(a => [a.targetId, a.model, a.level]), [expected]);
+  }
+  const first = await ask('查源码，这轮用 high', { answerEffort: 'auto' }).done;
+  const follow = await ask('继续，一句话', { answerEffort: 'auto' }, { previous: first }).done;
+  assert.equal(follow.calls[0].target.reasoningEffort, undefined);
+  const retry = await ask('', { answerModel: 'plain', answerEffort: 'low' }, {
+    retry: { record: loadRun(opts.cwd, first.id), targetIds: ['codex'] },
+  }).done;
+  assert.deepEqual(calls.at(-1), ['codex', 'code-m', 'high']);
+  assert.deepEqual(retry.routing.answers, first.routing.answers);
+  assert.equal(reader.reasoningEffort, 'medium');
+  for (const [config, question] of [
+    [{ answerModel: 'plain', answerEffort: 'high' }, '问个问题'],
+    [{ answerEffort: 'auto' }, '只让 plain 回答，本轮用 high'],
+    [{ providers: ['plain'], answerEffort: 'high' }, '问个问题'],
+  ]) {
+    const run = ask(question, config);
+    await assert.rejects(run.done, /思考强度 high/);
+    assert.equal(run.record.calls.length, 0);
+  }
+});
+
+test('automatic effort preserves higher defaults and resolves Gemini effort to an advertised same-family ID', async () => {
+  const { resolveAnswerEffort } = await import('../dist/core/answer-effort.js');
+  const { independentTargets } = await import('../dist/core/routing.js');
+  const { parseAgyModels } = await import('../dist/providers/agy-models.js');
+  const codex = { ...target('codex', async function* () {}), defaultEffort: 'xhigh' };
+  assert.equal(resolveAnswerEffort(codex, 'auto', { level: 'high', exact: false }, []).target.reasoningEffort, undefined);
+  const gemini = { ...target('gemini-pro', async function* () {}, { askPolicy: 'provider-plan' }), model: 'g-medium' };
+  const catalog = parseAgyModels('g-medium\tModel (medium)\ng-high\tModel (high)\nother-low\tOther (low)');
+  const resolved = resolveAnswerEffort(gemini, 'high', undefined, catalog);
+  assert.equal(resolved.target.model, 'g-high');
+  assert.equal(resolved.target.reasoningEffort, undefined);
+  assert.equal(resolved.choice.level, 'high');
+  assert.equal(resolveAnswerEffort(gemini, 'low', undefined, catalog), undefined);
+  const alias = { ...gemini, id: 'same-model', model: 'g-high' };
+  const other = { ...gemini, id: 'different-model', model: 'other-low' };
+  assert.deepEqual(independentTargets([gemini], [gemini, alias, other], 2), [gemini, other]);
+});
+
+test('answer policy preserves configured synthesis effort and the original policy for a later opinion', async t => {
+  const answer = async function* ({ reasoningEffort }) { yield { type: 'done', text: reasoningEffort ?? 'native' }; };
+  const codex = { ...target('codex', answer), reasoningEffort: 'high' };
+  const claude = { ...target('claude', answer), reasoningEffort: 'medium' };
+  const offline = target('offline', answer);
+  offline.adapter.detect = async () => ({ installed: false });
+  const opts = { cwd: workspace(t), targets: [codex, claude, offline] };
+  const config = { providers: ['codex', 'claude'], synthesizer: 'offline', answerEffort: 'low' };
+  const multi = await startComparison({ ...opts, question: '给两个独立意见', config: { ...config, routing: 'multi' } }).done;
+  assert.deepEqual(multi.calls.map(c => [c.scope, c.target.id, c.result.text]), [
+    ['answer', 'codex', 'low'], ['answer', 'claude', 'low'], ['synthesis', 'codex', 'high'],
+  ]);
+  const retry = await startComparison({ ...opts, question: '', config: { ...config, answerEffort: 'high' },
+    retry: { record: loadRun(opts.cwd, multi.id), targetIds: ['codex', 'claude'] } }).done;
+  assert.deepEqual(retry.calls.map(c => [c.scope, c.result.text]), [['answer', 'low'], ['answer', 'low'], ['synthesis', 'high']]);
+  const original = await startComparison({ ...opts, question: '给个判断', config: { ...config, routing: 'single' } }).done;
+  const opinion = await startComparison({ ...opts, question: '', config: { ...config, answerEffort: 'high' },
+    supplement: { source: original, action: 'opinion' } }).done;
+  assert.deepEqual(opinion.calls.map(c => [c.scope, c.target.id, c.result.text]), [['answer', 'claude', 'low']]);
+  assert.deepEqual(opinion.routing.answers.map(a => [a.targetId, a.level]), [['codex', 'low'], ['claude', 'low']]);
+});
+
+test('the auto decider runs only for ambiguous choices and fails back to one answer', async (t) => {
+  const cwd = workspace(t);
+  const answer = async function* () { yield { type: 'done', text: '回答' }; };
+  const router = target('router', async function* () { throw new Error('down'); });
+  const run = await startComparison({
+    cwd, config: { routing: 'auto', providers: ['a', 'b'], decider: router.id },
+    question: '方案 A 和方案 B 怎么选？', targets: [target('a', answer), target('b', answer), router],
+  }).done;
+  assert.deepEqual(run.calls.map(c => [c.scope, c.target.id]), [['decision', 'router'], ['answer', 'a']]);
+  assert.match(run.routing.reason, /无可用结果/);
+});
+
+test('an additional opinion and deferred synthesis reuse independent answers and the original history', async (t) => {
+  const cwd = workspace(t);
+  const a = target('a', async function* () { yield { type: 'done', text: '首答正文' }; });
+  const b = target('b', async function* ({ prompt }) {
+    assert.match(prompt, /原问题/);
+    assert.match(prompt, /前文/);
+    assert.doesNotMatch(prompt, /首答正文/);
+    yield { type: 'done', text: '第二意见' };
+  });
+  const judge = target('judge', async function* ({ prompt }) {
+    assert.match(prompt, /首答正文/);
+    assert.match(prompt, /第二意见/);
+    yield { type: 'done', text: '汇总正文' };
+  });
+  const opts = { cwd, config: { providers: ['a'], synthesizer: 'judge', routing: 'auto' }, targets: [a, b, judge] };
+  const original = await startComparison({ ...opts, question: '原问题', handoff: { turnId: 'earlier', question: '前文', answer: '背景' } }).done;
+  const opinion = await startComparison({ ...opts, question: '', supplement: { source: original, action: 'opinion' } }).done;
+  assert.equal(opinion.supplementOf, original.id);
+  assert.deepEqual(opinion.calls.map(c => [c.scope, c.target.id]), [['answer', 'b']]);
+  assert.equal(opinion.results[0].runId, original.results[0].runId);
+  assert.equal(selectPlan(opinion, 'a').text, '首答正文');
+  assert.equal(historyAfter(opinion, undefined, 'b').at(-1).answer, '第二意见');
+  assert.throws(() => startComparison({ ...opts, question: '', supplement: { source: original, action: 'opinion' } }), /最新/);
+  const synthesis = await startComparison({ ...opts, question: '', supplement: { source: opinion, action: 'synthesis' } }).done;
+  assert.deepEqual(synthesis.calls.map(c => c.scope), ['synthesis']);
+  assert.deepEqual(synthesis.results.map(r => r.runId), opinion.results.map(r => r.runId));
+  assert.equal(loadRun(cwd, synthesis.id).synthesis.result.text, '汇总正文');
+  assert.equal(loadRun(cwd, original.id).results.length, 1);
+});
+
 test('orphaned records expose interruption without rewriting history', async (t) => {
   const cwd = workspace(t);
   const run = await startComparison({ cwd, config: {}, question: 'Q', targets: [target('a', async function* () { yield { type: 'done', text: 'answer' }; })] }).done;

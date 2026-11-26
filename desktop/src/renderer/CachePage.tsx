@@ -4,7 +4,7 @@ import { unify } from './api.js';
 import { Spinner } from './ui.js';
 
 const stages: Record<string, string> = {
-  answer: '回答', decision: '路由', 'dispute-assessment': '分歧判断', 'source-check': '原文核查', synthesis: '汇总',
+  answer: '回答', advisor: '顾问复核', 'advisor-revision': '复核后修订', decision: '路由', 'dispute-assessment': '分歧判断', 'source-check': '原文核查', synthesis: '汇总',
   'plan-review': '方案复核', exec: '执行', 'result-review': '执行复核', report: '结果汇报', benchmark: '评测', distill: '记忆提炼', 'model-check': '模型检查',
 };
 

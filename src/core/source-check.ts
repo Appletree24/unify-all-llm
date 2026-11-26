@@ -14,7 +14,7 @@ const excerpt = z.object({
   quote: z.string().min(1).max(2400),
 });
 
-function readJsonReply(text: string): unknown {
+export function readJsonReply(text: string): unknown {
   const body = text.trim();
   const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/i.exec(body);
   try { return JSON.parse(fenced?.[1] ?? body); } catch { return undefined; }

@@ -1,7 +1,8 @@
 import { join } from 'node:path';
 import { readJson } from './config.js';
 import { listRunIds, loadRun, type RunRecord } from './store.js';
-import { SESSION_TITLE_LIMIT } from './types.js';
+import { runningStatus, SESSION_TITLE_LIMIT } from './types.js';
+export { runningStatus } from './types.js';
 
 export function sessionSettingsPath(cwd: string, first: RunRecord): string {
   return join(cwd, '.unify', 'runs', first.id, 'desktop-session.json');
@@ -24,9 +25,6 @@ export function readSessionRuns(cwd: string, sessionId?: string): RunRecord[] {
   }
   return runs;
 }
-
-export const runningStatus = (status: RunRecord['status']) =>
-  status === 'created' || status === 'deciding' || status === 'answering' || status === 'synthesizing';
 
 /** Input is in run-id order, as returned by listRunIds. */
 export function summarizeSessions(cwd: string, runs: RunRecord[]) {

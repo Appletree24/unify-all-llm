@@ -1,6 +1,7 @@
 import { deleteCollection, saveCollection } from '../../../src/bench/catalog.js';
 import { candidateEvidence, capture, deleteEntry, getCandidate, getCase, getDraft, listBench, saveDraft } from '../../../src/bench/cases.js';
 import { loadRun } from '../../../src/core/store.js';
+import { routingModeSchema } from '../../../src/core/config.js';
 import { readCacheReport } from '../../../src/core/cache-monitor.js';
 import { clearMaterials, discardMaterial, stageMaterial } from './materials.js';
 import type { MenuItemConstructorOptions } from 'electron';
@@ -31,11 +32,13 @@ interface State {
 
 function parseComposerSelection(value: unknown): ComposerSelection | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const { selected, synth, graph } = value as Record<string, unknown>;
+  const { selected, synth, graph, routing } = value as Record<string, unknown>;
   if (selected !== undefined && (!Array.isArray(selected) || selected.some((id) => typeof id !== 'string'))) return undefined;
   if (synth !== undefined && typeof synth !== 'string') return undefined;
   if (graph !== undefined && typeof graph !== 'string') return undefined;
-  return { selected: selected && [...new Set(selected)], synth, graph };
+  const mode = routingModeSchema.optional().safeParse(routing);
+  if (!mode.success) return undefined;
+  return { selected: selected && [...new Set(selected)], synth, graph, routing: mode.data };
 }
 
 function readState(): State {
@@ -245,11 +248,17 @@ const api: UnifyApi = {
       cwd, session: sessionId => ws.session(sessionId), liveTurn: turnId => ws.liveTurn(turnId),
       async ask(question, parent, signal) {
         const prefs = state.composerSelections[cwd];
-        const { selected, synth, graph } = resolveComposerSelection(ws.info(), prefs);
+        const { selected, synth, graph, routing, manual } = resolveComposerSelection(ws.info(), prefs);
         const result = await ws.ask({
-          question, sessionId: id, expectedTurnId: parent, selected, graph, manual: prefs?.selected !== undefined,
+          question, sessionId: id, expectedTurnId: parent, selected, graph, manual, routing,
           synthesize: synth !== 'off', synthesizer: synth && synth !== 'off' ? synth : undefined,
         }, signal);
+        return result.turnId;
+      },
+      async supplement(turnId, action, signal) {
+        signal.throwIfAborted();
+        const { synth } = resolveComposerSelection(ws.info(), state.composerSelections[cwd]);
+        const result = await ws.supplement(turnId, action, synth && synth !== 'off' ? synth : undefined);
         return result.turnId;
       },
     }, id, join(here, 'mobile'));
@@ -279,6 +288,7 @@ const api: UnifyApi = {
   },
   async ask(cwd, req) { return currentWorkspace(cwd).ask(req); },
   async retry(cwd, turnId, targetIds) { return currentWorkspace(cwd).retry(turnId, targetIds); },
+  async supplement(cwd, turnId, action, synthesizer) { return currentWorkspace(cwd).supplement(turnId, action, synthesizer); },
   async cancel(cwd, turnId) { currentWorkspace(cwd).cancel(turnId); },
   async cancelTarget(cwd, turnId, targetId) { return currentWorkspace(cwd).cancelTarget(turnId, targetId); },
   async respondInteraction(cwd, turnId, interactionId, response) { return currentWorkspace(cwd).respondInteraction(turnId, interactionId, response); },

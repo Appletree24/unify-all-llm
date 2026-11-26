@@ -1,4 +1,5 @@
-import { openJsonl, probeVersion, runJsonl } from '../core/proc.js';
+import { openHarness } from '../core/harness-pool.js';
+import { probeVersion, runJsonl } from '../core/proc.js';
 import type { InteractionOption, InteractionQuestion, ProviderAdapter, ProviderEvent, RunRequest, Usage } from '../core/types.js';
 
 export interface BinaryTarget {
@@ -116,11 +117,7 @@ class CodexStartupError extends Error {}
  */
 async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGenerator<ProviderEvent> {
   const interact: NonNullable<RunRequest['interact']> = req.interact ?? (async () => ({ cancelled: true }));
-  const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), 'app-server'], {
-    cwd: req.cwd,
-    signal: req.signal,
-    nativeExecutable: bin.nativeExecutable,
-  });
+  const session = openHarness(req, bin, ['app-server'], 'codex', 'rpc');
 
   let acc = '';
   let lastMessage = '';
@@ -147,13 +144,19 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
     },
   });
 
-  session.send({
-    id: 1,
-    method: 'initialize',
-    params: { clientInfo: { name: 'unify_llm', title: 'Unify LLM', version: '0.1.0' } },
+  const startTurn = (threadId: string) => session.send({
+    id: 3, method: 'turn/start',
+    params: { threadId, input: [{ type: 'text', text: resumeId ? req.conversation!.turnPrompt : req.prompt }],
+      ...(req.reasoningEffort ? { effort: req.reasoningEffort } : {}) },
   });
-
   try {
+    if (session.reused) {
+      const previousThread = session.worker.initialized?.threadId;
+      if (previousThread && previousThread !== resumeId) session.send({ id: 4, method: 'thread/unsubscribe', params: { threadId: previousThread } });
+      openThread();
+    }
+    else session.send({ id: 1, method: 'initialize',
+      params: { clientInfo: { name: 'unify_llm', title: 'Unify LLM', version: '0.1.0' } } });
     for await (const ev of session.events) {
       // 1. Responses to our client->server JSON-RPC requests
       if (ev.id === 1 && !ev.method) {
@@ -181,15 +184,7 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
         if (typeof threadId !== 'string' || !threadId) throw new Error('Codex 未返回 threadId');
         activeThread = threadId;
         if (req.conversation?.resumeId && !resumeId) req.onPublicReplay?.();
-        session.send({
-          id: 3,
-          method: 'turn/start',
-          params: {
-            threadId,
-            input: [{ type: 'text', text: resumeId ? req.conversation!.turnPrompt : req.prompt }],
-            ...(req.reasoningEffort ? { effort: req.reasoningEffort } : {}),
-          },
-        });
+        startTurn(threadId);
         continue;
       }
       if (ev.id === 3 && !ev.method) {
@@ -201,6 +196,11 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
       // 2. Server->Client interactive requests (have both id and method)
       if (ev.id !== undefined && typeof ev.method === 'string') {
         const params = (ev.params && typeof ev.params === 'object') ? ev.params : {};
+        const origin = params.threadId ?? params.conversationId;
+        if (session.reused && (!activeThread || origin !== activeThread || (params.turnId && activeTurn && params.turnId !== activeTurn))) {
+          session.send({ id: ev.id, error: { code: -32600, message: 'Request outside the active turn' } });
+          continue;
+        }
         if (ev.method === 'item/commandExecution/requestApproval' || ev.method === 'execCommandApproval') {
           const response = await interact({
             kind: 'approval',
@@ -305,8 +305,10 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
       const method = ev.method;
       const params = ev.params ?? {};
       if (!activeThread || (params.threadId && params.threadId !== activeThread)) continue;
-      if (method === 'turn/started') activeTurn = params.turn?.id;
-      if (params.turnId && activeTurn && params.turnId !== activeTurn) continue;
+      if (method === 'turn/started' && !activeTurn) activeTurn = params.turn?.id;
+      const eventTurn = params.turnId ?? params.turn?.id;
+      if (eventTurn && activeTurn && eventTurn !== activeTurn) continue;
+      if (session.reused && !activeTurn) continue;
       if (method === 'item/agentMessage/delta' && typeof params.delta === 'string' && params.delta) {
         const itemId = typeof params.itemId === 'string' ? params.itemId : '__default__';
         let chunk = params.delta;
@@ -359,7 +361,6 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
       } else if (method === 'error') {
         diagnostic = String(params.error?.message ?? params.message ?? 'Codex 请求失败');
       } else if (method === 'turn/completed') {
-        completed = true;
         const turn = params.turn ?? {};
         const status = turn.status;
         if (status === 'failed') {
@@ -369,6 +370,8 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
           yield { type: 'error', message: String(turn.error?.message ?? 'Codex 本轮已中断'), status: 'cancelled' };
           break;
         }
+        completed = true;
+        session.worker.initialized = { threadId: activeThread, turnId: turn.id };
         yield {
           type: 'done',
           nativeSession: req.conversation && activeThread ? { id: activeThread, turnId: turn.id, forkable: !!turn.id } : undefined,
@@ -382,7 +385,7 @@ async function* runCodexAppServer(req: RunRequest, bin: BinaryTarget): AsyncGene
     if (!activeThread) throw new CodexStartupError(String(err), { cause: err });
     throw err;
   } finally {
-    await session.close();
+    await session.release(completed ? 'rpc' : undefined);
   }
 
   if (!completed && diagnostic) throw new Error(diagnostic);
@@ -403,7 +406,7 @@ export function createCodexAdapter(bin: BinaryTarget = DEFAULT_CODEX_BIN): Provi
     },
 
     async *run(req: RunRequest): AsyncGenerator<ProviderEvent> {
-      if (req.interact || req.conversation) {
+      if (req.harnesses || req.interact || req.conversation) {
         try {
           yield* runCodexAppServer(req, bin);
           return;

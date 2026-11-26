@@ -2,7 +2,8 @@ import type { BenchIndex, BenchCase, Candidate, Collection, Publication, Reposit
 import type { BenchResult } from '../../../src/bench/workflow.js';
 export type { BenchIndex, BenchCase, Candidate, Collection, Publication, Repository, BenchResult };
 // The contract between the Electron main process and the renderer. Types only.
-import type { Config, ReasoningEffort } from '../../../src/core/config.js';
+import type { Config, ReasoningEffort, RoutingMode } from '../../../src/core/config.js';
+import type { SupplementAction } from '../../../src/core/routing.js';
 import type { InteractionOption, InteractionQuestion, InteractionRequest, InteractionResponse, PendingInteraction } from '../../../src/core/types.js';
 import type { RunRecord } from '../../../src/core/store.js';
 import type { ModelTestState } from '../../../src/core/model-tests.js';
@@ -53,6 +54,8 @@ export interface WorkspaceInfo {
   synthesizer?: string;
   executor?: string;
   decider?: string;
+  routing?: RoutingMode;
+  answerModel?: string | null;
   collaborationGraphs: NonNullable<Config['collaborationGraphs']>;
   showReasoning: boolean;
   configError?: string;
@@ -63,14 +66,18 @@ export interface ComposerSelection {
   selected?: string[];
   synth?: string;
   graph?: string;
+  routing?: RoutingMode;
 }
 
 export function resolveComposerSelection(workspace: WorkspaceInfo | null | undefined, selection?: ComposerSelection) {
   const available = new Set(workspace?.targets.filter(target => target.installed !== false).map(target => target.id));
-  const selected = (selection?.selected ?? workspace?.defaults ?? []).filter(id => available.has(id));
+  const routing = selection?.routing ?? workspace?.routing ?? 'standard';
+  const manual = routing !== 'auto' && selection?.selected !== undefined;
+  const selected = ((manual ? selection.selected : workspace?.answerModel ? [workspace.answerModel] : workspace?.defaults) ?? []).filter(id => available.has(id));
   const synth = selection?.synth ?? '';
   return {
-    selected, synth: synth === 'off' || available.has(synth) ? synth : '',
+    selected: routing === 'single' && manual ? selected.slice(0, 1) : selected,
+    manual, routing, synth: synth === 'off' || available.has(synth) ? synth : '',
     graph: selection?.graph && workspace && Object.hasOwn(workspace.collaborationGraphs, selection.graph) ? selection.graph : undefined,
   };
 }
@@ -106,6 +113,7 @@ export interface AskRequest {
   question: string;
   selected: string[];
   manual: boolean;
+  routing?: RoutingMode;
   synthesize: boolean;
   synthesizer?: string;
   /** Continue this session's latest comparison; omit to start a new one. */
@@ -183,6 +191,7 @@ export interface UnifyApi {
   updateSession(cwd: string, id: string, changes: SessionChanges): Promise<void>;
   deleteSession(cwd: string, id: string): Promise<void>;
   ask(cwd: string, req: AskRequest): Promise<{ turnId: string; sessionId: string }>;
+  supplement(cwd: string, turnId: string, action: SupplementAction, synthesizer?: string): Promise<{ turnId: string; sessionId: string }>;
   retry(cwd: string, turnId: string, targetIds?: string[]): Promise<{ turnId: string; sessionId: string }>;
   cancel(cwd: string, turnId: string): Promise<void>;
   closeCollaboration(cwd: string, turnId: string): Promise<void>;

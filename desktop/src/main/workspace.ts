@@ -1,3 +1,5 @@
+import { HarnessPool } from '../../../src/core/harness-pool.js';
+import { answerMode } from '../../../src/core/routing.js';
 import { repoSchema, type Publication, type Repository } from '../../../src/bench/cases.js';
 import { draftCase, publish, runBench } from '../../../src/bench/workflow.js';
 import { lstatSync, mkdtempSync, realpathSync, renameSync, rmdirSync, statSync } from 'node:fs';
@@ -24,6 +26,7 @@ import { targetModelIds, modelIds } from '../../../src/providers/models.js';
 import { officialApis, readApiProfile, saveApiProfile } from '../../../src/providers/official.js';
 import { QUOTA_REFRESH_MS, readTargetQuotas, type TargetQuota } from '../../../src/quota/index.js';
 import { SESSION_TITLE_LIMIT, type AskRequest, type ExecPreview, type InteractionResponse, type WorkspacePush, type SessionChanges, type SessionSummary, type SettingsInfo, type TargetInfo, type WorkspaceInfo } from '../shared/api.js';
+import type { SupplementAction } from '../../../src/core/routing.js';
 
 const ACTIVE = new Set<RunRecord['status']>(['created', 'deciding', 'answering', 'synthesizing']);
 const SESSION_BUSY = '这个对话还有请求在进行，请等待完成或先取消';
@@ -37,6 +40,7 @@ const message = (err: unknown) => (err instanceof Error ? err.message : String(e
  * Everything model-related goes through the same core functions the CLI and TUI use.
  */
 export class Workspace {
+  private readonly harnesses = new HarnessPool();
   cfg: Config = {};
   targets: ModelTarget[] = [];
   configError?: string;
@@ -98,7 +102,7 @@ export class Workspace {
     const ctl = (this.detectCtl = new AbortController());
     const targets = this.targets;
     this.installed = new Map();
-    this.detecting = detectTargets(targets, ctl.signal).then((found) => {
+    this.detecting = detectTargets(targets, ctl.signal, this.harnesses.available).then((found) => {
       if (ctl.signal.aborted) return;
       this.installed = found;
       this.pushInfo();
@@ -127,6 +131,7 @@ export class Workspace {
     return {
       cwd: this.cwd, name: basename(this.cwd) || this.cwd, branch: this.branch, targets, defaults,
       synthesizer: this.cfg.synthesizer, executor: this.cfg.executor, decider: this.cfg.decider,
+      routing: answerMode(this.cfg), answerModel: this.cfg.answerModel,
       collaborationGraphs: this.cfg.collaborationGraphs ?? {},
       showReasoning: this.cfg.showReasoning ?? false, configError: this.configError,
     };
@@ -346,11 +351,25 @@ export class Workspace {
     }
     if (req.materials?.length && req.materialWorkspace !== this.cwd) throw new Error('请回到添加材料的项目发送');
     const materials = req.materials?.length ? commitMaterials(this.cwd, req.materials) : undefined;
-    return this.start((onEvent) => startComparison({
+    return this.start((onEvent) => startComparison({ harnesses: this.harnesses,
       cwd: this.cwd, config, targets: this.targets, question: req.question, selected: req.selected, collaboration: graph,
       collaborationTargets: req.reviseTurn ? previous?.collaborationTargets : undefined,
-      manualSelection: req.manual, synthesize: req.synthesize, previous, continueFrom: req.continueFrom,
+      manualSelection: req.manual, routing: req.routing, synthesize: req.synthesize, previous, continueFrom: req.continueFrom,
       memoryUpdates: req.memoryUpdates, materials, expandFileMentions: !req.replyTo, discussionFormat, interactive: true, onEvent,
+    }));
+  }
+
+  async supplement(turnId: string, action: SupplementAction, synthesizer?: string): Promise<{ turnId: string; sessionId: string }> {
+    if (this.configError) throw new Error(`配置有误：${this.configError}`);
+    await this.detecting;
+    if (this.disposed) throw new Error('项目已关闭');
+    const source = this.load(turnId);
+    if (!source) throw new Error(`找不到记录 ${turnId}`);
+    this.assertSessionIdle(source.sessionId);
+    const config = synthesizer ? parseConfig({ ...this.cfg, synthesizer }) : this.cfg;
+    return this.start(onEvent => startComparison({ harnesses: this.harnesses,
+      cwd: this.cwd, config, targets: this.targets, question: source.question,
+      supplement: { source, action }, discussionFormat, interactive: true, onEvent,
     }));
   }
 
@@ -362,7 +381,7 @@ export class Workspace {
     if (original.collaboration) {
       if (original.kind !== 'comparison') throw new Error('实施不能自动重试');
       this.assertSessionIdle(original.sessionId);
-      return this.start(onEvent => startComparison({
+      return this.start(onEvent => startComparison({ harnesses: this.harnesses,
         cwd: this.cwd, config: this.cfg, targets: this.targets, question: original.question, collaboration: original.collaboration,
         retry: { record: original, targetIds: original.collaboration!.plans.map(p => p.target) }, discussionFormat, interactive: true, onEvent,
       }));
@@ -370,7 +389,7 @@ export class Workspace {
     this.assertSessionIdle(original.sessionId);
     const ids = targetIds?.length ? targetIds : original.targets.filter((t) => !original.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id);
     if (!ids.length) throw new Error('没有需要重试的目标');
-    return this.start((onEvent) => startComparison({
+    return this.start((onEvent) => startComparison({ harnesses: this.harnesses,
       cwd: this.cwd, config: this.cfg, targets: this.targets, question: '',
       retry: { record: original, targetIds: ids }, discussionFormat, interactive: true, onEvent,
     }));
@@ -440,7 +459,7 @@ export class Workspace {
       }
     }
     const executor = chooseExecutor(this.targets, executorId, this.installed);
-    return this.start((onEvent) => startExecution({ cwd: this.cwd, config: this.cfg, targets: this.targets, executor, source, from, interactive: true, onEvent }));
+    return this.start((onEvent) => startExecution({ harnesses: this.harnesses, cwd: this.cwd, config: this.cfg, targets: this.targets, executor, source, from, interactive: true, onEvent }));
   }
 
   // ── quota, settings, memory ────────────────────────────────────────────
@@ -580,6 +599,7 @@ export class Workspace {
     for (const h of pending) h.cancel();
     const deletions = Array.from(this.deletions.values(), (deletion) => deletion.catch(() => undefined));
     await Promise.all([quota, this.branchChange?.catch(() => undefined), this.modelTests.reset(), ...pending.map((h) => h.done.catch(() => undefined)), ...deletions]);
+    await this.harnesses.dispose();
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 }

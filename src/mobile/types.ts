@@ -1,4 +1,5 @@
 import type { RunRecord } from '../core/store.js';
+import type { SupplementAction } from '../core/routing.js';
 
 export interface MobileNetwork {
   name: string;
@@ -29,6 +30,9 @@ export interface MobileTurn {
   waitingForInput: boolean;
   error?: string;
   answers: MobileAnswer[];
+  routing?: string;
+  advisor?: string;
+  actions?: SupplementAction[];
 }
 
 export interface MobileUpdate {

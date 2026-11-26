@@ -1,6 +1,10 @@
+import { advisorText } from '../../../src/core/advisor.js';
+import { effortLabel } from '../../../src/providers/effort.js';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from 'react';
 import { synthesisFormatter } from '../../../src/core/synth.js';
 import { graphIssue, graphPlanResult, graphStages, isReviewOrReport, roleNames, type Collaboration } from '../../../src/core/collaboration.js';
+import type { RoutingMode } from '../../../src/core/config.js';
+import { routingLabels, routingNotice, supplementActions, supplementLabels, type SupplementAction } from '../../../src/core/routing.js';
 import type { DistillApplyResult, DistillCandidate, DistillPreparation, DistillSourceRef, DuplicateCheckResult, ExecPreview, InteractionOption, RunRecord, RunResultRecord, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
 import { useAnimatedDialog, usePresence } from './motion.js';
@@ -30,6 +34,7 @@ export interface TurnActions {
   zoom(turnId: string, runId: string, trigger: HTMLButtonElement): void;
   exec(turnId: string, from?: string): void;
   retry(turnId: string, targetIds?: string[]): void;
+  supplement(turnId: string, action: SupplementAction): void;
   cancel(turnId: string): void;
   cancelTarget(turnId: string, targetId: string): void;
   respondInteraction: Respond;
@@ -86,7 +91,7 @@ export function Card({ record, result, kind, showReasoning, interactions, action
   const prefix = { answer: '', synthesis: '汇总', exec: '实施', 'plan-review': '方案复核', 'result-review': '实施复核', report: roleNames.report }[kind];
   const label = (prefix ? prefix + ' · ' : '') + (target?.label ?? result.targetId);
   const canAnnotate = !isReviewOrReport(kind);
-  const meta = [result.model, result.reasoningEffort && `思考 ${result.reasoningEffort}`].filter(Boolean).join(' · ');
+  const meta = [result.model, result.reasoningEffort && effortLabel(result.reasoningEffort, '思考 ')].filter(Boolean).join(' · ');
   const elapsed = running ? now - (firstSeen.get(result.runId) ?? now) : result.durationMs;
   const turnRunning = isActive(record);
 
@@ -292,7 +297,8 @@ export function Turn({ cwd, record, notices, interactions, showReasoning, action
   isLatestComparison?: boolean; isLatestTurn?: boolean; followUp?: FollowUpChoice; execution?: RunRecord; graphExecutor?: string; choiceBlocker?: string;
 }) {
   const active = isActive(record);
-  const messages = [...new Set([...notices, ...record.calls.flatMap(c =>
+  const route = record.routing && routingNotice(record.routing);
+  const messages = [...new Set([...notices.filter(m => m !== route && !m.startsWith('顾问复核 ·')), ...record.calls.flatMap(c =>
     (c.result.cacheWarnings ?? []).map(w => '缓存监控 · ' + c.target.label + ' · ' + w))])];
   const noticesView = messages.length > 0 && <div className="notices" role="status">{messages.map(m => <div key={m}>{m}</div>)}</div>;
   const pendingItems = Object.values(interactions ?? {}).flat().filter(item => item.turnId === record.id);
@@ -352,6 +358,7 @@ export function Turn({ cwd, record, notices, interactions, showReasoning, action
         <div className="q-meta">
           <span>{time}</span>
           {record.retryOf && <span>重试</span>}
+          {route && <span>{route}</span>}
           {answers.length > 0 && <span>{answers.length} 个模型</span>}
         </div>
       </div>
@@ -372,6 +379,7 @@ export function Turn({ cwd, record, notices, interactions, showReasoning, action
         </div>
       )}
       {record.synthesis && <Card key={record.synthesis.result.runId} record={record} result={record.synthesis.result} kind="synthesis" showReasoning={showReasoning} interactions={interactions?.[record.synthesis.result.runId]} actions={actions} />}
+      {record.advisor && <section className="notices" aria-label="顾问复核"><Markdown text={advisorText(record.advisor)} /></section>}
       {reviewCards}
       {requests}
       {choices.length > 0 && <FollowUpQuestions key={from ?? ''} groups={choices} blocked={choiceBlocker}
@@ -389,6 +397,8 @@ export function Turn({ cwd, record, notices, interactions, showReasoning, action
           <button className="ghost" onClick={() => actions.cancel(record.id)}><Icon name="stop" size={14} />取消本轮</button>
         ) : (
           <>
+            {isLatestTurn && supplementActions(record).map(action => <button className="ghost" key={action}
+              onClick={() => actions.supplement(record.id, action)}>{supplementLabels[action]}</button>)}
             {anyOk && !record.collaboration && <button className="ghost" onClick={() => actions.exec(record.id)}><Icon name="run" size={14} />实施方案…</button>}
             {anyOk && showChoices && !choices.length && <CollectQuestionsButton blocked={choiceBlocker} send={text => actions.sendChoices(text, record)} />}
             {actions.benchmark && <button className="ghost" onClick={() => actions.feedback(record)}>{answers.length > 1 ? '比较回答 / 整轮留题' : '整轮反馈 / 留题'}</button>}
@@ -402,7 +412,7 @@ export function Turn({ cwd, record, notices, interactions, showReasoning, action
 }
 
 // ── composer ──────────────────────────────────────────────────────────────
-export interface ComposerState { selected: string[]; synth: string; graph?: string }
+export interface ComposerState { selected: string[]; synth: string; graph?: string; routing: RoutingMode; manual: boolean }
 
 function SynthesisPicker({ targets, defaultId, value, onChange }: {
   targets: WorkspaceInfo['targets']; defaultId?: string; value: string; onChange(value: string): void;
@@ -472,24 +482,29 @@ function SynthesisPicker({ targets, defaultId, value, onChange }: {
   );
 }
 
-function ModePicker({ graphs, value, revision, route, onSelect, onManage }: {
+function ModePicker({ graphs, value, routing, revision, route, onSelect, onRouting, onManage }: {
   graphs: WorkspaceInfo['collaborationGraphs'];
   value?: string;
+  routing: RoutingMode;
   revision?: Collaboration;
   route?: string;
   onSelect(id?: string): void;
+  onRouting(mode: RoutingMode): void;
   onManage(): void;
 }) {
   const menuId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
-  const current = revision ? 'revision' : value ?? '';
-  const items: { value: string; label: string; detail?: string; icon: string }[] = [
-    { value: '', label: '普通问答', detail: '自由选择参与模型与汇总', icon: 'chat' },
-    ...(revision ? [{ value: 'revision', label: `修改 · ${revision.name}`, detail: '由原方案模型沿用记录调整', icon: 'edit' }] : []),
-    ...Object.entries(graphs).map(([id, g]) => ({ value: id, label: g.name, detail: '组合模版', icon: 'layers' })),
+  const current = revision ? 'revision' : value ? `graph:${value}` : routing;
+  const items = [
+    { value: 'auto', label: routingLabels.auto, detail: '支持点名，查项目优先用能读仓库的模型，按需比较', icon: 'spark', select: () => onRouting('auto') },
+    { value: 'single', label: routingLabels.single, detail: '仅由一个模型回答', icon: 'chat', select: () => onRouting('single') },
+    { value: 'multi', label: routingLabels.multi, detail: '并行请多个模型回答', icon: 'layers', select: () => onRouting('multi') },
+    { value: 'standard', label: routingLabels.standard, detail: '沿用原有问答设置', icon: 'chat', select: () => onRouting('standard') },
+    ...(revision ? [{ value: 'revision', label: `修改 · ${revision.name}`, detail: '由原方案模型沿用记录调整', icon: 'edit', select: () => {} }] : []),
+    ...Object.entries(graphs).map(([id, g]) => ({ value: `graph:${id}`, label: g.name, detail: '组合模版', icon: 'layers', select: () => onSelect(id) })),
   ];
   const active = items.find((item) => item.value === current) ?? items[0];
-  const isGraph = !!current;
+  const isGraph = !!(revision || value);
 
   return (
     <div className="synth-picker mode-picker">
@@ -530,7 +545,7 @@ function ModePicker({ graphs, value, revision, route, onSelect, onManage }: {
             <button
               key={item.value} type="button" role="menuitemradio" aria-checked={checked} tabIndex={-1}
               className="synth-item" onClick={(event) => {
-                onSelect(item.value || undefined);
+                item.select();
                 event.currentTarget.closest<HTMLElement>('[popover]')?.hidePopover();
                 trigger.current?.focus();
               }}
@@ -557,9 +572,10 @@ function ModePicker({ graphs, value, revision, route, onSelect, onManage }: {
   );
 }
 
-export function Composer({ home = false, ws, quota, busy, state, onToggleTarget, onSynthesisChange, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp, pendingMemoryUpdates, onClearMemoryUpdates, onGraph, editGraph, revision, inserted, consumed }: {
+export function Composer({ home = false, ws, quota, busy, state, onToggleTarget, onSynthesisChange, onSend, onCancel, autoFocusKey, followUp, onClearFollowUp, pendingMemoryUpdates, onClearMemoryUpdates, onGraph, onRouting, editGraph, revision, inserted, consumed }: {
   home?: boolean; ws: WorkspaceInfo; quota: Map<string, TargetQuota>; busy: boolean;
   onGraph(id?: string): void; editGraph(): void; revision?: Collaboration;
+  onRouting(mode: RoutingMode): void;
   state: ComposerState; onToggleTarget(id: string): void; onSynthesisChange(value: string): void;
   onSend(text: string, materials?: MaterialSelection[]): Promise<boolean>; onCancel(): void; autoFocusKey: string;
   inserted?: { text: string }; consumed?(): void;
@@ -593,11 +609,11 @@ export function Composer({ home = false, ws, quota, busy, state, onToggleTarget,
   const usable = ws.targets.filter((t) => t.installed !== false);
   const graph = revision ?? (state.graph ? ws.collaborationGraphs[state.graph] : undefined);
   const problem = graph && graphIssue(graph, ws.targets);
-  const count = graph ? (problem ? 0 : graph.plans.length) : state.selected.length;
+  const hasAnswerTarget = graph ? !problem && graph.plans.length > 0 : state.routing === 'auto' ? usable.length > 0 : state.selected.length > 0;
   const route = graph && graphStages(graph).map(s => s === 'confirm' ? '本人确认' : s === 'plan' ? graph.plans.map(p => p.target).join(' + ') : graph[s]!.target).join(' → ');
   const send = async () => {
     const q = text.trim() || (materials.drafts.length ? '请根据附上的材料作答。' : '');
-    if (!q || busy || sending || materials.pending || materials.recording || !count) return;
+    if (!q || busy || sending || materials.pending || materials.recording || !hasAnswerTarget) return;
     setSending(true);
     const ok = await onSend(q, materials.drafts.map(d => ({ id: d.item.id, note: d.note })));
     setSending(false);
@@ -635,7 +651,7 @@ export function Composer({ home = false, ws, quota, busy, state, onToggleTarget,
         onDragOver={e => { if (e.dataTransfer.types.includes('Files')) e.preventDefault(); }}>
         <textarea
           ref={area} value={text} rows={home ? 2 : 1} spellCheck={false}
-          placeholder={problem ?? (revision ? '告诉方案模型你想调整什么…' : graph ? '描述要协作完成的任务…' : count ? (home ? '问点什么，或描述你想做的事…' : '继续提问…') : '先选择一个回答模型')}
+          placeholder={problem ?? (revision ? '告诉方案模型你想调整什么…' : graph ? '描述要协作完成的任务…' : hasAnswerTarget ? (home ? '问点什么，或描述你想做的事…' : '继续提问…') : '先选择一个回答模型')}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); }
@@ -654,21 +670,21 @@ export function Composer({ home = false, ws, quota, busy, state, onToggleTarget,
         />
         <MaterialInput input={materials} disabled={sending} />
         <div className="composer-bar">
-          <ModePicker graphs={ws.collaborationGraphs} value={state.graph} revision={revision} route={route} onSelect={onGraph} onManage={editGraph} />
+          <ModePicker graphs={ws.collaborationGraphs} value={state.graph} routing={state.routing} revision={revision} route={route} onSelect={onGraph} onRouting={onRouting} onManage={editGraph} />
           {graph ? (
             <button type="button" className="synth-trigger" onClick={editGraph} title="编辑组合模版"><Icon name="sliders" size={13} /><span>编辑模版</span></button>
           ) : (
             <span className="composer-sep" aria-hidden="true" />
           )}
           <div className="chips">
-            {!graph && usable.map((t) => {
+            {!graph && state.routing !== 'auto' && usable.map((t) => {
               const q = quotaSummary(quota.get(t.id)?.reading, t);
-              const on = state.selected.includes(t.id);
+              const on = (state.routing !== 'single' || state.manual) && state.selected.includes(t.id);
               return (
                 <button
                   key={t.id} type="button" className={`chip${on ? ' on' : ''}${q?.ratio !== undefined && q.ratio < 0.15 ? ' low' : ''}`}
                   style={{ '--h': hue(t.id) } as CSSProperties} onClick={() => onToggleTarget(t.id)} aria-pressed={on}
-                  title={`${t.label}${t.model ? ` · ${t.model}` : ''}${t.reasoningEffort ? ` · 思考 ${t.reasoningEffort}` : ''}${t.installed === undefined ? '\n正在检测…' : ''}${q?.title ? `\n${q.title}` : ''}`}
+                  title={`${t.label}${t.model ? ` · ${t.model}` : ''}${t.reasoningEffort ? ' · ' + effortLabel(t.reasoningEffort, '思考 ') : ''}${t.installed === undefined ? '\n正在检测…' : ''}${q?.title ? `\n${q.title}` : ''}`}
                 >
                   <i className={`dot${t.installed === undefined ? ' probing' : ''}`} />
                   {t.label}
@@ -677,8 +693,8 @@ export function Composer({ home = false, ws, quota, busy, state, onToggleTarget,
               );
             })}
           </div>
-          {!graph && <SynthesisPicker targets={usable} defaultId={ws.synthesizer} value={state.synth} onChange={onSynthesisChange} />}
-          <button type="button" className={`send${busy ? ' stop' : ''}`} disabled={!busy && ((!text.trim() && !materials.drafts.length) || !count || sending || !!materials.pending || !!materials.recording)}
+          {!graph && state.routing !== 'single' && <SynthesisPicker targets={usable} defaultId={ws.synthesizer} value={state.synth} onChange={onSynthesisChange} />}
+          <button type="button" className={`send${busy ? ' stop' : ''}`} disabled={!busy && ((!text.trim() && !materials.drafts.length) || !hasAnswerTarget || sending || !!materials.pending || !!materials.recording)}
             onClick={busy ? onCancel : () => void send()} title={busy ? '停止 (Esc)' : '发送 (Enter)'}>
             <Icon key={busy ? 'stop' : 'send'} name={busy ? 'stop' : 'send'} />
           </button>

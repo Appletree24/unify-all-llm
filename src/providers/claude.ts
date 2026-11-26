@@ -1,4 +1,5 @@
-import { openJsonl, probeVersion, runJsonl } from '../core/proc.js';
+import { openHarness } from '../core/harness-pool.js';
+import { probeVersion, runJsonl } from '../core/proc.js';
 import type { InteractionQuestion, ProviderAdapter, ProviderEvent, RunRequest } from '../core/types.js';
 import type { BinaryTarget } from './codex.js';
 
@@ -38,14 +39,14 @@ function mapClaudeResult(ev: Record<string, any>, req: RunRequest, acc: string):
 }
 
 async function* runClaudeInteractive(req: RunRequest, bin: BinaryTarget): AsyncGenerator<ProviderEvent> {
-  const interact = req.interact!;
+  const interact: NonNullable<RunRequest['interact']> = req.interact ?? (async () => ({ cancelled: true }));
   const args = [
     '-p',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
-    '--permission-prompts', 'host',
+    '--permission-prompts', req.interact ? 'host' : 'none',
   ];
   if (req.mode === 'ask') {
     args.push('--tools', 'Read,Glob,Grep,WebSearch,WebFetch');
@@ -54,21 +55,21 @@ async function* runClaudeInteractive(req: RunRequest, bin: BinaryTarget): AsyncG
   }
   if (req.conversation?.resumeId) args.push('--resume', req.conversation.resumeId);
   else if (req.mode === 'ask' && !req.conversation) args.push('--no-session-persistence');
-  if (req.conversation?.fork) args.push('--fork-session');
+  if (req.conversation?.turnId && req.conversation.resumeId) args.push('--resume-session-at', req.conversation.turnId);
+  if (req.conversation?.fork || req.conversation?.turnId) args.push('--fork-session');
   if (req.conversation?.fork && req.mode === 'exec') args.push('--tools', 'default');
   if (req.reasoningEffort) args.push('--effort', req.reasoningEffort);
   if (req.model) args.push('--model', req.model);
 
-  const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...args], {
-    cwd: req.cwd,
-    signal: req.signal,
-    nativeExecutable: bin.nativeExecutable,
-  });
-
-  session.send({ type: 'user', message: { role: 'user', content: req.prompt } });
-
+  const identity = (id: string, turn: string) => JSON.stringify([req.model, req.reasoningEffort, !!req.interact, id, turn]);
+  const previous = req.conversation;
+  const parent = previous?.resumeId && previous.turnId && !previous.fork ? identity(previous.resumeId, previous.turnId) : undefined;
+  const session = openHarness(req, bin, args, 'claude', parent);
+  let releaseAs: string | undefined;
+  let messageId: string | undefined;
   let acc = '';
   try {
+    session.send({ type: 'user', message: { role: 'user', content: req.prompt } });
     for await (const ev of session.events) {
       if (ev.type === 'control_request') {
         const requestId = ev.request_id;
@@ -159,6 +160,7 @@ async function* runClaudeInteractive(req: RunRequest, bin: BinaryTarget): AsyncG
 
       if (ev.parent_tool_use_id) continue; // subagent chatter
 
+      if (ev.type === 'assistant' && typeof ev.uuid === 'string') messageId = ev.uuid;
       if (ev.type === 'stream_event') {
         const e = ev.event;
         if (e?.type === 'message_start' && acc) {
@@ -176,12 +178,17 @@ async function* runClaudeInteractive(req: RunRequest, bin: BinaryTarget): AsyncG
           }
         }
       } else if (ev.type === 'result') {
-        yield mapClaudeResult(ev, req, acc);
+        const result = mapClaudeResult(ev, req, acc);
+        if (req.harnesses && result.type === 'done' && result.nativeSession && messageId) {
+          result.nativeSession.turnId = messageId;
+          releaseAs = identity(result.nativeSession.id, messageId);
+        }
+        yield result;
         break;
       }
     }
   } finally {
-    await session.close();
+    await session.release(releaseAs);
   }
 }
 
@@ -195,7 +202,8 @@ async function* runClaudeHeadless(req: RunRequest, bin: BinaryTarget): AsyncGene
   }
   if (req.conversation?.resumeId) args.push('--resume', req.conversation.resumeId);
   else if (req.mode === 'ask' && !req.conversation) args.push('--no-session-persistence');
-  if (req.conversation?.fork) args.push('--fork-session');
+  if (req.conversation?.turnId && req.conversation.resumeId) args.push('--resume-session-at', req.conversation.turnId);
+  if (req.conversation?.fork || req.conversation?.turnId) args.push('--fork-session');
   if (req.conversation?.fork && req.mode === 'exec') args.push('--tools', 'default');
   if (req.reasoningEffort) args.push('--effort', req.reasoningEffort);
   if (req.model) args.push('--model', req.model);
@@ -252,7 +260,7 @@ export function createClaudeAdapter(bin: BinaryTarget = DEFAULT_CLAUDE_BIN): Pro
         return;
       }
       let started = false;
-      const missing = /no conversation found|session (?:not found|does not exist)|could not find (?:conversation|session)/i;
+      const missing = /no conversation found|session (?:not found|does not exist)|could not find (?:conversation|session)|unknown option[^\n]*resume-session-at|(?:message|UUID)[^\n]*not found/i;
       try {
         for await (const event of run({ ...req, prompt: turn.turnPrompt }, bin)) {
           if (!started && event.type === 'error' && missing.test(event.message)) throw new Error(event.message);

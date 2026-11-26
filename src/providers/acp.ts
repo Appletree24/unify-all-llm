@@ -1,4 +1,4 @@
-import { openJsonl } from '../core/proc.js';
+import { openHarness } from '../core/harness-pool.js';
 import { TOOL_STATUSES, type InteractionOption, type InteractionResponse, type ProviderEvent, type RunRequest, type ToolUse, type Usage } from '../core/types.js';
 import type { BinaryTarget } from './codex.js';
 
@@ -46,9 +46,8 @@ function messageChunk(content: unknown): string {
 
 export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOptions): AsyncGenerator<ProviderEvent> {
   const interact: NonNullable<RunRequest['interact']> = req.interact ?? (async () => ({ cancelled: true }));
-  const session = openJsonl(bin.cmd, [...(bin.prefixArgs ?? []), ...options.args], {
-    cwd: req.cwd, signal: req.signal, nativeExecutable: bin.nativeExecutable,
-  });
+  const session = openHarness(req, bin, options.args, 'acp', 'rpc');
+  let reusable = false;
   const send = (id: number, method: string, params: object) => session.send({ jsonrpc: '2.0', id, method, params });
   let initialized = false;
   let sessionId = '';
@@ -87,8 +86,20 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
     };
   };
 
+  const openSession = (caps: Record<string, any>) => {
+    initialized = true;
+    canFork = !!caps?.sessionCapabilities?.fork;
+    const method = req.conversation?.fork
+      ? (canFork ? 'session/fork' : undefined)
+      : caps?.sessionCapabilities?.resume ? 'session/resume' : caps?.loadSession ? 'session/load' : undefined;
+    supportsResume = !!(caps?.sessionCapabilities?.resume || caps?.loadSession);
+    resumeId = method ? req.conversation?.resumeId : undefined;
+    if (method && resumeId) send(2, method, { cwd: req.cwd, mcpServers: [], sessionId: resumeId });
+    else send(2, 'session/new', { cwd: req.cwd, mcpServers: [] });
+  };
   try {
-    send(1, 'initialize', { protocolVersion: 1, clientInfo: { name: 'unify_llm', version: '0.1.0' }, clientCapabilities: {} });
+    if (session.reused) openSession(session.worker.initialized!);
+    else send(1, 'initialize', { protocolVersion: 1, clientInfo: { name: 'unify_llm', version: '0.1.0' }, clientCapabilities: {} });
     for await (const ev of session.events) {
       if (!ev.method) {
         if (ev.id === 2 && ev.error && resumeId) {
@@ -99,16 +110,8 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
         if (ev.error) throw new Error(text(ev.error.message) ?? options.label + ' ACP 请求失败');
         if (ev.id === 1) {
           if (ev.result?.protocolVersion !== 1) throw new Error(options.label + ' ACP 协议版本不受支持');
-          initialized = true;
-          const caps = ev.result?.agentCapabilities;
-          canFork = !!caps?.sessionCapabilities?.fork;
-          const method = req.conversation?.fork
-            ? (canFork ? 'session/fork' : undefined)
-            : caps?.sessionCapabilities?.resume ? 'session/resume' : caps?.loadSession ? 'session/load' : undefined;
-          supportsResume = !!(caps?.sessionCapabilities?.resume || caps?.loadSession);
-          resumeId = method ? req.conversation?.resumeId : undefined;
-          if (method && resumeId) send(2, method, { cwd: req.cwd, mcpServers: [], sessionId: resumeId });
-          else send(2, 'session/new', { cwd: req.cwd, mcpServers: [] });
+          session.worker.initialized = ev.result?.agentCapabilities ?? {};
+          openSession(session.worker.initialized!);
         } else if (ev.id === 2) {
           sessionId = ev.result?.sessionId ?? (req.conversation?.fork ? undefined : resumeId);
           if (!text(sessionId)) throw new Error(options.label + ' ACP 未返回会话 ID');
@@ -133,6 +136,7 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
             cachedInputTokens: stats.cachedReadTokens ?? stats.cachedInputTokens ?? stats.cached,
             cacheWriteTokens: stats.cachedWriteTokens,
           };
+          reusable = true;
           yield { type: 'done', text: answer, usage, nativeSession: (supportsResume || canFork) && req.conversation ? { id: sessionId, forkable: canFork } : undefined };
           break;
         }
@@ -140,6 +144,10 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
       }
 
       if (ev.id !== undefined && ev.method === 'session/request_permission') {
+        if (session.reused && (!prompting || ev.params?.sessionId !== sessionId)) {
+          session.send({ jsonrpc: '2.0', id: ev.id, result: { outcome: { outcome: 'cancelled' } } });
+          continue;
+        }
         const call = ev.params?.toolCall ?? {};
         const choices = optionsFor(ev.params?.options);
         const tool = toolEvent(call);
@@ -177,12 +185,12 @@ export async function* runAcp(req: RunRequest, bin: BinaryTarget, options: AcpOp
     if (!initialized) throw new Error(options.label + ' ACP 未初始化');
   } catch (err) {
     if (!initialized && !req.signal?.aborted) {
-      await session.close();
+      await session.release();
       yield* options.fallback();
       return;
     }
     throw err;
   } finally {
-    await session.close();
+    await session.release(reusable ? 'rpc' : undefined);
   }
 }

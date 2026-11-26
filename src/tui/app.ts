@@ -1,3 +1,4 @@
+import { HarnessPool } from '../core/harness-pool.js';
 import { capture } from '../bench/cases.js';
 import { recommend, recommendationLabel } from '../bench/recommend.js';
 import { createHandoff, editHandoff, handoffPath, readHandoff } from '../core/handoff.js';
@@ -13,6 +14,8 @@ import { timeoutMillis } from '../core/config.js';
 import { graphIssue, graphPlanResult, roleNames } from '../core/collaboration.js';
 import { runOne } from '../core/orchestrator.js';
 import { recapPrompt } from '../core/recap.js';
+import { advisorText } from '../core/advisor.js';
+import { answerMode, routingLabels, routingNotice, type SupplementAction } from '../core/routing.js';
 import { readSessionRuns, runningStatus, summarizeSessions } from '../core/sessions.js';
 import { InteractionView } from './interaction.js';
 import { HistoryView, historyEntries } from './history.js';
@@ -95,6 +98,7 @@ export interface TuiIO {
 }
 
 export class App {
+  private readonly harnesses = new HarnessPool();
   onQuit: () => void = () => {};
 
   private installed = new Map<string, boolean>();
@@ -204,7 +208,7 @@ export class App {
       }
     }, 100);
     const initial = this.all;
-    const [detected, branch] = await Promise.all([detectTargets(initial, this.detecting.signal), initialBranch]);
+    const [detected, branch] = await Promise.all([detectTargets(initial, this.detecting.signal, this.harnesses.available), initialBranch]);
     if (this.disposed) return;
     if (!this.branchOperation && this.branch === undefined) this.branch = branch;
     for (const target of initial) {
@@ -212,7 +216,7 @@ export class App {
     }
     if (!this.manualModels) {
       const wanted = defaultTargetIds(this.cfg, this.all);
-      this.selected = this.cfg.providers ?? wanted.filter((id) => this.installed.get(id));
+      this.selected = this.cfg.answerModel ? [this.cfg.answerModel] : this.cfg.providers ?? wanted.filter((id) => this.installed.get(id));
     }
     this.requestRender();
   }
@@ -230,6 +234,7 @@ export class App {
     this.recapController.abort();
     this.detecting.abort();
     await Promise.all([this.active?.done.catch(() => undefined), this.projectWork, this.recapWork, this.branchOperation, this.modelTests.reset()]);
+    await this.harnesses.dispose();
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 
@@ -351,7 +356,8 @@ export class App {
     if (this.handleInteraction(ev)) return;
     if (ev.type === 'stage' && ev.stage === 'answering') {
       this.synth = undefined;
-      this.panes = ev.targets.map((t) => this.newPane(t.id, 'answer', t.label, this.colorOf(t.id)));
+      this.panes = [...record.results.map(r => this.restoredPane(record, r, 'answer', '')),
+        ...ev.targets.map(t => this.newPane(t.id, 'answer', t.label, this.colorOf(t.id)))];
     } else if (ev.type === 'call' && (ev.scope === 'synthesis' || ev.scope === 'plan-review')) {
       this.synth = this.newPane(ev.target.id, 'synth', `${ev.scope === 'plan-review' ? '方案复核' : '汇总'} · ${ev.target.label}`, GOLD);
       if (ev.scope === 'synthesis') this.synth.synthesis = synthesisText(record);
@@ -362,26 +368,28 @@ export class App {
     this.requestRender();
   }
 
-  private ask(question: string, retryIds?: string[], revise?: RunRecord): string | void {
+  private ask(question: string, retryIds?: string[], revise?: RunRecord, supplement?: { action: SupplementAction; targetId?: string }): string | void {
     if (this.switchingBranch) return this.say('正在切换 Git 分支，请稍候', YELLOW);
     const previous = revise ?? this.lastRun;
-    const graph = retryIds || revise ? previous?.collaboration : this.selectedGraph;
+    if (supplement && (!previous || this.lastExecution)) return this.say('请先打开可追加的最新问答轮次', YELLOW);
+    const graph = supplement ? undefined : retryIds || revise ? previous?.collaboration : this.selectedGraph;
     if (graph) {
       const issue = graphIssue(graph, this.all.map(t => ({ id: t.id, installed: this.installed.get(t.id), exec: t.adapter.capabilities.exec })));
       if (issue) return this.say(issue, YELLOW);
-    } else if (!this.selected.length && !retryIds) {
+    } else if (!this.selected.length && !retryIds && !supplement && !this.cfg.answerModel && answerMode(this.cfg) !== 'auto') {
       return this.say('没有可用的模型，输入 /settings 接入官方 API，或检查 CLI 登录状态', RED);
     }
     try {
       const ctl = new AbortController();
       const display = displaySynthesisEvents((ev, record) => this.workflowEvent(ev, record), false);
-      this.active = startComparison({
+      this.active = startComparison({ harnesses: this.harnesses,
         cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
-        previous, continueFrom: retryIds || revise ? undefined : this.continueFrom,
-        handoff: this.pendingHandoff,
+        previous: supplement ? undefined : previous, continueFrom: retryIds || revise || supplement ? undefined : this.continueFrom,
+        handoff: supplement ? undefined : this.pendingHandoff,
         collaboration: graph, collaborationTargets: revise?.collaborationTargets,
-        manualSelection: this.manualModels, signal: ctl.signal, interactive: true,
+        manualSelection: !supplement && this.manualModels, signal: ctl.signal, interactive: true,
         retry: retryIds && previous ? { record: previous, targetIds: retryIds } : undefined,
+        supplement: supplement && previous ? { source: previous, ...supplement } : undefined,
         onEvent: (ev, record) => { this.share?.update(record); display(ev, record); },
       });
       this.ctl = ctl;
@@ -391,7 +399,7 @@ export class App {
     this.continueFrom = undefined;
     this.question = question;
     this.turn++;
-    this.panes = [];
+    this.panes = this.active.record.results.map(r => this.restoredPane(this.active!.record, r, 'answer', ''));
     this.synth = this.exec = undefined;
     this.lastRun = this.active.record;
     this.lastExecution = undefined;
@@ -405,15 +413,22 @@ export class App {
   }
 
   private async observeQuestion(handle: WorkflowHandle): Promise<void> {
+    const run = handle.record;
+    const auto = answerMode(this.cfg) === 'auto' && !run.collaboration && !run.retryOf;
     try {
       const result = await handle.done;
+      if (result.advisor) {
+        this.panes = result.results.map(r => this.restoredPane(result, r, 'answer', ''));
+        this.synth = this.advisorPane(result.advisor);
+      }
       this.addUsage(result);
       if (result.error) this.say(result.error, RED);
       else if (graphPlanResult(result)) this.say('方案已就绪 · /exec 确认实施 · /revise 修改要求 · /close-plan 终止', GOLD);
     } catch (err) {
       this.say(`出错: ${err instanceof Error ? err.message : err}`, RED);
     } finally {
-      this.enqueueRecap(handle.record);
+      const recap = auto ? run.synthesis?.result.ok : run.routing?.kind !== 'direct';
+      if (recap && !run.supplementOf) this.enqueueRecap(run);
       this.finish();
     }
   }
@@ -465,7 +480,7 @@ export class App {
     let execution: RunRecord | undefined;
     this.render();
     try {
-      this.active = startExecution({
+      this.active = startExecution({ harnesses: this.harnesses,
         cwd: this.cwd, config: this.cfg, targets: this.all, executor, source, from, signal: ctl.signal, interactive: true,
         onEvent: (ev, record) => {
           this.share?.update(record);
@@ -534,8 +549,7 @@ export class App {
   }
 
   private addUsage(run: RunRecord): void {
-    const supporting = run.calls.filter(c => ['plan-review', 'result-review', 'report', 'dispute-assessment', 'source-check'].includes(c.scope));
-    for (const r of [...run.results, ...(run.synthesis ? [run.synthesis.result] : []), ...supporting.map(c => c.result)]) this.addCallUsage(r);
+    for (const call of run.calls) this.addCallUsage(call.result);
   }
 
   private addCallUsage(result: RunResult): void {
@@ -547,7 +561,8 @@ export class App {
     const signal = this.recapController.signal;
     if (signal.aborted) return;
     const turn = execution ?? run;
-    const id = [this.cfg.synthesizer ?? 'claude', run.synthesis?.provider, ...run.results.map(r => r.targetId), ...this.selected]
+    const preferred = !execution && run.routing?.mode === 'auto' ? run.synthesis?.provider : this.cfg.synthesizer ?? 'claude';
+    const id = [preferred, run.synthesis?.provider, ...run.results.map(r => r.targetId), ...this.selected]
       .find(id => id && this.installed.get(id));
     const target = id ? this.adapter(id) : undefined;
     const show = (text: string, style: string) => {
@@ -655,10 +670,11 @@ export class App {
       this.io.setMouse?.(this.mouseOn);
     }
     if (field === 'showReasoning') this.showReasoning = cfg.showReasoning ?? false;
-    if (field === 'providers') this.manualModels = false;
+    if (field === 'routing') this.graphId = undefined;
+    if (field === 'providers' || field === 'answerModel' || (field === 'routing' && cfg.routing === 'auto')) this.manualModels = false;
     this.selected = this.selected.filter(id => targets.some(t => t.id === id));
     const selectDefaults = () => {
-      if (!this.manualModels) this.selected = cfg.providers ?? defaultTargetIds(cfg, targets).filter(id => this.installed.get(id));
+      if (!this.manualModels) this.selected = cfg.answerModel ? [cfg.answerModel] : cfg.providers ?? defaultTargetIds(cfg, targets).filter(id => this.installed.get(id));
     };
     const transportChanged = ['targets', 'custom', 'disableClaude'].includes(field);
     if (transportChanged) this.installed.clear();
@@ -735,6 +751,15 @@ export class App {
           if (!turnId) throw new Error(this.notice);
           return turnId;
         },
+        supplement: (parent, action, signal) => {
+          signal.throwIfAborted();
+          if (this.disposed || this.lastRun?.sessionId !== id || this.lastRun.id !== parent) throw new Error('请在当前会话的最新轮次操作');
+          if (this.busy || this.confirm) throw new Error('请等待终端当前请求结束');
+          this.shareView = undefined;
+          const turnId = this.ask(this.lastRun.question, undefined, undefined, { action });
+          if (!turnId) throw new Error(this.notice);
+          return turnId;
+        },
       }, id, fileURLToPath(new URL('../mobile/', import.meta.url)));
       this.share = share;
       const info = await share.listen(address);
@@ -798,14 +823,14 @@ export class App {
       this.activeAnswer = 0;
       this.panes = last.results.map(result => this.restoredPane(last, result, 'answer', ''));
       const review = last.calls.find(c => c.scope === 'plan-review');
-      this.synth = review ? this.restoredPane(last, review.result, 'synth', '方案复核')
+      this.synth = last.advisor ? this.advisorPane(last.advisor) : review ? this.restoredPane(last, review.result, 'synth', '方案复核')
         : last.synthesis ? this.restoredPane(last, last.synthesis.result, 'synth', '汇总') : undefined;
       const stage = execution?.calls.filter(c => c.scope === 'report' || c.scope === 'result-review').at(-1);
       const result = stage?.result ?? execution?.results[0];
       this.exec = execution && result ? this.restoredPane(execution, result, 'exec',
         stage?.scope === 'report' ? roleNames.report : stage ? roleNames.audit : roleNames.execution) : undefined;
       const hint = comparisons.length > 1 || execution ? ' · ← 查看上一轮' : '';
-      this.say(`已恢复会话 · 第 ${this.turn} 轮${hint}`, GOLD);
+      this.say(last.advisor ? advisorText(last.advisor) + hint : last.routing ? routingNotice(last.routing) + hint : `已恢复会话 · 第 ${this.turn} 轮${hint}`, GOLD);
     } catch (err) { this.say(err instanceof Error ? err.message : String(err), RED); }
   }
 
@@ -816,6 +841,15 @@ export class App {
       const earlier = readSessionRuns(this.cwd, current.sessionId).filter(run => run.id < current.id && !runningStatus(run.status));
       if (earlier.length) this.historyView = new HistoryView(this.cwd, historyEntries(earlier), earlier.length - 1, this.showReasoning);
     } catch (err) { this.say(err instanceof Error ? err.message : String(err), RED); }
+  }
+
+  private advisorPane(advisor: NonNullable<RunRecord['advisor']>): Pane {
+    const pane = this.newPane(advisor.reviewer ?? '', 'synth', '顾问复核', GOLD);
+    pane.text = advisorText(advisor);
+    pane.status = advisor.status === 'failed' ? 'err' : 'ok';
+    pane.end = pane.start;
+    pane.follow = false;
+    return pane;
   }
 
   private restoredPane(run: RunRecord, result: RunRecord['results'][number], kind: Pane['kind'], stage: string): Pane {
@@ -1007,8 +1041,16 @@ export class App {
       if (this.busy) return this.say('请等待本轮结束后修改设置', YELLOW);
       this.settings = new SettingsView(
         this.cwd, this.modelTests,
-        () => ({ cfg: this.cfg, targets: this.all, selected: this.selected, showReasoning: this.showReasoning, mouse: this.mouseOn }),
+        () => ({
+          cfg: this.cfg, targets: this.all, selected: this.selected, showReasoning: this.showReasoning, mouse: this.mouseOn,
+          installed: this.installed, currentTurn: this.lastExecution ? undefined : this.lastRun,
+        }),
         (field, value, entry) => this.applySetting(field, value, entry),
+        (action, targetId) => {
+          if (this.busy || this.confirm) throw new Error('请先等待当前请求结束');
+          if (!this.ask(this.lastRun?.question ?? '', undefined, undefined, { action, targetId })) throw new Error(this.notice);
+          this.settings = undefined;
+        },
         () => {
           this.api = new ApiView(this.cfg, (api, profile) => {
             this.useApi(api, profile);
@@ -1420,7 +1462,7 @@ export class App {
     else if (ch === 'b') this.command('/bench');
     else if (ch === 'u' && (p.kind === 'answer' || p.kind === 'synth')) {
       if (p.status !== 'ok' || !p.text.trim()) return this.say('该回答尚未完成，无法作为追问上下文', YELLOW);
-      this.continueFrom = p.kind === 'synth' ? 'synthesis' : p.targetId;
+      this.continueFrom = p.kind === 'synth' ? (this.lastRun?.advisor ? this.lastRun.results[0]?.targetId : 'synthesis') : p.targetId;
       this.zoomId = undefined;
       this.focus = 'input';
       this.say(`下轮追问将沿用「${p.title}」的回答（输入 /use 重置）`, GOLD);
@@ -1725,9 +1767,8 @@ export class App {
   /** One line above the composer: confirmation, notice, what is running, or key hints. */
   private drawActivity(s: Screen, y: number): void {
     if (this.prompt) {
-      const error = this.prompt.inputError;
       const keys = this.interactions.length > 1 ? 'Ctrl+G 下一项 · ' : '';
-      const hint = error || `${keys}Enter 提交 · Esc 取消 · ↑↓ 详情 · Tab 返回`;
+      const hint = keys + this.prompt.keyHint;
       s.put(1, y, truncate(hint, s.cols - 2), `1;${YELLOW}`);
       return;
     }
@@ -1770,7 +1811,9 @@ export class App {
     const branch = this.branch === undefined ? '' : ` (${this.branch ?? '游离 HEAD'})`;
     const where = (this.cwd === home || this.cwd.startsWith(home + '/') ? '~' + this.cwd.slice(home.length) : this.cwd) + branch;
     const graph = this.selectedGraph;
-    const who = graph ? `模版 · ${graph.name}` : this.selected.length ? `${this.selected.join(' + ')}${this.cfg.synthesizer && this.selected.length > 1 ? ` → ${this.cfg.synthesizer}` : ''}` : '';
+    const mode = answerMode(this.cfg);
+    const who = graph ? `模版 · ${graph.name}` : mode !== 'standard' ? routingLabels[mode]
+      : this.selected.length ? `${this.selected.join(' + ')}${this.cfg.synthesizer && this.selected.length > 1 ? ` → ${this.cfg.synthesizer}` : ''}` : '';
     const room = (right ? rx : s.cols) - 2;
     const left = textWidth(where) + textWidth(who) + 3 <= room ? where : basename(this.cwd) + branch;
     const x = s.put(1, y, truncate(left, room), DIM);

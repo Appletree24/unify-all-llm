@@ -66,6 +66,7 @@ function start(cmd: string, args: string[], opts: ProcOptions, interactive = fal
     if (err.code !== 'EPIPE' && !opts.signal?.aborted) failure ??= err;
   });
   if (!interactive) child.stdin.end(opts.stdin ?? '', 'utf8');
+  let cleanup: Promise<void> | undefined;
   return {
     child,
     async finish() {
@@ -74,12 +75,14 @@ function start(cmd: string, args: string[], opts: ProcOptions, interactive = fal
       if (failure) throw failure;
       if (code !== 0) throw new Error(`${cmd} 退出码 ${code}: ${stderr.trim().slice(-800)}`);
     },
-    async cleanup() {
-      opts.signal?.removeEventListener('abort', abort);
-      if (stopping) await stopping;
-      else if (!closed) await stop();
-      // A successful leader must not leave background descendants behind either.
-      else if (!isWin) signalGroup('SIGKILL');
+    cleanup() {
+      return cleanup ??= (async () => {
+        opts.signal?.removeEventListener('abort', abort);
+        if (stopping) await stopping;
+        else if (!closed) await stop();
+        // A successful leader must not leave background descendants behind either.
+        else if (!isWin) signalGroup('SIGKILL');
+      })();
     },
   };
 }
@@ -105,6 +108,7 @@ export async function* runJsonl(cmd: string, args: string[], opts: ProcOptions):
 }
 
 export interface JsonlSession {
+  readonly alive: boolean;
   events: AsyncGenerator<Record<string, any>>;
   send(value: object): void;
   endInput(): void;
@@ -117,8 +121,10 @@ export interface JsonlSession {
  */
 export function openJsonl(cmd: string, args: string[], opts: ProcOptions): JsonlSession {
   const proc = start(cmd, args, opts, true);
+  const events = readJsonl(proc);
   return {
-    events: readJsonl(proc),
+    get alive() { return proc.child.exitCode === null && proc.child.signalCode === null && !proc.child.stdin.destroyed && !proc.child.stdout.destroyed; },
+    events,
     send(value: object) {
       if (!proc.child.stdin.destroyed && proc.child.stdin.writable) {
         proc.child.stdin.write(JSON.stringify(value) + '\n');
@@ -129,8 +135,9 @@ export function openJsonl(cmd: string, args: string[], opts: ProcOptions): Jsonl
         proc.child.stdin.end();
       }
     },
-    close() {
-      return proc.cleanup();
+    async close() {
+      await proc.cleanup();
+      await events.return(undefined);
     },
   };
 }

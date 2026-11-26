@@ -1,5 +1,8 @@
+import { advisorPolicyAllowed } from '../../../src/core/advisor.js';
 import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { QUOTA_LOW_PERCENT, QUOTA_RESET_NOTICE_MINUTES } from '../../../src/quota/reminders.js';
+import { answerEffortLabels } from '../../../src/core/routing.js';
+import { effortLabel } from '../../../src/providers/effort.js';
 import { isAgyProvider, modelSettings, type AgyModel } from '../../../src/providers/agy-models.js';
 import type { ApiInfo, Config, SettingsInfo, TargetQuota, WorkspaceInfo } from '../shared/api.js';
 import { unify } from './api.js';
@@ -232,6 +235,18 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
       </Section>
 
       <Section title="模型与思考强度">
+        <Row label="回答模型">
+          <select aria-label="回答模型" value={cfg.answerModel ?? ''} onChange={e => void save('answerModel', e.target.value || null)}>
+            <option value="">自动（按问答模式）</option>
+            {ws.targets.map(t => <option key={t.id} value={t.id}>{t.label}（{t.id}）</option>)}
+          </select>
+        </Row>
+        <Row label="回答思考强度">
+          <select aria-label="回答思考强度" value={cfg.answerEffort ?? 'target'} onChange={e => void save('answerEffort', e.target.value)}>
+            {cfg.answerEffort === 'none' && <option value="none" disabled hidden>{effortLabel('none')}</option>}
+            {Object.entries(answerEffortLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </Row>
         {ws.targets.map((t) => {
           const agy = isAgyProvider(t.provider, t.askPolicy);
           const options = modelSettings(t, agy ? agyCatalog ?? [] : undefined);
@@ -247,6 +262,8 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
                 </select>
                 <select aria-label={t.label + ' 思考强度'} value={options.effortValue} disabled={!options.efforts.length}
                   onChange={(e) => void save(options.effortField, e.target.value, t.id)}>
+                  {options.effortField === 'reasoningEffort' && options.effortValue === 'none' && options.efforts.length > 0 &&
+                    <option value="none" disabled hidden>{options.storedEffort}</option>}
                   {!options.efforts.length && <option value={options.effortValue}>{loading ? '加载中…' : options.storedEffort ?? (agyError && agy ? '未获取' : '无档位')}</option>}
                   {options.efforts.map(e => <option key={e.value} value={e.value}>{e.label}</option>)}
                 </select>
@@ -268,6 +285,13 @@ export function SettingsPage({ ws, onChange, notify, initialGraph }: { ws: Works
       </Section>
 
       <Section title="回答、汇总与执行">
+        <Row label="顾问复核">
+          <select aria-label="顾问复核" value={cfg.advisor ?? 'auto'} onChange={e => void save('advisor', e.target.value)}>
+            <option value="auto">自动选择</option><option value="off">关闭</option>
+            {ws.targets.filter(t => advisorPolicyAllowed(t.askPolicy) && !['auto', 'off'].includes(t.id))
+              .map(t => <option key={t.id} value={t.id}>{t.label}（{t.id}）</option>)}
+          </select>
+        </Row>
         <Row label="默认回答目标">
           <Switch label="自动选择" checked={!providers} onChange={(auto) => void save('providers', auto ? undefined : ws.defaults.length ? ws.defaults : ws.targets.slice(0, 1).map((t) => t.id))} />
         </Row>

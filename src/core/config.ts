@@ -6,8 +6,12 @@ import { collaborationSchema } from './collaboration.js';
 
 const id = z.string().regex(/^[a-z][\w-]*$/i).refine((s) => !['__proto__', 'constructor', 'prototype'].includes(s), '保留名称');
 const text = z.string().trim().min(1);
-export const effortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+export const effortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 export type ReasoningEffort = z.infer<typeof effortSchema>;
+export const answerEffortSchema = z.union([effortSchema, z.enum(['target', 'default', 'auto'])]);
+export type AnswerEffort = z.infer<typeof answerEffortSchema>;
+export const routingModeSchema = z.enum(['standard', 'auto', 'single', 'multi']);
+export type RoutingMode = z.infer<typeof routingModeSchema>;
 const seconds = z.number().positive().max(2_147_483);
 export const customSchema = z.discriminatedUnion('type', [
   z.strictObject({
@@ -15,6 +19,7 @@ export const customSchema = z.discriminatedUnion('type', [
       const u = new URL(s);
       return ['http:', 'https:'].includes(u.protocol) && !u.username && !u.password && !u.search && !u.hash;
     }, '需要不含凭证、查询参数或片段的 HTTP(S) URL'),
+    supportedEfforts: z.array(effortSchema).optional(),
     model: text, apiKeyEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(), system: z.string().optional(),
   }),
   z.strictObject({ type: z.literal('command'), label: text.optional(), command: text, args: z.array(z.string()).optional(), interactive: z.boolean().optional() }),
@@ -31,6 +36,9 @@ const schema = z.strictObject({
   disableClaude: z.boolean().optional(),
   providers: z.array(id).min(1).refine((a) => new Set(a).size === a.length, '目标不能重复').optional(),
   synthesizer: id.optional(), executor: id.optional(), decider: id.optional(),
+  routing: routingModeSchema.optional(),
+  advisor: id.optional(),
+  answerModel: id.nullable().optional(), answerEffort: answerEffortSchema.optional(),
   collaborationGraphs: z.record(id, collaborationSchema).optional(),
   reasoningEffort: z.record(id, z.union([effortSchema, z.literal('default')])).optional(),
   models: z.record(id, text).optional(),

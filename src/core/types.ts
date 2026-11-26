@@ -1,6 +1,11 @@
+import type { HarnessPool } from './harness-pool.js';
 import type { CustomProviderConfig, ReasoningEffort } from './config.js';
 import type { QuotaReader } from '../quota/types.js';
 import type { MemoryReference } from '../memory/report.js';
+import type { RunRecord } from './store.js';
+
+export const runningStatus = (status: RunRecord['status']) =>
+  status === 'created' || status === 'deciding' || status === 'answering' || status === 'synthesizing';
 
 /** ask requests an answer using the provider's declared policy; exec permits edits. */
 export type RunMode = 'ask' | 'exec';
@@ -123,6 +128,8 @@ export interface InteractionResponse {
 export type InteractionHandler = (request: InteractionRequest) => Promise<InteractionResponse>;
 
 export interface RunRequest {
+  harnesses?: HarnessPool;
+  sessionId?: string;
   prompt: string;
   /** Report a transport-level fallback before submitting the full public history. */
   onPublicReplay?: () => void;
@@ -163,6 +170,8 @@ export interface ModelTarget {
   label: string;
   adapter: ProviderAdapter;
   model?: string;
+  supportedEfforts?: ReasoningEffort[];
+  defaultEffort?: ReasoningEffort;
   reasoningEffort?: ReasoningEffort;
 }
 

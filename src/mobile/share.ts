@@ -4,6 +4,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { networkInterfaces } from 'node:os';
 import { basename, join } from 'node:path';
 import { isReviewOrReport } from '../core/collaboration.js';
+import { advisorText } from '../core/advisor.js';
+import { routingNotice, supplementActions, type SupplementAction } from '../core/routing.js';
 import { readSessionSettings, runningStatus } from '../core/sessions.js';
 import type { RunRecord } from '../core/store.js';
 import { synthesisFormatter } from '../core/synth.js';
@@ -18,6 +20,7 @@ interface SessionHost {
   session(id: string): RunRecord[];
   liveTurn(turnId: string): TurnControls | undefined;
   ask(question: string, parent: string, signal: AbortSignal): string | Promise<string>;
+  supplement(turnId: string, action: SupplementAction, signal: AbortSignal): string | Promise<string>;
 }
 
 export function mobileNetworks(): MobileNetwork[] {
@@ -53,6 +56,7 @@ function publicTurn(run: RunRecord, controls?: TurnControls): MobileTurn {
   return {
     id: run.id, question: run.question, answers, status: run.status, busy, error: run.error,
     canCancel: busy && !!controls, waitingForInput: controls?.waitingForInput ?? false,
+    routing: run.routing && routingNotice(run.routing), advisor: run.advisor && advisorText(run.advisor), actions: supplementActions(run),
   };
 }
 
@@ -221,6 +225,20 @@ export class MobileShare {
         controls.cancel();
       }
       return json(res, 200, { turnId: run.id });
+    }
+    if (req.method === 'POST' && url.pathname === '/supplement') {
+      const run = this.turns.get(url.searchParams.get('turnId') ?? '')?.run;
+      if (!run) return json(res, 404, { error: '共享会话中找不到这一轮' });
+      const action = url.searchParams.get('action');
+      if ((action !== 'opinion' && action !== 'synthesis') || !supplementActions(run).includes(action)) {
+        return json(res, 409, { error: '该轮没有可追加的操作' });
+      }
+      try {
+        this.lifetime.signal.throwIfAborted();
+        return json(res, 200, { turnId: await this.ws.supplement(run.id, action, this.lifetime.signal) });
+      } catch (err) {
+        return json(res, 409, { error: err instanceof Error ? err.message : '追加操作失败' });
+      }
     }
     if (req.method === 'POST' && url.pathname === '/ask') {
       let input;

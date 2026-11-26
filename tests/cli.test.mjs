@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -45,6 +46,111 @@ async function invoke(args, opts, onOutput) {
   const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
   return { code, stdout, stderr };
 }
+
+test('CLI opts into automatic routing through the existing ask command', async (t) => {
+  const opts = environment(t);
+  const command = text => ({ type: 'command', command: process.execPath, args: ['-e', `console.log(${JSON.stringify(text)})`] });
+  writeFileSync(join(opts.env.HOME, '.unify', 'config.json'), JSON.stringify({
+    disableClaude: true, custom: { fast: command('first answer'), deep: command('independent answer') },
+  }));
+  writeFileSync(join(opts.cwd, 'unify.config.json'), JSON.stringify({ providers: ['fast', 'deep'], synthesizer: 'fast' }));
+  const result = await invoke(['ask', '--mode', 'auto', '把这段话压成一句', '--json'], opts);
+  assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+  const events = result.stdout.trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(events.filter(e => e.type === 'call').map(e => e.scope), ['answer']);
+  assert.equal(loadRun(opts.cwd).routing.kind, 'direct');
+  const named = await invoke(['ask', '--mode', 'auto', '只让 deep 回答，解释 fast 的含义', '--json'], opts);
+  assert.equal(named.code, 0, named.stderr);
+  assert.deepEqual(loadRun(opts.cwd).calls.map(c => c.target.id), ['deep']);
+});
+
+test('Codex max and ultra follow the inherited model catalog and reach the actual turn', async t => {
+  const opts = environment(t);
+  opts.env.CODEX_HOME = join(opts.env.HOME, '.codex');
+  opts.env.UNIFY_TEST_SCENARIO = 'codex-efforts';
+  writeFileSync(join(opts.cwd, 'unify.config.json'), JSON.stringify({ providers: ['codex'] }));
+  const ask = (model, effort) => invoke(['ask', '--model', model, '--effort', effort, '--json', '请回答'], opts);
+  for (const [inherited, speaker, level, expected] of [
+    ['pro', 'auto', 'ultra', 'pro'], ['pro', 'codex', 'max', 'pro'], [null, 'auto', 'max', 'small'],
+  ]) {
+    if (inherited) opts.env.UNIFY_TEST_CODEX_MODEL = inherited;
+    else delete opts.env.UNIFY_TEST_CODEX_MODEL;
+    const result = await ask(speaker, level);
+    assert.equal(result.code, 0, result.stderr);
+    const run = loadRun(opts.cwd);
+    assert.equal(run.results[0].text, level);
+    assert.equal(run.calls[0].target.model, expected);
+    assert.equal(run.routing.answers[0].level, level);
+  }
+  const unsupported = await ask('codex', 'ultra');
+  assert.equal(unsupported.code, 1);
+  assert.match(unsupported.stderr + unsupported.stdout, /思考强度 ultra/);
+  assert.equal(loadRun(opts.cwd).calls.length, 0);
+  opts.env.UNIFY_TEST_CODEX_MODEL = 'unlisted';
+  assert.equal((await ask('auto', 'ultra')).code, 1);
+  const manual = await ask('codex', 'ultra');
+  assert.equal(manual.code, 0, manual.stderr);
+  assert.equal(loadRun(opts.cwd).results[0].text, 'ultra');
+});
+
+test('CLI advisor verifies supplied logs before revising and show restores the findings', async t => {
+  const opts = environment(t);
+  const calls = [];
+  const quote = 'timeout attempt=1 retries=0';
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const { model, messages } = JSON.parse(body);
+    const prompt = messages.at(-1).content;
+    calls.push(model);
+    const reply = model === 'judge' ? JSON.stringify({ verdict: 'disputed', finding: '日志显示重试次数为零。', quotes: [quote] })
+      : prompt.startsWith('请结合已核对的证据') ? '更正：这次没有重试。' : '这次重试了三次。\n需独立核对：重试次数是多少？';
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end('data: ' + JSON.stringify({ choices: [{ delta: { content: reply }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+  writeFileSync(join(opts.env.HOME, '.unify', 'config.json'), JSON.stringify({ custom: {
+    writer: { type: 'openai', model: 'writer', baseUrl }, judge: { type: 'openai', model: 'judge', baseUrl },
+  } }));
+  writeFileSync(join(opts.cwd, 'unify.config.json'), JSON.stringify({ providers: ['writer'] }));
+  const result = await invoke(['ask', '--model', 'writer', '--advisor', 'judge', '--json', '问这次重试了几次。日志：' + quote], opts);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(calls, ['writer', 'judge', 'writer']);
+  const run = loadRun(opts.cwd);
+  assert.equal(run.advisor.status, 'revised');
+  const shown = await invoke(['show', run.id], opts);
+  assert.match(shown.stdout, /更正：这次没有重试/);
+  assert.match(shown.stdout, /顾问复核 · 首答已修订 · judge/);
+  assert.match(shown.stdout, /timeout attempt=1 retries=0/);
+});
+
+test('CLI answer policy selects a compatible model and sends the requested HTTP effort', async t => {
+  const opts = environment(t);
+  const requests = [];
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    requests.push(JSON.parse(body));
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+  writeFileSync(join(opts.env.HOME, '.unify', 'config.json'), JSON.stringify({ custom: {
+    plain: { type: 'openai', baseUrl, model: 'plain' },
+    smart: { type: 'openai', baseUrl, model: 'smart', supportedEfforts: ['low', 'high'] },
+  } }));
+  writeFileSync(join(opts.cwd, 'unify.config.json'), JSON.stringify({ providers: ['plain', 'smart'], answerModel: 'plain' }));
+  const high = await invoke(['ask', '--model', 'auto', '--effort', 'auto', '本轮用 high', '--json'], opts);
+  assert.equal(high.code, 0, high.stderr);
+  const native = await invoke(['ask', '--model', 'smart', '--effort', 'auto', '用一句话回答', '--json'], opts);
+  assert.equal(native.code, 0, native.stderr);
+  assert.deepEqual(requests.map(r => [r.model, r.reasoning_effort]), [['smart', 'high'], ['smart', undefined]]);
+  assert.ok(!Object.hasOwn(requests[1], 'reasoning_effort'));
+});
 
 test('CLI JSONL separates target, provider and call identities; continue and retry read records', async (t) => {
   const opts = environment(t);

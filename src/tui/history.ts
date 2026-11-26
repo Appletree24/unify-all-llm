@@ -1,3 +1,4 @@
+import { advisorText } from '../core/advisor.js';
 import { isReviewOrReport, roleNames } from '../core/collaboration.js';
 import { loadRunRecap, type RunRecord } from '../core/store.js';
 import type { RunResult } from '../core/types.js';
@@ -60,6 +61,10 @@ function renderTurn(cwd: string, run: RunRecord, width: number, showReasoning: b
     if (!isReviewOrReport(call.scope)) continue;
     const stage = call.scope === 'plan-review' ? roleNames.check : call.scope === 'result-review' ? roleNames.audit : roleNames.report;
     result(`${stage} · ${call.target.label}`, call.result);
+  }
+  if (run.advisor) {
+    heading('顾问复核');
+    lines.push(...layout(advisorText(run.advisor), width, GOLD));
   }
   if (run.error) {
     heading('运行错误');
