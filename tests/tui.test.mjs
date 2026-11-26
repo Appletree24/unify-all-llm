@@ -100,13 +100,37 @@ test('TUI removes overlapping setting commands, configures them via /settings, a
   press('down', 'down', 'down', 'down', 'down', 'enter'); // 鼠标滚动
   assert.deepEqual(mouseEvents, [false]);
   assert.equal(JSON.parse(readFileSync(join(cwd, 'unify.config.json'), 'utf8')).mouse, false);
+  press('enter'); // 重新开启鼠标，验证点击勾选和保存
 
   press('up', 'up', 'up', 'enter', 'enter'); // 回答、汇总与执行 -> 默认回答目标
-  submit(app, 'codex,codex');
-  assert.match(screen(app), /目标不能重复/);
-  press('ctrl+u');
-  submit(app, 'codex,deepseek');
+  const projectSettings = () => JSON.parse(readFileSync(join(cwd, 'unify.config.json'), 'utf8'));
+  assert.match(screen(app), /\[x\] 自动选择/);
+  clickText(app, '[ ] DeepSeek');
+  press('up', 'up'); // Codex
+  type(app, ' ');
+  assert.match(screen(app), /\[x\] Codex/);
+  assert.equal(projectSettings().providers, undefined);
+  press('enter');
   assert.match(screen(app), /已保存/);
+  assert.deepEqual(projectSettings().providers, ['deepseek', 'codex']);
+
+  press('enter');
+  assert.match(screen(app), /\[x\] DeepSeek/);
+  clickText(app, '[x] Codex');
+  assert.match(screen(app), /\[ \] Codex/);
+  press('esc');
+  press('enter');
+  assert.match(screen(app), /\[x\] Codex/);
+  press('home');
+  type(app, ' ');
+  assert.match(screen(app), /\[x\] 自动选择/);
+  clickText(app, '保存选择');
+  assert.equal(projectSettings().providers, undefined);
+
+  press('enter');
+  clickText(app, '[ ] Codex');
+  clickText(app, '[ ] DeepSeek');
+  clickText(app, '保存选择');
 
   press('down', 'enter', 'down', 'down', 'down', 'down', 'enter'); // 汇总模型 -> deepseek
   press('esc', 'esc');

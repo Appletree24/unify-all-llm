@@ -70,6 +70,7 @@ interface Page {
   subtitle: string;
   rows(): Row[];
   index: number;
+  confirm?(): void;
 }
 
 interface Input {
@@ -408,6 +409,44 @@ export class SettingsView {
     ];
   }
 
+  private chooseAnswerTargets(): void {
+    const { cfg, targets } = this.state();
+    const selected = new Set(cfg.providers);
+    const confirm = () => {
+      this.save('providers', selected.size ? [...selected] : undefined);
+      this.pages.pop();
+      this.message = '✓ 已保存';
+      this.messageKind = 'ok';
+    };
+    this.pages.push({
+      title: '默认回答目标',
+      subtitle: '空格或点击勾选多个回答目标，Enter 保存，Esc 取消',
+      index: 0,
+      confirm,
+      rows: () => [
+        {
+          label: `[${selected.size ? ' ' : 'x'}] 自动选择`,
+          summary: '清除项目指定的回答目标。优先沿用用户配置，否则自动选择可用目标（决策模型除外）。',
+          open: () => selected.clear(),
+        },
+        ...targets.map(t => ({
+          label: `[${selected.has(t.id) ? 'x' : ' '}] ${t.label === t.id ? t.id : `${t.label}（${t.id}）`}`,
+          value: t.model,
+          accent: targetColor(t),
+          preview: () => [
+            { label: '目标 ID', text: t.id },
+            { label: '模型', text: t.model ?? '默认模型' },
+          ],
+          open: () => {
+            if (selected.has(t.id)) selected.delete(t.id);
+            else selected.add(t.id);
+          },
+        })),
+        { label: '保存选择', value: selected.size ? `已选 ${selected.size} 项` : '自动', open: confirm },
+      ],
+    });
+  }
+
   private routing(): Row[] {
     const { cfg, targets } = this.state();
     const rows: Row[] = [{
@@ -416,16 +455,12 @@ export class SettingsView {
       valueStyle: cfg.providers ? GOLD : DIM,
       chevron: true,
       scope: 'project',
-      summary: '指定每次普通问答并行发送的模型目标。留空则自动选择全部可用目标（不含决策模型）。',
+      summary: '从列表勾选每次普通问答要调用的模型，或使用自动选择。',
       preview: () => [
         { label: '当前配置', text: cfg.providers?.join(', ') ?? '自动选择', style: cfg.providers ? GOLD : DIM },
         { label: '可选目标', text: targets.map(t => t.id).join(', ') || '无', style: DIM },
       ],
-      open: () => this.edit('默认回答目标', cfg.providers?.join(',') ?? '', '逗号分隔，留空自动选择。可选 ' + targets.map(t => t.id).join(', '), 'project',
-        v => {
-          const ids = v ? v.split(/[,，\s]+/).filter(Boolean) : [];
-          this.save('providers', ids.length ? ids : undefined);
-        }),
+      open: () => this.chooseAnswerTargets(),
     }];
     const descriptions = {
       synthesizer: '多模型回答完成后，由该模型对各份回答进行匿名对比并汇总最优方案。',
@@ -579,7 +614,8 @@ export class SettingsView {
       else if (k.name === 'end') page.index = rows.length - 1;
       else if (k.name === 'pgup') page.index = Math.max(0, page.index - 5);
       else if (k.name === 'pgdn') page.index = Math.min(rows.length - 1, page.index + 5);
-      else if (k.name === 'enter') rows[page.index]?.open();
+      else if (k.name === 'enter') (page.confirm ?? rows[page.index]?.open)?.();
+      else if (page.confirm && k.name === 'char' && k.text === ' ') rows[page.index]?.open();
       else if (k.name === 'click' && k.x !== undefined && k.y !== undefined && this.hit?.page === page) {
         const { x, y, w, first, count } = this.hit;
         if (k.x >= x && k.x < x + w && k.y >= y && k.y < y + count) {
@@ -638,6 +674,7 @@ export class SettingsView {
 
     const hints = this.input
       ? ['Enter 保存', 'Ctrl+U 清空', 'Esc 取消']
+      : page.confirm ? ['↑↓ 移动', '空格 勾选', 'Enter 保存', 'Esc 取消']
       : ['↑↓ 选择', 'Enter 进入/切换', this.pages.length > 1 ? 'Esc 返回' : 'Esc 关闭'];
     drawHints(s, s.rows - 1, hints);
   }
