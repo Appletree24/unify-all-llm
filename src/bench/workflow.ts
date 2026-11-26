@@ -1,4 +1,5 @@
 import { findCollection, readCatalog } from './catalog.js';
+import { recordBenchResults } from './recommend.js';
 import { loadRun } from '../core/store.js';
 import { caseSchema, getCandidate, getCase, publishedIds, reviewSchema, saveDraft, sourceAnswer, storeValidated, taskSchema, type BenchCase, type Publication, type Repository } from './cases.js';
 import { ask, grade, materials, publicPrompt, temporary, unfence, writeFiles, type BenchModel, type RubricCheck } from './grading.js';
@@ -91,5 +92,6 @@ export async function runBench(cwd: string, ids: string[], models: BenchModel[],
     }
   }
   signal?.throwIfAborted();
+  recordBenchResults(cwd, results, models.map(m => m.target));
   return results;
 }

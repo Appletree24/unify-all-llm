@@ -7,7 +7,7 @@ import { graphIssue, graphPlanResult, graphStages, isReviewOrReport, roleNames, 
 import { resolveSharedFileContext } from './context.js';
 import { buildDecisionPrompt, parseDecision } from './decider.js';
 import { fanOut, runOne } from './orchestrator.js';
-import { createRun, exportRun, historyAfter, latestExecutionFor, loadRun, newRunId, saveRun, type CallRecord, type PlanSource, type RunRecord } from './store.js';
+import { createRun, exportRun, historyAfter, latestExecutionFor, loadRun, newRunId, saveRun, type CallRecord, type HistoryEntry, type PlanSource, type RunRecord } from './store.js';
 import { nativeConversation, type NativeConversation } from './native-conversation.js';
 import type { CacheContext } from './cache-monitor.js';
 import { anonymize, appendConversationAnswer, buildApiMessages, buildConversationPrompt, buildExecPrompt, buildPlanInput, buildSynthesisInput, buildSynthesisInstructions, buildTurnUserContent, extractFinalPlan, synthesisFormatter } from './synth.js';
@@ -52,6 +52,7 @@ export interface ComparisonOptions extends CommonOptions {
   manualSelection?: boolean;
   synthesize?: boolean;
   previous?: RunRecord;
+  handoff?: HistoryEntry;
   continueFrom?: string;
   /** Optional append-only memory deltas saved mid-session, injected at the tail of the next API user turn. */
   memoryUpdates?: string[];
@@ -412,6 +413,11 @@ export function startComparison(opts: ComparisonOptions): WorkflowHandle {
   const question = opts.retry?.record.question ?? opts.question.trim();
   if (!question) throw new Error('问题不能为空');
   const record = initialRecord(opts, question, opts.retry ? undefined : opts.previous, opts.retry ? undefined : opts.continueFrom);
+  if (opts.handoff) {
+    if (opts.previous || opts.retry) throw new Error('交接单需要开启新会话');
+    record.input.history = [opts.handoff];
+    record.input.prompt = buildConversationPrompt(record.input.history, question);
+  }
   if (opts.materials?.length) record.input.materials = opts.materials;
   const graph = opts.collaboration ?? opts.retry?.record.collaboration;
   if (graph) {

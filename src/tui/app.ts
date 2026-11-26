@@ -1,4 +1,8 @@
 import { capture } from '../bench/cases.js';
+import { recommend, recommendationLabel } from '../bench/recommend.js';
+import { createHandoff, editHandoff, handoffPath, readHandoff } from '../core/handoff.js';
+import { applyTrial, runTrial } from '../core/trial.js';
+import { TrialView } from './trial-view.js';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename } from 'node:path';
@@ -109,6 +113,12 @@ export class App {
   private graphId?: string;
   private picker?: Picker;
   private historyView?: HistoryView;
+  private trialView?: TrialView;
+  private projectWork?: Promise<void>;
+  private lastTrial?: string;
+  private draftHandoff?: string;
+  private editingHandoff?: { id: string; before: string };
+  private pendingHandoff?: ReturnType<typeof readHandoff>;
   private share?: MobileShare;
   private shareView?: ShareView;
   private interactions: InteractionView[] = [];
@@ -219,12 +229,13 @@ export class App {
     this.ctl?.abort();
     this.recapController.abort();
     this.detecting.abort();
-    await Promise.all([this.active?.done.catch(() => undefined), this.recapWork, this.branchOperation, this.modelTests.reset()]);
+    await Promise.all([this.active?.done.catch(() => undefined), this.projectWork, this.recapWork, this.branchOperation, this.modelTests.reset()]);
     await this.memory?.then((m) => m.close(), () => undefined);
   }
 
   /** Wait for model cleanup and record persistence; also used by terminal hosts. */
   async waitForIdle(): Promise<void> {
+    await this.projectWork;
     await this.active?.done.catch(() => undefined);
   }
 
@@ -307,7 +318,7 @@ export class App {
 
   // ── flows ────────────────────────────────────────────────────────────────
   private get hasFullScreenView(): boolean {
-    return !!(this.source || this.shareView || this.picker || this.historyView || this.branchView || this.api || this.settings || this.quotaDetails || this.mem);
+    return !!(this.source || this.trialView || this.shareView || this.picker || this.historyView || this.branchView || this.api || this.settings || this.quotaDetails || this.mem);
   }
 
   private get source(): SourceView | AnswerSourceView | undefined {
@@ -367,6 +378,7 @@ export class App {
       this.active = startComparison({
         cwd: this.cwd, config: this.cfg, targets: this.all, question, selected: this.selected,
         previous, continueFrom: retryIds || revise ? undefined : this.continueFrom,
+        handoff: this.pendingHandoff,
         collaboration: graph, collaborationTargets: revise?.collaborationTargets,
         manualSelection: this.manualModels, signal: ctl.signal, interactive: true,
         retry: retryIds && previous ? { record: previous, targetIds: retryIds } : undefined,
@@ -375,6 +387,7 @@ export class App {
       this.ctl = ctl;
     } catch (err) { return this.say(err instanceof Error ? err.message : String(err), RED); }
     this.begin();
+    this.pendingHandoff = undefined;
     this.continueFrom = undefined;
     this.question = question;
     this.turn++;
@@ -601,6 +614,8 @@ export class App {
 
   private newConversation(): void {
     if (this.busy) return this.say('请等待当前请求完成，或按 Ctrl+C 取消', YELLOW);
+    this.pendingHandoff = this.editingHandoff = undefined;
+    this.recap = undefined;
     this.stopSharing();
     this.panes = [];
     this.synth = this.exec = undefined;
@@ -771,6 +786,7 @@ export class App {
       const execution = latest.kind === 'execution' && latest.planSource?.turnId === last.id ? latest : undefined;
       if (this.share && this.share.id !== last.sessionId) this.stopSharing();
       this.lastRun = last;
+      this.pendingHandoff = this.editingHandoff = undefined;
       this.lastExecution = execution;
       const turnId = (execution ?? last).id;
       const recap = loadRunRecap(this.cwd, turnId);
@@ -847,11 +863,122 @@ export class App {
       });
   }
 
+  private projectTask(label: string, work: (signal: AbortSignal) => Promise<void>) {
+    const ctl = new AbortController();
+    this.ctl = ctl;
+    this.begin();
+    this.say(label);
+    this.projectWork = work(ctl.signal).catch(err => this.say(err instanceof Error ? err.message : String(err), RED))
+      .finally(() => { this.projectWork = undefined; this.finish(); });
+  }
+
+  private handoffMenu(id: string) {
+    const draft = readHandoff(this.cwd, id);
+    this.draftHandoff = id;
+    this.picker = new Picker('会话交接单', [
+      { id: 'show', label: '阅读交接单', detail: handoffPath(this.cwd, id) },
+      { id: 'edit', label: '编辑交接单', detail: '在输入框编辑正文，Enter 保存' },
+      { id: 'use', label: '确认并接入新会话', detail: '下一次提问带入交接单，可先选择模型' },
+    ], undefined, action => {
+      if (action === 'show') {
+        this.openSource({ path: handoffPath(this.cwd, id) });
+        this.say('阅读后输入 /handoff open 返回交接单菜单');
+      } else if (action === 'edit') {
+        this.editingHandoff = { id, before: draft.answer };
+        this.ed.set(draft.answer);
+        this.focus = 'input';
+        this.say('编辑交接单 · Enter 保存 · Esc 放弃');
+      } else this.useHandoff(id);
+    }, () => { this.picker = undefined; });
+  }
+
+  private useHandoff(id: string) {
+    const draft = readHandoff(this.cwd, id);
+    this.newConversation();
+    this.graphId = undefined;
+    this.pendingHandoff = draft;
+    this.say('已带入交接单，可选择回答目标并输入下一步任务', GOLD);
+  }
+
+  private openTrial(id: string) {
+    this.trialView = new TrialView(this.cwd, id, slot => {
+      this.trialView = undefined;
+      this.confirm = { text: '将方案 ' + slot + ' 应用到当前工作区？[y/N]', yes: () => {
+        try { applyTrial(this.cwd, id, slot); this.say('已采纳方案 ' + slot, GOLD); }
+        catch (err) { this.say(String(err), RED); }
+      } };
+    }, () => { this.trialView = undefined; });
+  }
+
+  private trialCommand(arg: string) {
+    const show = /^show(?:\s+(\S+))?$/.exec(arg);
+    if (show) {
+      const id = show[1] ?? this.lastTrial;
+      if (!id) throw new Error('请指定试跑 ID');
+      return this.openTrial(id);
+    }
+    const source = this.lastRun;
+    const answers = source?.results.filter(r => r.ok && r.text.trim()) ?? [];
+    if (!source || answers.length < 2 || source.collaboration) throw new Error('请先在普通问答中取得两个成功回答');
+    if (!arg) {
+      const choose = (first?: string) => {
+        const items = answers.filter(r => r.targetId !== first).map(r =>
+          ({ id: r.targetId, label: r.targetId, detail: r.text.trim().replace(/\s+/g, ' ').slice(0, 160) }));
+        this.picker = new Picker(first ? '选择第二份回答' : '选择第一份回答', items, undefined, picked => {
+          if (!first) return choose(picked);
+          this.ed.set('/trial ' + first + ',' + picked + ' ');
+          this.focus = 'input';
+          this.say('在末尾输入两个方案都要运行的验证命令，例如 npm ci && npm test');
+        }, () => { this.picker = undefined; });
+      };
+      return choose();
+    }
+    const match = /^(\S+),(\S+)\s+(.+)$/s.exec(arg);
+    if (!match) throw new Error('用法：/trial 目标A,目标B 验证命令');
+    const executor = chooseExecutor(this.all, this.cfg.executor, this.installed);
+    const [, a, b, check] = match;
+    this.confirm = { text: '用 ' + executor.label + ' 实施两份方案并运行 ' + check + '？[y/N]', yes: () =>
+      this.projectTask('正在创建试跑工作树…', async signal => {
+        const result = await runTrial(this.cwd, source, [a,b], executor, check, timeoutMillis(this.cfg.execTimeoutSec ?? 3600),
+          signal, id => { this.lastTrial = id; this.say('正在试跑 ' + id); });
+        if (!signal.aborted) this.openTrial(result.id);
+      }) };
+  }
+
   private command(line: string): void {
     const branch = /^\/branch(?:[ \t]+(.*))?$/.exec(line);
     if (branch) return this.changeBranch(branch[1] ?? '');
     const [name, ...rest] = line.slice(1).trim().split(/\s+/);
     const arg = rest.join(' ');
+    if (['trial', 'handoff', 'recommend'].includes(name)) {
+      if (this.busy || this.switchingBranch) return this.say('请等待当前操作结束', YELLOW);
+      try {
+        if (name === 'trial') return this.trialCommand(line.slice(6).trim());
+        if (name === 'recommend') return this.projectTask('正在读取项目评测和额度…', async signal => {
+          const result = await recommend(this.cwd, this.all, signal, arg || undefined);
+          const items = result.rows.map(row => ({ id: row.target, label: recommendationLabel(row), detail: row.quotaText }));
+          this.picker = new Picker(result.recommended ? '按项目选模型 · 推荐 ' + result.recommended : '尚无通过样本可供推荐',
+            items, result.recommended ?? undefined, id => {
+              if (!result.rows.find(r => r.target === id)?.eligible) return this.say('该目标当前不可用', YELLOW);
+              this.selected = [id]; this.manualModels = true; this.graphId = undefined;
+              this.say('已选用 ' + id, GOLD);
+            }, () => { this.picker = undefined; });
+        });
+        if (rest[0] === 'use' || rest[0] === 'open') {
+          const id = rest[1] ?? this.draftHandoff;
+          if (!id) throw new Error('请指定交接单 ID');
+          return rest[0] === 'use' ? this.useHandoff(id) : this.handoffMenu(id);
+        }
+        const session = this.lastRun?.sessionId;
+        if (!session) throw new Error('请先完成一轮问答，或用 /resume 打开会话');
+        const target = this.adapter(arg || this.cfg.synthesizer || this.selected[0]);
+        if (!target || !this.installed.get(target.id)) throw new Error('请用 /handoff 目标ID 选择可用的整理模型');
+        return this.projectTask('正在整理会话交接单…', async signal => {
+          const draft = await createHandoff(this.cwd, session, target, timeoutMillis(this.cfg.timeoutSec ?? 600), signal);
+          this.handoffMenu(draft.id);
+        });
+      } catch (err) { return this.say(err instanceof Error ? err.message : String(err), RED); }
+    }
     if (name === 'share') return this.shareCommand(arg);
     if (['graph', 'resume', 'revise', 'close-plan'].includes(name)) {
       if (this.busy) return this.say('请在当前请求结束后操作', YELLOW);
@@ -1025,9 +1152,20 @@ export class App {
       }
       return this.requestRender();
     }
+    if (this.trialView) {
+      if (k.name === 'ctrl+d') return this.onQuit();
+      this.trialView.handleKey(k);
+      return this.requestRender();
+    }
+    if (this.editingHandoff && (k.name === 'esc' || k.name === 'ctrl+c')) {
+      this.editingHandoff = undefined;
+      this.ed.clear();
+      this.say('已放弃编辑');
+      return this.requestRender();
+    }
     if (this.picker) {
       if (k.name === 'ctrl+d') return this.onQuit();
-      this.picker.handleKey(k);
+      try { this.picker.handleKey(k); } catch (err) { this.say(String(err), RED); }
       return this.requestRender();
     }
     if (this.historyView) {
@@ -1379,6 +1517,16 @@ export class App {
   }
 
   private submit(): void {
+    if (this.editingHandoff) {
+      const { id, before } = this.editingHandoff;
+      try {
+        editHandoff(this.cwd, id, before, this.ed.text);
+        this.editingHandoff = undefined;
+        this.ed.clear();
+        this.handoffMenu(id);
+      } catch (err) { this.say(String(err), RED); }
+      return;
+    }
     const raw = this.ed.text.trimStart();
     const text = /^\/branch(?:[ \t]|$)/.test(raw) ? raw.replace(/[ \t\r\n]+$/, '') : raw.trimEnd();
     if (!text) return;
@@ -1440,6 +1588,7 @@ export class App {
       return s;
     }
     if (!this.prompt) {
+      if (this.trialView) { this.trialView.draw(s); return s; }
       if (this.shareView) { this.shareView.draw(s); return s; }
       if (this.picker) { this.picker.draw(s); return s; }
       if (this.branchView) {

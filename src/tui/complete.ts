@@ -27,6 +27,9 @@ export interface CommandSpec {
 
 export const COMMANDS: CommandSpec[] = [
   { name: 'settings', detail: '设置模型、思考强度、官方 API 和运行偏好' },
+  { name: 'trial', detail: '对比两个回答的实施结果和验证，可用 /trial show ID 查看' },
+  { name: 'handoff', detail: '整理、编辑交接单并开新会话，/handoff use ID 接手' },
+  { name: 'recommend', detail: '根据项目评测和额度选择模型，可附案例集 ID' },
   { name: 'graph', detail: '选用已保存的协作模版，/graph off 恢复普通问答' },
   { name: 'resume', detail: '选择当前项目的历史会话继续工作' },
   { name: 'share', detail: '手机扫码继续当前会话，/share off 停止共享' },

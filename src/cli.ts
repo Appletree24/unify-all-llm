@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { benchCommand } from './bench/command.js';
+import { projectCommand } from './project-command.js';
+import { readHandoff } from './core/handoff.js';
 import { readCacheReport } from './core/cache-monitor.js';
 import { isReviewOrReport, roleNames } from './core/collaboration.js';
 import { createInterface } from 'node:readline/promises';
@@ -29,6 +31,9 @@ const HELP = `unify — 同时提问多个模型，再汇总与实施
   unify ask "<问题>"             提问（也支持 stdin）
   unify retry [记录id] --target a 只重试指定目标，创建新记录
   unify exec [记录id]            按方案实施（需确认）
+  unify trial --help            两份回答分别实施、运行同一验证并比较补丁
+  unify handoff --help          起草可编辑的会话交接单，接入新对话
+  unify recommend [--collection id]  结合项目评测和额度推荐目标
   unify show [记录id]            查看结果及部分输出
   unify list                    查看记录
   unify doctor                  检查目标及能力
@@ -43,6 +48,7 @@ ask 选项:
       --no-synth                跳过汇总
   -c, --continue                继续最近一次问答，保留公共对话历史
       --from id                 配合 -c 使用：沿用上一轮中指定目标（或 synthesis）的回答
+      --handoff id              带入已审阅的交接单，开启新会话
       --reasoning               显示汇总思考过程
       --json                    输出带 turnId/callId 的 JSONL 事件
       --timeout 秒              单次模型调用超时（默认 600）
@@ -193,9 +199,11 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
             models: { type: 'string', short: 'm' }, synth: { type: 'string', short: 's' }, 'no-synth': { type: 'boolean' },
             continue: { type: 'boolean', short: 'c' }, from: { type: 'string' }, reasoning: { type: 'boolean' }, json: { type: 'boolean' },
             timeout: { type: 'string' }, concurrency: { type: 'string' }, target: { type: 'string' },
+            handoff: { type: 'string' },
         },
     });
     if (values.from && !values.continue) throw new Error('--from 需要与 -c/--continue 一起使用');
+    if (values.handoff && (values.continue || retry)) throw new Error('--handoff 需要开启新会话');
     const config = parseConfig({
         ...loadConfig(cwd),
         ...(values.synth ? { synthesizer: values.synth } : {}),
@@ -214,6 +222,7 @@ async function cmdAsk(argv: string[], retry = false): Promise<number> {
             cwd, config, targets, question, selected: values.models?.split(',').map((s) => s.trim()),
             manualSelection: !!values.models, synthesize: !values['no-synth'],
             previous: values.continue ? latestComparison(cwd) : undefined,
+            handoff: values.handoff ? readHandoff(cwd, values.handoff) : undefined,
             continueFrom: values.continue ? values.from : undefined,
             retry: original ? { record: original, targetIds: values.target?.split(',').map((s) => s.trim()) ?? original.targets.filter((t) => !original.results.find((r) => r.targetId === t.id)?.ok).map((t) => t.id) } : undefined,
             interactive: canInteract, onInteract,
@@ -385,6 +394,7 @@ async function main(): Promise<number> {
             }
             return 0;
         case 'bench': return benchCommand(cwd, rest, abort.signal);
+        case 'trial': case 'handoff': case 'recommend': return projectCommand(cmd, cwd, rest, abort.signal);
         case 'memory': return cmdMemory(rest);
         case 'quota': return cmdQuota(rest);
         case 'cache': {
