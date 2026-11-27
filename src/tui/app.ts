@@ -88,6 +88,12 @@ interface Pane {
   cache?: { key: string; lines: Cell[][] };
 }
 
+interface ComposerArea {
+  x: number;
+  width: number;
+  bottom: number;
+}
+
 export interface TuiIO {
   cols(): number;
   rows(): number;
@@ -1651,6 +1657,10 @@ export class App {
         return s;
       }
     }
+    if (!this.help && !this.prompt && !this.busy && !this.question && !this.panes.length && !this.bottomPane()) {
+      this.drawHome(s);
+      return s;
+    }
     this.drawHeader(s);
     const inputH = this.drawInput(s);
     this.drawFooter(s);
@@ -1695,8 +1705,9 @@ export class App {
   }
 
   /** Draws the activity line, queued messages and composer above the footer; returns their height. */
-  private drawInput(s: Screen): number {
-    const inner = s.cols - 3;
+  private drawInput(s: Screen, home?: ComposerArea): number {
+    const { x, width, bottom } = home ?? { x: 0, width: s.cols, bottom: s.rows - 1 };
+    const inner = width - 3;
     // Wrap the input manually so the caret position is known exactly.
     const { chars, caret } = this.ed;
     const lines: Cell[][] = [[]];
@@ -1726,13 +1737,13 @@ export class App {
     const h = Math.min(Math.max(3, Math.floor(s.rows / 3)), lines.length, inputBudget);
     const first = clamp(cy - h + 1, 0, lines.length - h);
     const queued = this.queue.slice(0, Math.min(3, inputBudget - h));
-    const y = s.rows - 1 - (h + 2);
+    const y = bottom - (h + 2);
     const top = y - 1 - queued.length;
     this.inputTop = top;
     const active = this.focus === 'input' && !this.confirm && !this.prompt;
-    const st = active ? GOLD : BORDER;
+    const st = active && !home ? GOLD : BORDER;
 
-    this.drawActivity(s, top);
+    this.drawActivity(s, top, home?.x);
     const recap = this.recap?.turnId === (this.lastExecution ?? this.lastRun)?.id ? this.recap : undefined;
     const recapLines = recap && !this.prompt ? wrap(toCells(`回顾 · ${recap.text}`, recap.style), s.cols - 2) : [];
     const recapHeight = Math.min(recapLines.length, 3, Math.max(0, top - 5));
@@ -1746,26 +1757,26 @@ export class App {
       const more = i === 2 && this.queue.length > 3 ? ` (+${this.queue.length - 3})` : '';
       s.put(1, top + 1 + i, truncate(`↳ 已排队${more}  ${q.replace(/\s+/g, ' ')}`, s.cols - 2), DIM);
     });
-    s.put(0, y, '─'.repeat(s.cols), st);
-    s.put(0, y + h + 1, '─'.repeat(s.cols), st);
-    if (first === 0) s.put(0, y + 1, '❯', active ? GOLD : DIM);
-    for (let i = 0; i < h; i++) s.putCells(2, y + 1 + i, lines[first + i], s.cols - 1);
+    s.put(x, y, '─'.repeat(width), st);
+    s.put(x, y + h + 1, '─'.repeat(width), st);
+    if (first === 0) s.put(x, y + 1, '❯', active ? GOLD : DIM);
+    for (let i = 0; i < h; i++) s.putCells(x + 2, y + 1 + i, lines[first + i], x + width - 1);
     if (chars.length === 0 && !this.prompt) {
       const hint = this.busy
         ? '继续输入会排队，本轮结束后发送…'
         : this.continueFrom
           ? `沿用「${this.continueFrom}」继续追问…（输入 /use 重置）`
           : this.turn === 0
-            ? '问点什么…  / 命令 · @ 引用文件'
+            ? '输入消息…'
             : '继续追问，或输入 /exec 让模型按方案动手';
-      s.put(2, y + 1, truncate(hint, inner), DIM);
+      s.put(x + 2, y + 1, truncate(hint, inner), DIM);
     }
-    if (active) this.cursor = { x: 2 + cx, y: y + 1 + (cy - first) };
+    if (active) this.cursor = { x: x + 2 + cx, y: y + 1 + (cy - first) };
     return h + 3 + queued.length + recapHeight;
   }
 
   /** One line above the composer: confirmation, notice, what is running, or key hints. */
-  private drawActivity(s: Screen, y: number): void {
+  private drawActivity(s: Screen, y: number, homeX?: number): void {
     if (this.prompt) {
       const keys = this.interactions.length > 1 ? 'Ctrl+G 下一项 · ' : '';
       const hint = keys + this.prompt.keyHint;
@@ -1774,8 +1785,12 @@ export class App {
     }
     const first = this.interactions[0];
     if (first) return void s.put(1, y, truncate(first.summary, s.cols - 2), `1;${YELLOW}`);
-    if (this.confirm) return void s.put(1, y, truncate(this.confirm.text, s.cols - 2), `1;${YELLOW}`);
-    if (this.notice) return void s.put(1, y, truncate(this.notice, s.cols - 2), this.noticeColor);
+    if (this.confirm || this.notice) {
+      const text = this.confirm?.text ?? this.notice;
+      const x = Math.max(1, Math.min(homeX ?? 1, s.cols - textWidth(text) - 1));
+      s.put(x, y, truncate(text, s.cols - x - 1), this.confirm ? `1;${YELLOW}` : this.noticeColor);
+      return;
+    }
     if (this.busy) {
       const done = this.panes.filter((p) => p.status !== 'run').length;
       const stage = this.exec?.status === 'run' ? '实施中' : this.synth?.status === 'run' ? '汇总中' : this.panes.length ? `回答中 ${done}/${this.panes.length}` : '准备中';
@@ -1784,6 +1799,7 @@ export class App {
       s.put(x + 1, y, truncate(`${Math.floor((Date.now() - this.busySince) / 1000)}s · Esc 中断${this.queue.length ? ` · ${this.queue.length} 条排队` : ''}`, s.cols - x - 2), DIM);
       return;
     }
+    if (homeX !== undefined) return;
     const hints =
       this.focus === 'input'
         ? this.panes.length
@@ -1791,9 +1807,12 @@ export class App {
             `${this.selectionCopyLabel} 复制选区`, 'Ctrl+R 思考', 'Ctrl+N 新对话', '/help 帮助']
           : ['Enter 发送', 'Shift+Enter/Ctrl+J 换行', '/quota 套餐余量', '/ 命令', '@ 文件', '/help 帮助']
         : ['↑↓/滚轮 滚动', 'Enter 放大', 'u 沿此继续', 'b 留题', `${this.answerCopyLabel} 复制`, 'Ctrl+E 按此实施', 'Esc 返回'];
-    let x = 1;
+    this.drawKeyHints(s, y, 1, s.cols - 3, hints);
+  }
+
+  private drawKeyHints(s: Screen, y: number, x: number, right: number, hints: string[]): void {
     for (const h of hints) {
-      if (x + textWidth(h) + 3 > s.cols) break;
+      if (x + textWidth(h) > right) break;
       const [key, ...rest] = h.split(' ');
       x = s.put(x, y, key, '');
       x = s.put(x, y, ' ' + rest.join(' '), DIM) + 3;
@@ -1821,23 +1840,28 @@ export class App {
   }
 
   /** Completion list floating over the body, directly above the activity line. */
-  private drawPopup(s: Screen): void {
+  private drawPopup(s: Screen, { x, width } = { x: 0, width: s.cols }): number | undefined {
     const c = this.comp;
     if (!c || this.focus !== 'input' || this.confirm) return;
     const n = Math.min(c.items.length, 8, Math.max(1, this.inputTop - 3));
     const first = clamp(this.compIdx - n + 1, 0, Math.max(0, c.items.length - n));
-    const labelW = Math.min(Math.max(...c.items.map((i) => textWidth(i.label))), c.kind === 'file' ? s.cols - 6 : 24);
+    const labelW = Math.min(Math.max(...c.items.map((i) => textWidth(i.label))), c.kind === 'file' ? width - 6 : 24);
+    const right = x + width;
+    const detailX = x + labelW + 5;
     const y0 = this.inputTop - n;
-    s.put(0, y0 - 1, '─'.repeat(s.cols), BORDER);
+    s.put(x, y0 - 1, '─'.repeat(width), BORDER);
     for (let i = 0; i < n; i++) {
       const item = c.items[first + i];
       const on = first + i === this.compIdx;
-      s.put(0, y0 + i, ' '.repeat(s.cols));
-      s.put(1, y0 + i, on ? '›' : ' ', GOLD);
-      const x = s.put(3, y0 + i, truncate(item.label, labelW), on ? `1;${GOLD}` : '', s.cols - 1);
-      if (item.detail) s.put(Math.max(x, 3 + labelW) + 2, y0 + i, truncate(item.detail, Math.max(0, s.cols - labelW - 7)), DIM, s.cols - 1);
+      s.put(x, y0 + i, ' '.repeat(width));
+      s.put(x + 1, y0 + i, on ? '›' : ' ', GOLD);
+      s.put(x + 3, y0 + i, truncate(item.label, labelW), on ? `1;${GOLD}` : '');
+      if (item.detail && detailX < right - 2) {
+        s.put(detailX, y0 + i, truncate(item.detail, right - detailX - 2), DIM);
+      }
     }
-    if (c.items.length > n) s.put(s.cols - 12, y0 - 1, ` ${this.compIdx + 1}/${c.items.length} `, DIM);
+    if (c.items.length > n) s.put(right - 12, y0 - 1, ` ${this.compIdx + 1}/${c.items.length} `, DIM);
+    return y0 - 1;
   }
 
   private drawHelp(s: Screen, y: number, h: number): void {
@@ -1873,9 +1897,9 @@ export class App {
     const bottom = requested && requested.kind !== 'answer' ? requested : this.bottomPane();
     const zoomed = this.zoomId ? this.findPane(this.zoomId) : undefined;
     if (zoomed && (!requested || requested === zoomed)) return this.drawPane(s, 0, y, s.cols, h, zoomed, true);
-    if (this.panes.length === 0) {
-      if (bottom) return this.drawPane(s, 0, y, s.cols, h, bottom, this.focus === bottom.id);
-      return this.drawWelcome(s, y, h);
+    if (!this.panes.length) {
+      if (bottom) this.drawPane(s, 0, y, s.cols, h, bottom, this.focus === bottom.id);
+      return;
     }
     if (h < 12) {
       // Too short to split: show one pane at a time.
@@ -1899,46 +1923,51 @@ export class App {
     if (bottom) this.drawPane(s, 0, y + ah, s.cols, h - ah, bottom, this.focus === bottom.id);
   }
 
-  private drawWelcome(s: Screen, y: number, h: number): void {
+  private drawHome(s: Screen): void {
     const graph = this.selectedGraph;
-    const answering = graph ? graph.plans.map(p => p.target) : this.selected;
-    const targets = this.all.filter((a) => this.installed.get(a.id) !== false);
-    const n = targets.length;
-    const nameW = Math.min(Math.max(1, ...targets.map((a) => textWidth(a.label))), Math.floor(s.cols / 3));
-    const mid = Math.floor((n - 1) / 2);
-    const showDiagram = s.cols - nameW >= 48;
-    const quotaOffset = 2 + nameW + (showDiagram ? 18 : 2);
-    const blockW = Math.min(s.cols - 2, quotaOffset + 52);
-    const x0 = Math.floor((s.cols - blockW) / 2);
-    const quotaW = blockW - quotaOffset;
-    const blockH = n + 4;
-    let row = y + Math.max(0, Math.floor((h - blockH) / 2));
-    for (const [i, a] of targets.entries()) {
-      if (row >= y + h) break;
-      const on = answering.includes(a.id);
+    const answering = new Set(graph ? graph.plans.map(p => p.target) : this.selected);
+    const targets = this.all.filter(a => this.installed.get(a.id) !== false).map(a => {
+      const on = answering.has(a.id);
       const known = this.installed.has(a.id);
-      const color = on ? this.colorOf(a.id) : BORDER;
-      const tag = !graph && a.id === this.cfg.decider ? '决策' : '';
-      s.put(x0, row, !known ? SPIN[this.frame % 10] : on ? '●' : '○', color);
-      s.put(x0 + 2, row, truncate(a.label, nameW), on ? `1;${color}` : DIM);
-      if (showDiagram) {
-        const joint = n === 1 ? '─' : i === mid ? (i === 0 ? '┬' : i === n - 1 ? '┴' : '┼') : i === 0 ? '╮' : i === n - 1 ? '╯' : '┤';
-        const x = s.put(x0 + 3 + nameW, row, '──' + joint, color === BORDER ? BORDER : DIM);
-        if (i === mid) s.put(s.put(x, row, '──▶ ', DIM), row, '✦ 最优解', `1;${GOLD}`);
-        else if (tag) s.put(x + 1, row, tag, GOLD);
-      }
-      const summary = this.quota?.summary(a.id, quotaW) ?? '余量查询中…';
-      const end = s.put(x0 + quotaOffset, row, truncate(summary, quotaW), DIM);
-      if ((!showDiagram || i === mid) && tag && end + 2 + textWidth(tag) <= x0 + blockW) {
-        s.put(end + 2, row, tag, GOLD);
-      }
-      row++;
+      const deciding = known && !graph && !on && a.id === this.cfg.decider;
+      return { id: a.id, label: deciding ? `${a.label} 决策` : a.label, on, known, deciding };
+    }).sort((a, b) => Number(b.on || b.deciding) - Number(a.on || a.deciding));
+    const width = Math.min(68, s.cols - 2);
+    const x = Math.floor((s.cols - width) / 2);
+    const right = x + width;
+    const modelRows = Math.max(1, targets.length);
+    // Center the title, model list and one-line composer as a group. Longer input expands upward.
+    const bottom = Math.min(s.rows - 2, Math.floor((s.rows + modelRows + 8) / 2) - 1);
+    const area = { x, width, bottom };
+    this.drawInput(s, area);
+    const titleY = Math.max(1, this.inputTop - modelRows - 3);
+    const listEnd = this.drawPopup(s, area) ?? this.inputTop;
+    const visibleRows = Math.max(0, listEnd - titleY - 3);
+    if (titleY < listEnd) s.put(x, titleY, 'unify', '1');
+    if (visibleRows && !targets.length) s.put(x, titleY + 2, '没有可用的模型', DIM);
+    if (visibleRows && targets.length) {
+      const overflow = targets.length > visibleRows && visibleRows > 1;
+      const shown = targets.slice(0, visibleRows - Number(overflow));
+      const nameW = Math.min(Math.max(8, ...shown.map(a => textWidth(a.label))), Math.floor(width / 3));
+      const quotaX = x + nameW + 5;
+      const quotaW = right - quotaX;
+      s.put(x, titleY + 2, '模型', DIM);
+      s.put(quotaX, titleY + 2, '套餐余量', DIM);
+      shown.forEach((a, i) => {
+        const row = titleY + 3 + i;
+        const marker = !a.known ? SPIN[this.frame % 10] : a.deciding ? '◆' : a.on ? '●' : '○';
+        s.put(x, row, marker, a.on || a.deciding ? GOLD : DIM);
+        s.put(x + 2, row, truncate(a.label, nameW), a.on || a.deciding ? '' : DIM);
+        const summary = this.quota?.summary(a.id, quotaW) ?? '余量查询中…';
+        s.put(quotaX, row, truncate(summary, quotaW), DIM);
+      });
+      if (overflow) s.put(x, titleY + 3 + shown.length, `另有 ${targets.length - shown.length} 个模型 · /quota`, DIM);
     }
-    const center = (text: string, st: string, at: number) => {
-      if (at < y + h) s.put(Math.max(1, Math.floor((s.cols - textWidth(text)) / 2)), at, truncate(text, s.cols - 2), st);
-    };
-    center(graph ? `协作模版 · ${graph.name}` : '一个问题 · 多个模型 · 一份最优解', '', row + 1);
-    center('输入 /settings 接入官方 API', DIM, row + 2);
+    const settingsLabel = width >= 48 ? ' 设置' : '';
+    const settingsX = right - textWidth('/settings' + settingsLabel);
+    this.drawKeyHints(s, bottom, x, settingsX - 1, ['Enter 发送', '/ 命令', '@ 文件', 'Ctrl+J 换行']);
+    s.put(s.put(settingsX, bottom, '/settings'), bottom, settingsLabel, DIM);
+    this.drawFooter(s);
   }
 
   private drawPane(s: Screen, x: number, y: number, w: number, h: number, p: Pane, focused: boolean, hint = ''): void {

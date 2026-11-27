@@ -34,7 +34,7 @@ export function sourceReference(value: string, explicit = false): SourceReferenc
   if (!path || /[#?]/.test(path) || (/^[a-z][a-z0-9+.-]*:/i.test(path) && !/^[a-z]:[\\/]/i.test(path))) return;
   const looksLikeFile = /[\\/].*[\p{L}\p{N}_.-]/u.test(path) || /\.(?:[\p{L}_][\p{L}\p{N}_-]*)$/u.test(path)
     || /^(?:Dockerfile|Makefile|Gemfile|LICENSE)$/i.test(path);
-  if (!looksLikeFile && !explicit) return;
+  if (!explicit && (!looksLikeFile || path.includes('|'))) return;
   const line = Number(suffix?.[1] ?? suffix?.[2]);
   const column = Number(suffix?.[3]);
   return { path, line: Number.isSafeInteger(line) && line > 0 ? line : undefined, column: Number.isSafeInteger(column) && column > 0 ? column : undefined };

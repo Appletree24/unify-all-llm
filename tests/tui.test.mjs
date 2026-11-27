@@ -5,6 +5,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { App } from '../dist/tui/app.js';
+import { layout } from '../dist/tui/markdown.js';
 import { textWidth } from '../dist/tui/screen.js';
 import { listRunIds, loadRun, loadRunRecap } from '../dist/core/store.js';
 import { loadConfig } from '../dist/core/config.js';
@@ -421,6 +422,18 @@ test('TUI lists local branches, switches through /branch, and preserves conflict
   assert.equal(readFileSync(file, 'utf8'), 'local edit\n');
 });
 
+test('TUI links the file next to a Gemini exclusion regex and leaves the regex as text', () => {
+  const exclude = String.raw`\.git|node_modules|__pycache__|\.venv|dist|build|\.pytest_cache|target`;
+  const path = String.raw`src\main.ts`;
+  for (const line of [`⚙ search '${exclude}' ${path}:3`, `\`${exclude}\` \`${path}:3\``]) {
+    const cells = layout(line, 120, '').flat();
+    assert.ok(cells.map(cell => cell.ch).join('').includes(exclude));
+    const links = cells.filter(cell => cell.source);
+    assert.equal(links.map(cell => cell.ch).join(''), `${path}:3`);
+    assert.ok(links.every(cell => cell.source.path === path && cell.source.line === 3));
+  }
+});
+
 for (const [platform, copyKey] of [['darwin', '\x1b[99;9u'], ['win32', '\x03']]) test(`TUI drags to select, copies on ${platform}, and opens file references`, async (t) => {
   const { KeyParser } = await import('../dist/tui/keys.js');
   const cwd = workspace(t);
@@ -698,15 +711,22 @@ test('welcome rows and answer panes show each model’s quota and update without
     { label: '5 小时', remaining: percentage, unit: '%', resetsAt: '2027-01-01T00:00:00Z' },
   ] });
   b.adapter.readQuota = async () => ({ status: 'ok', limits: [{ label: '账户余额', remaining: balance, unit: 'CNY' }] });
-  let cols = 140;
-  const app = new App({ cols: () => cols, rows: () => 36, write() {} }, workspace(t), { providers: ['alpha', 'beta'] }, [a, b, unavailable]);
+  let cols = 140, rows = 36;
+  const app = new App({ cols: () => cols, rows: () => rows, write() {} }, workspace(t), { providers: ['alpha', 'beta'] }, [a, b, unavailable]);
   t.after(() => app.dispose());
   await app.init();
   await new Promise(setImmediate);
   const welcome = screen(app);
   assert.match(welcome, /ALPHA[^\n]*74%/);
   assert.match(welcome, /BETA[^\n]*0 CNY/);
-  assert.doesNotMatch(welcome, /UNAVAILABLE|未安装|缺少密钥/);
+  assert.doesNotMatch(welcome, /UNAVAILABLE|未安装|缺少密钥|最优解|接入官方 API/);
+  cols = 40;
+  rows = 12;
+  const compact = screen(app);
+  assert.match(compact, /ALPHA[^\n]*74%[^\n]*\n[^\n]*BETA[^\n]*0 CNY/);
+  assert.match(compact, /❯ 输入消息…[\s\S]*Enter 发送[^\n]*\/settings/);
+  cols = 140;
+  rows = 36;
   submit(app, 'compare');
   await app.waitForIdle();
   await new Promise(setImmediate);
@@ -762,7 +782,7 @@ test('TUI quota view shares live readings with the main screen and cancels an un
   assert.equal(reads, 3);
   app.handleKey({ name: 'esc' });
   assert.equal(lastSignal.aborted, false);
-  assert.match(screen(app), /✦ unify/);
+  assert.match(screen(app), /^ +unify$/m);
   await app.dispose();
   assert.equal(lastSignal.aborted, true);
   await new Promise(setImmediate);
@@ -774,8 +794,9 @@ test('TUI quota view shares live readings with the main screen and cancels an un
 const composer = (app) => {
   app.invalidate();
   const lines = app.snapshot();
-  const rules = lines.flatMap((l, i) => (/^─+$/.test(l) ? [i] : []));
-  return lines.slice(rules.at(-2) + 1, rules.at(-1)).join('\n');
+  const rules = lines.flatMap((l, i) => (/^ *─+$/.test(l) ? [i] : []));
+  const left = lines[rules.at(-1)].indexOf('─');
+  return lines.slice(rules.at(-2) + 1, rules.at(-1)).map(line => line.slice(left)).join('\n');
 };
 
 test('key parser understands kitty, modifyOtherKeys and word-motion chords', async () => {
@@ -1122,5 +1143,5 @@ test('TUI memory view browses layers, edits a memory in place and undoes it', as
   press('x');
   assert.match(screen(app), /Codex 启动时的记忆上下文[\s\S]*<!-- 全局指令 · ~\/\.codex\/AGENTS\.md -->\n - 先读测试/);
   press('esc', 'q');
-  assert.match(screen(app), /✦ unify/);
+  assert.match(screen(app), /^ +unify$/m);
 });

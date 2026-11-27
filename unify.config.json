@@ -1,5 +1,9 @@
 {
   "showReasoning": true,
+  "providers": [
+    "gemini-pro",
+    "codex"
+  ],
   "synthesizer": "deepseek",
   "collaborationGraphs": {
     "relay": {
